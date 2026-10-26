@@ -1,6 +1,7 @@
-//! Against real servers. Set `DATADROP_TEST_POSTGRES_URL` and/or
-//! `DATADROP_TEST_MYSQL_URL` (e.g. `postgres://postgres:pw@127.0.0.1:5432/postgres`);
-//! without them these tests pass without doing anything. CI runs both on Linux.
+//! Against real databases. SQLite always runs (a file in a temporary folder). For
+//! servers, set `DATADROP_TEST_POSTGRES_URL` and/or `DATADROP_TEST_MYSQL_URL` (e.g.
+//! `postgres://postgres:pw@127.0.0.1:5432/postgres`); without them those tests pass
+//! without doing anything. CI runs both on Linux.
 
 use std::time::{Duration, Instant};
 
@@ -18,16 +19,37 @@ struct Db {
 /// A client with a profile for the test server, and a fresh schema (PostgreSQL) or
 /// database (MySQL) named `schema` that the profile uses, so tests don't collide.
 async fn setup(driver: Driver, schema: &str) -> Option<Db> {
+    let dir = tempfile::tempdir().unwrap();
+    let client = Client::new(&ConfigDir::new(dir.path()));
+    if driver == Driver::Sqlite {
+        let profile = Profile {
+            name: "test".into(),
+            driver,
+            database: dir
+                .path()
+                .join(format!("{schema}.db"))
+                .display()
+                .to_string(),
+            create_if_missing: true,
+            ..Profile::default()
+        };
+        save(&client, profile).await;
+        return Some(Db {
+            client,
+            profile: "test".into(),
+            driver,
+            _dir: dir,
+        });
+    }
     let var = match driver {
         Driver::Postgres => "DATADROP_TEST_POSTGRES_URL",
         Driver::Mysql => "DATADROP_TEST_MYSQL_URL",
+        Driver::Sqlite => unreachable!(),
     };
     let Ok(url) = std::env::var(var) else {
         eprintln!("{var} isn't set; skipping");
         return None;
     };
-    let dir = tempfile::tempdir().unwrap();
-    let client = Client::new(&ConfigDir::new(dir.path()));
     let admin = Profile {
         name: "admin".into(),
         driver,
@@ -40,6 +62,7 @@ async fn setup(driver: Driver, schema: &str) -> Option<Db> {
             format!("DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}")
         }
         Driver::Mysql => format!("DROP DATABASE IF EXISTS {schema}; CREATE DATABASE {schema}"),
+        Driver::Sqlite => unreachable!(),
     };
     ok(run(&client, "admin", &reset, None).await);
 
@@ -101,7 +124,16 @@ fn ok(q: QueryOutput) -> QueryOutput {
 fn prefix(db: &Db, schema: &str) -> String {
     match db.driver {
         Driver::Postgres => format!("{schema}."),
-        Driver::Mysql => String::new(),
+        Driver::Mysql | Driver::Sqlite => String::new(),
+    }
+}
+
+/// The schema the test's tables are in.
+fn home<'a>(db: &Db, schema: &'a str) -> &'a str {
+    if db.driver == Driver::Sqlite {
+        "main"
+    } else {
+        schema
     }
 }
 
@@ -118,6 +150,11 @@ macro_rules! both {
             async fn mysql() {
                 let f: fn(Driver, &'static str) -> _ = $body;
                 f(Driver::Mysql, concat!("dd_", stringify!($name))).await;
+            }
+            #[tokio::test]
+            async fn sqlite() {
+                let f: fn(Driver, &'static str) -> _ = $body;
+                f(Driver::Sqlite, concat!("dd_", stringify!($name))).await;
             }
         }
     };
@@ -140,8 +177,25 @@ both!(connects, |driver, schema| async move {
     let expect = match driver {
         Driver::Postgres => "PostgreSQL",
         Driver::Mysql => "MySQL",
+        Driver::Sqlite => "SQLite",
     };
     assert!(server_version.contains(expect), "{server_version}");
+    if driver == Driver::Sqlite {
+        // A missing file is an error unless the profile says to create it.
+        let missing = Profile {
+            name: "x".into(),
+            driver,
+            database: "/nonexistent/folder/none.db".into(),
+            ..Profile::default()
+        };
+        assert!(
+            db.client
+                .execute(Command::ConnectionTest { profile: missing })
+                .await
+                .is_err()
+        );
+        return;
+    }
 
     // A wrong password fails with the server's message, not a panic.
     let mut bad = db.client.store().get("test").unwrap();
@@ -175,6 +229,12 @@ both!(values_as_text, |driver, schema| async move {
         Driver::Mysql => "CREATE TABLE t (id int PRIMARY KEY, name text, price decimal(8,2), ok boolean, \
                at datetime, doc json, raw varbinary(4));
              INSERT INTO t VALUES (1, 'café', 12.50, true, '2026-01-02 03:04:05', '{\"k\": 1}', 0x00ff),
+                                  (2, NULL, NULL, NULL, NULL, NULL, NULL);
+             SELECT * FROM t ORDER BY id"
+            .to_owned(),
+        Driver::Sqlite => "CREATE TABLE t (id integer PRIMARY KEY, name text, price numeric, ok boolean, \
+               at text, doc text, raw blob);
+             INSERT INTO t VALUES (1, 'café', 12.50, true, '2026-01-02 03:04:05', '{\"k\": 1}', x'00ff'),
                                   (2, NULL, NULL, NULL, NULL, NULL, NULL);
              SELECT * FROM t ORDER BY id"
             .to_owned(),
@@ -216,6 +276,21 @@ both!(values_as_text, |driver, schema| async move {
                     Some("1"),
                     Some("café"),
                     Some("12.50"),
+                    Some("1"),
+                    Some("2026-01-02 03:04:05"),
+                    Some("{\"k\": 1}"),
+                    Some("0x00ff")
+                ]
+            );
+        }
+        Driver::Sqlite => {
+            assert_eq!(names, ["id", "name", "price", "ok", "at", "doc", "raw"]);
+            assert_eq!(
+                row(0),
+                [
+                    Some("1"),
+                    Some("café"),
+                    Some("12.5"),
                     Some("1"),
                     Some("2026-01-02 03:04:05"),
                     Some("{\"k\": 1}"),
@@ -307,6 +382,11 @@ both!(row_limit_and_empty_results, |driver, schema| async move {
             SELECT /*+ SET_VAR(cte_max_recursion_depth = 5000) */ n FROM c"
                 .to_owned()
         }
+        Driver::Sqlite => {
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2500) \
+            SELECT n FROM c"
+                .to_owned()
+        }
     };
     let out = db
         .client
@@ -364,6 +444,7 @@ both!(browses_the_schema, |driver, schema| async move {
     else {
         panic!()
     };
+    let schema = home(&db, schema);
     assert!(schemas.iter().any(|s| s == schema), "{schemas:?}");
     assert!(
         !schemas
@@ -405,7 +486,9 @@ both!(browses_the_schema, |driver, schema| async move {
     };
     let names: Vec<_> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["id", "total", "note"]);
-    assert!(columns[0].primary_key && !columns[0].nullable);
+    assert!(columns[0].primary_key);
+    // SQLite allows NULL in a primary key unless it's exactly INTEGER PRIMARY KEY.
+    assert!(!columns[0].nullable || driver == Driver::Sqlite);
     assert!(!columns[1].nullable && columns[1].default.is_some());
     assert!(columns[2].nullable && !columns[2].primary_key);
     assert!(
@@ -422,6 +505,11 @@ both!(cancels_on_the_server, |driver, schema| async move {
     let sleep = match driver {
         Driver::Postgres => "SELECT pg_sleep(30)",
         Driver::Mysql => "SELECT SLEEP(30)",
+        // No sleep in SQLite: a long count instead.
+        Driver::Sqlite => {
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) \
+                           SELECT count(*) FROM c"
+        }
     };
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
@@ -450,7 +538,16 @@ both!(cancels_on_the_server, |driver, schema| async move {
         "{:?}",
         started.elapsed()
     );
-    // The session is still usable.
+    // The session is still usable, for long statements too.
     let q = ok(run(&db.client, "test", "SELECT 42", Some("tab")).await);
     assert_eq!(q.results[0].rows[0][0].as_deref(), Some("42"));
+    let long = match driver {
+        Driver::Postgres => "SELECT count(*) FROM generate_series(1, 300000)",
+        Driver::Mysql => "SELECT BENCHMARK(300000, MD5('x'))",
+        Driver::Sqlite => {
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 300000) \
+                           SELECT count(*) FROM c"
+        }
+    };
+    ok(run(&db.client, "test", long, Some("tab")).await);
 });

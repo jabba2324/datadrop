@@ -12,14 +12,29 @@ use sqlx::mysql::{
     MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlSslMode,
 };
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions};
 use sqlx::{
     AssertSqlSafe, Column as _, Connection, Either, Executor, Row, SqlSafeStr, Statement as _,
     TypeInfo, ValueRef,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{CoreError, Result};
 use crate::profile::{Driver, Profile, SslMode};
 use crate::sql::{self, Dialect};
+
+/// The first value of the first row, as text.
+macro_rules! scalar {
+    ($conn:expr, $sql:expr) => {
+        async {
+            let row = sqlx::raw_sql(AssertSqlSafe(String::from($sql)))
+                .fetch_one($conn)
+                .await?;
+            Ok::<_, CoreError>(text_value(&row, 0)?.unwrap_or_default())
+        }
+    };
+}
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -69,7 +84,11 @@ pub struct ColumnInfo {
     pub primary_key: bool,
 }
 
-fn pg_options(p: &Profile) -> Result<PgConnectOptions> {
+/// Where to connect instead of the profile's own host and port (an SSH tunnel's
+/// local end).
+pub type Endpoint = Option<(String, u16)>;
+
+fn pg_options(p: &Profile, via: &Endpoint) -> Result<PgConnectOptions> {
     let mut o = match &p.url {
         Some(url) => PgConnectOptions::from_str(url)?,
         None => {
@@ -93,6 +112,9 @@ fn pg_options(p: &Profile) -> Result<PgConnectOptions> {
     if !url_pass && let Some(pw) = &p.password {
         o = o.password(pw);
     }
+    if let Some((host, port)) = via {
+        o = o.host(host).port(*port);
+    }
     o = o.application_name("DataDrop").ssl_mode(match p.ssl_mode {
         SslMode::Disable => PgSslMode::Disable,
         SslMode::Prefer => PgSslMode::Prefer,
@@ -106,7 +128,7 @@ fn pg_options(p: &Profile) -> Result<PgConnectOptions> {
     Ok(o)
 }
 
-fn my_options(p: &Profile) -> Result<MySqlConnectOptions> {
+fn my_options(p: &Profile, via: &Endpoint) -> Result<MySqlConnectOptions> {
     let mut o = match &p.url {
         Some(url) => MySqlConnectOptions::from_str(url)?,
         None => {
@@ -130,6 +152,9 @@ fn my_options(p: &Profile) -> Result<MySqlConnectOptions> {
     if !url_pass && let Some(pw) = &p.password {
         o = o.password(pw);
     }
+    if let Some((host, port)) = via {
+        o = o.host(host).port(*port);
+    }
     o = o.charset("utf8mb4").ssl_mode(match p.ssl_mode {
         SslMode::Disable => MySqlSslMode::Disabled,
         SslMode::Prefer => MySqlSslMode::Preferred,
@@ -141,6 +166,22 @@ fn my_options(p: &Profile) -> Result<MySqlConnectOptions> {
         o = o.ssl_ca(ca);
     }
     Ok(o)
+}
+
+fn lite_options(p: &Profile) -> Result<SqliteConnectOptions> {
+    let o = match &p.url {
+        Some(url) => SqliteConnectOptions::from_str(url)?,
+        None => {
+            if p.database.is_empty() {
+                return Err(CoreError::InvalidProfile(
+                    "choose the SQLite database file".into(),
+                ));
+            }
+            SqliteConnectOptions::new().filename(&p.database)
+        }
+    };
+    Ok(o.create_if_missing(p.create_if_missing)
+        .busy_timeout(Duration::from_secs(5)))
 }
 
 /// Whether the profile's URL already carries a user name and a password.
@@ -165,15 +206,23 @@ async fn timed<T>(fut: impl Future<Output = Result<T, sqlx::Error>>) -> Result<T
 /// transactions carry over between runs.
 pub struct Session {
     conn: Conn,
-    /// The server's id for this connection (backend pid / connection id), for
-    /// cancelling a running query from another connection.
-    server_id: u64,
+    stop: Stopper,
     pub profile: Profile,
 }
 
 enum Conn {
     Pg(PgConnection),
     My(MySqlConnection),
+    Lite(SqliteConnection),
+}
+
+/// How to stop a running statement.
+enum Stopper {
+    /// Ask the server, from another connection, to cancel the statement running on
+    /// the connection with this id (backend pid / connection id).
+    Server { via: Endpoint, id: u64 },
+    /// SQLite checks this flag every few thousand steps and stops when it's set.
+    Flag(Arc<AtomicBool>),
 }
 
 macro_rules! run_text {
@@ -245,7 +294,7 @@ fn looks_like_query(sql: &str, dialect: Dialect) -> bool {
 }
 
 /// A value as display text: the server's text form, or `0x…` hex for bytes that
-/// aren't UTF-8 (MySQL binary columns).
+/// aren't UTF-8 (MySQL binary columns) and SQLite BLOBs.
 fn text_value<R: Row>(row: &R, i: usize) -> Result<Option<String>>
 where
     usize: sqlx::ColumnIndex<R>,
@@ -256,7 +305,10 @@ where
     if raw.is_null() {
         return Ok(None);
     }
-    if let Ok(s) = row.try_get_unchecked::<&str, _>(i) {
+    // SQLite would happily read a BLOB as text; show its bytes instead.
+    let blob =
+        raw.type_info().name() == "BLOB" && <R::Database as sqlx::Database>::NAME == "SQLite";
+    if !blob && let Ok(s) = row.try_get_unchecked::<&str, _>(i) {
         return Ok(Some(s.to_owned()));
     }
     let bytes: Vec<u8> = row.try_get_unchecked(i)?;
@@ -269,24 +321,37 @@ where
 }
 
 impl Session {
-    pub async fn connect(profile: &Profile) -> Result<Session> {
-        let (conn, server_id) = match profile.driver {
+    /// Connect with `profile`, through `via` (an SSH tunnel) if given.
+    pub async fn connect(profile: &Profile, via: Endpoint) -> Result<Session> {
+        let (conn, stop) = match profile.driver {
             Driver::Postgres => {
-                let opts = pg_options(profile)?;
+                let opts = pg_options(profile, &via)?;
                 let mut c = timed(PgConnection::connect_with(&opts)).await?;
-                let id = scalar_pg(&mut c, "SELECT pg_backend_pid()::text").await?;
-                (Conn::Pg(c), id.parse().unwrap_or(0))
+                let id = scalar!(&mut c, "SELECT pg_backend_pid()::text").await?;
+                let id = id.parse().unwrap_or(0);
+                (Conn::Pg(c), Stopper::Server { via, id })
             }
             Driver::Mysql => {
-                let opts = my_options(profile)?;
+                let opts = my_options(profile, &via)?;
                 let mut c = timed(MySqlConnection::connect_with(&opts)).await?;
-                let id = scalar_my(&mut c, "SELECT CAST(CONNECTION_ID() AS CHAR)").await?;
-                (Conn::My(c), id.parse().unwrap_or(0))
+                let id = scalar!(&mut c, "SELECT CAST(CONNECTION_ID() AS CHAR)").await?;
+                let id = id.parse().unwrap_or(0);
+                (Conn::My(c), Stopper::Server { via, id })
+            }
+            Driver::Sqlite => {
+                let opts = lite_options(profile)?;
+                let mut c = timed(SqliteConnection::connect_with(&opts)).await?;
+                let flag = Arc::new(AtomicBool::new(false));
+                let check = flag.clone();
+                c.lock_handle()
+                    .await?
+                    .set_progress_handler(10_000, move || !check.load(Ordering::Relaxed));
+                (Conn::Lite(c), Stopper::Flag(flag))
             }
         };
         Ok(Session {
             conn,
-            server_id,
+            stop,
             profile: profile.clone(),
         })
     }
@@ -301,6 +366,7 @@ impl Session {
         let (columns, rows, truncated, affected) = match &mut self.conn {
             Conn::Pg(c) => run_text!(c, sql, max_rows, Dialect::Postgres),
             Conn::My(c) => run_text!(c, sql, max_rows, Dialect::Mysql),
+            Conn::Lite(c) => run_text!(c, sql, max_rows, Dialect::Sqlite),
         };
         Ok(StatementResult {
             sql: sql.to_owned(),
@@ -315,59 +381,66 @@ impl Session {
 
     pub async fn server_version(&mut self) -> Result<String> {
         match &mut self.conn {
-            Conn::Pg(c) => scalar_pg(c, "SELECT version()").await,
-            Conn::My(c) => scalar_my(c, "SELECT CONCAT('MySQL ', VERSION())").await,
+            Conn::Pg(c) => scalar!(c, "SELECT version()").await,
+            Conn::My(c) => scalar!(c, "SELECT CONCAT('MySQL ', VERSION())").await,
+            Conn::Lite(c) => scalar!(c, "SELECT 'SQLite ' || sqlite_version()").await,
         }
     }
 
-    /// Ask the server to stop whatever this session is running (from a separate
-    /// connection, as the session's own one is busy).
+    /// Ask the database to stop whatever this session is running (for a server,
+    /// from a separate connection, as the session's own one is busy).
     pub async fn cancel_running(&self) -> Result<()> {
-        cancel_on_server(&self.profile, self.server_id).await
+        match &self.stop {
+            Stopper::Server { via, id } => cancel_on_server(&self.profile, via, *id).await,
+            Stopper::Flag(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    /// After a cancel has taken effect: let the next statement run.
+    pub fn clear_cancel(&self) {
+        if let Stopper::Flag(flag) = &self.stop {
+            flag.store(false, Ordering::Relaxed);
+        }
     }
 
     pub async fn close(self) {
         let _ = match self.conn {
             Conn::Pg(c) => c.close().await,
             Conn::My(c) => c.close().await,
+            Conn::Lite(c) => c.close().await,
         };
     }
 }
 
-pub async fn cancel_on_server(profile: &Profile, server_id: u64) -> Result<()> {
+async fn cancel_on_server(profile: &Profile, via: &Endpoint, server_id: u64) -> Result<()> {
     if server_id == 0 {
         return Ok(());
     }
     match profile.driver {
         Driver::Postgres => {
-            let mut c = timed(PgConnection::connect_with(&pg_options(profile)?)).await?;
-            let sql = format!("SELECT pg_cancel_backend({server_id})::text");
-            scalar_pg(&mut c, &sql).await?;
+            let opts = pg_options(profile, via)?;
+            let mut c = timed(PgConnection::connect_with(&opts)).await?;
+            scalar!(
+                &mut c,
+                &format!("SELECT pg_cancel_backend({server_id})::text")
+            )
+            .await?;
             let _ = c.close().await;
         }
         Driver::Mysql => {
-            let mut c = timed(MySqlConnection::connect_with(&my_options(profile)?)).await?;
+            let opts = my_options(profile, via)?;
+            let mut c = timed(MySqlConnection::connect_with(&opts)).await?;
             sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {server_id}")))
                 .execute(&mut c)
                 .await?;
             let _ = c.close().await;
         }
+        Driver::Sqlite => {}
     }
     Ok(())
-}
-
-async fn scalar_pg(c: &mut PgConnection, sql: &str) -> Result<String> {
-    let row = sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
-        .fetch_one(&mut *c)
-        .await?;
-    Ok(text_value(&row, 0)?.unwrap_or_default())
-}
-
-async fn scalar_my(c: &mut MySqlConnection, sql: &str) -> Result<String> {
-    let row = sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
-        .fetch_one(&mut *c)
-        .await?;
-    Ok(text_value(&row, 0)?.unwrap_or_default())
 }
 
 /// A small connection pool for browsing the schema, so that never waits behind a
@@ -376,6 +449,7 @@ async fn scalar_my(c: &mut MySqlConnection, sql: &str) -> Result<String> {
 pub enum MetaPool {
     Pg(PgPool),
     My(MySqlPool),
+    Lite(SqlitePool),
 }
 
 /// Text of column `i`, for metadata queries that cast everything to text.
@@ -391,21 +465,28 @@ where
 }
 
 impl MetaPool {
-    pub fn new(profile: &Profile) -> Result<MetaPool> {
+    pub fn new(profile: &Profile, via: Endpoint) -> Result<MetaPool> {
         Ok(match profile.driver {
             Driver::Postgres => MetaPool::Pg(
                 PgPoolOptions::new()
                     .max_connections(2)
                     .acquire_timeout(CONNECT_TIMEOUT)
                     .idle_timeout(Duration::from_secs(300))
-                    .connect_lazy_with(pg_options(profile)?),
+                    .connect_lazy_with(pg_options(profile, &via)?),
             ),
             Driver::Mysql => MetaPool::My(
                 MySqlPoolOptions::new()
                     .max_connections(2)
                     .acquire_timeout(CONNECT_TIMEOUT)
                     .idle_timeout(Duration::from_secs(300))
-                    .connect_lazy_with(my_options(profile)?),
+                    .connect_lazy_with(my_options(profile, &via)?),
+            ),
+            Driver::Sqlite => MetaPool::Lite(
+                SqlitePoolOptions::new()
+                    .max_connections(2)
+                    .acquire_timeout(CONNECT_TIMEOUT)
+                    .idle_timeout(Duration::from_secs(300))
+                    .connect_lazy_with(lite_options(profile)?),
             ),
         })
     }
@@ -431,12 +512,20 @@ impl MetaPool {
             .iter()
             .filter_map(|r| text_col(r, 0))
             .collect(),
+            MetaPool::Lite(p) => sqlx::query(
+                "SELECT name FROM pragma_database_list WHERE name <> 'temp' ORDER BY seq",
+            )
+            .fetch_all(p)
+            .await?
+            .iter()
+            .filter_map(|r| text_col(r, 0))
+            .collect(),
         })
     }
 
     pub async fn tables(&self, schema: &str) -> Result<Vec<TableInfo>> {
         let kind = |k: Option<String>| match k.as_deref() {
-            Some("v" | "VIEW" | "SYSTEM VIEW") => TableKind::View,
+            Some("v" | "VIEW" | "SYSTEM VIEW" | "view") => TableKind::View,
             Some("m") => TableKind::MaterializedView,
             Some("f") => TableKind::ForeignTable,
             _ => TableKind::Table,
@@ -464,6 +553,21 @@ impl MetaPool {
             .iter()
             .map(|r| (text_col(r, 0), text_col(r, 1)))
             .collect(),
+            MetaPool::Lite(p) => {
+                // The schema can't be a parameter; it's quoted as an identifier.
+                let sql = format!(
+                    "SELECT name, type FROM {}.sqlite_master \
+                     WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                     ORDER BY name",
+                    sql::quote_ident(schema, Dialect::Sqlite)
+                );
+                sqlx::query(AssertSqlSafe(sql))
+                    .fetch_all(p)
+                    .await?
+                    .iter()
+                    .map(|r| (text_col(r, 0), text_col(r, 1)))
+                    .collect()
+            }
         };
         Ok(rows
             .into_iter()
@@ -512,6 +616,18 @@ impl MetaPool {
             .iter()
             .map(|r| std::array::from_fn(|i| text_col(r, i)))
             .collect(),
+            MetaPool::Lite(p) => sqlx::query(
+                "SELECT name, type, CASE WHEN \"notnull\" THEN 'NO' ELSE 'YES' END, \
+                 dflt_value, CASE WHEN pk > 0 THEN 'YES' ELSE 'NO' END \
+                 FROM pragma_table_info(?1, ?2) ORDER BY cid",
+            )
+            .bind(table)
+            .bind(schema)
+            .fetch_all(p)
+            .await?
+            .iter()
+            .map(|r| std::array::from_fn(|i| text_col(r, i)))
+            .collect(),
         };
         Ok(rows
             .into_iter()
@@ -531,6 +647,7 @@ impl MetaPool {
         match self {
             MetaPool::Pg(p) => p.close().await,
             MetaPool::My(p) => p.close().await,
+            MetaPool::Lite(p) => p.close().await,
         }
     }
 }

@@ -12,6 +12,7 @@ use crate::profile::Driver;
 pub enum Dialect {
     Postgres,
     Mysql,
+    Sqlite,
 }
 
 impl From<Driver> for Dialect {
@@ -19,6 +20,7 @@ impl From<Driver> for Dialect {
         match d {
             Driver::Postgres => Self::Postgres,
             Driver::Mysql => Self::Mysql,
+            Driver::Sqlite => Self::Sqlite,
         }
     }
 }
@@ -125,9 +127,32 @@ impl Lexer<'_> {
                     };
                     self.push(kind, start);
                 }
-                b'`' if self.dialect == Dialect::Mysql => {
+                b'`' if self.dialect != Dialect::Postgres => {
                     self.quoted(b'`', false);
                     self.push(TokenKind::QuotedIdentifier, start);
+                }
+                b'[' if self.dialect == Dialect::Sqlite => {
+                    // [name], as in SQL Server; no escapes inside.
+                    match self.s[self.i..].find(']') {
+                        Some(end) => self.i += end + 1,
+                        None => self.i = self.b.len(),
+                    }
+                    self.push(TokenKind::QuotedIdentifier, start);
+                }
+                b'?' | b':' | b'@' | b'$'
+                    if self.dialect == Dialect::Sqlite
+                        && (c == b'?'
+                            || self.s[self.i + 1..]
+                                .chars()
+                                .next()
+                                .is_some_and(is_ident_start)) =>
+                {
+                    // ?, ?NNN, :name, @name, $name
+                    self.i += 1;
+                    while self.i < self.b.len() && is_ident_char(self.char_here()) {
+                        self.i += self.char_here().len_utf8();
+                    }
+                    self.push(TokenKind::Parameter, start);
                 }
                 b'e' | b'E'
                     if self.dialect == Dialect::Postgres
@@ -191,7 +216,7 @@ impl Lexer<'_> {
     /// MySQL needs whitespace (or the end) after `--` for it to be a comment.
     fn line_comment_dash_ok(&self) -> bool {
         match self.dialect {
-            Dialect::Postgres => true,
+            Dialect::Postgres | Dialect::Sqlite => true,
             Dialect::Mysql => match self.s.get(self.i + 2..) {
                 Some(rest) => rest.chars().next().is_none_or(|c| c.is_whitespace()),
                 None => true,
@@ -529,6 +554,9 @@ pub fn is_keyword(word: &str) -> bool {
 /// The statements in a script: byte ranges without the closing `;` or surrounding
 /// whitespace. Pieces holding only comments are left out.
 pub fn split_statements(text: &str, dialect: Dialect) -> Vec<Range<usize>> {
+    if dialect == Dialect::Mysql && text.to_ascii_uppercase().contains("DELIMITER") {
+        return split_with_delimiters(text);
+    }
     let mut out = vec![];
     let mut first: Option<usize> = None;
     let mut last_end = 0;
@@ -553,6 +581,72 @@ pub fn split_statements(text: &str, dialect: Dialect) -> Vec<Range<usize>> {
     if has_code && let Some(f) = first {
         out.push(f..last_end);
     }
+    out
+}
+
+/// MySQL scripts that change the statement delimiter, as the `mysql` client allows:
+///
+/// ```sql
+/// DELIMITER $$
+/// CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END $$
+/// DELIMITER ;
+/// ```
+///
+/// `DELIMITER` lines are for the client and aren't part of any statement.
+fn split_with_delimiters(text: &str) -> Vec<Range<usize>> {
+    let tokens = tokenize(text, Dialect::Mysql);
+    let mut out = vec![];
+    let mut delimiter = ";".to_owned();
+    let mut first: Option<usize> = None;
+    let mut last_end = 0;
+    let mut has_code = false;
+    let mut skip_until = 0;
+    let mut finish = |first: &mut Option<usize>, has_code: &mut bool, last_end: usize| {
+        if *has_code && let Some(f) = *first {
+            out.push(f..last_end);
+        }
+        *first = None;
+        *has_code = false;
+    };
+    for t in &tokens {
+        if t.range.start < skip_until {
+            continue;
+        }
+        let word = &text[t.range.clone()];
+        let at_line_start = text[..t.range.start]
+            .rsplit('\n')
+            .next()
+            .is_some_and(|before| before.trim().is_empty());
+        match t.kind {
+            TokenKind::Whitespace => {}
+            TokenKind::Identifier
+                if first.is_none() && at_line_start && word.eq_ignore_ascii_case("DELIMITER") =>
+            {
+                let line_end = text[t.range.end..]
+                    .find('\n')
+                    .map_or(text.len(), |n| t.range.end + n);
+                if let Some(d) = text[t.range.end..line_end].split_whitespace().next() {
+                    delimiter = d.to_owned();
+                }
+                skip_until = line_end;
+            }
+            TokenKind::String | TokenKind::QuotedIdentifier | TokenKind::Comment => {
+                first.get_or_insert(t.range.start);
+                last_end = t.range.end;
+                has_code |= t.kind != TokenKind::Comment;
+            }
+            _ if text[t.range.start..].starts_with(delimiter.as_str()) => {
+                finish(&mut first, &mut has_code, last_end);
+                skip_until = t.range.start + delimiter.len();
+            }
+            _ => {
+                first.get_or_insert(t.range.start);
+                last_end = t.range.end;
+                has_code = true;
+            }
+        }
+    }
+    finish(&mut first, &mut has_code, last_end);
     out
 }
 
@@ -590,7 +684,7 @@ pub fn first_keyword(sql: &str, dialect: Dialect) -> Option<String> {
 /// Quote an identifier for the dialect: `"a""b"` or `` `a``b` ``.
 pub fn quote_ident(name: &str, dialect: Dialect) -> String {
     match dialect {
-        Dialect::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+        Dialect::Postgres | Dialect::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
         Dialect::Mysql => format!("`{}`", name.replace('`', "``")),
     }
 }
@@ -732,6 +826,52 @@ mod tests {
             stmts("-- just this\nselect 2", Mysql),
             ["-- just this\nselect 2"]
         );
+    }
+
+    #[test]
+    fn sqlite_specials() {
+        use TokenKind::*;
+        let sql = "select [odd name], `b`, \"c\", ?1, :n, @m, $v from t";
+        let k: Vec<_> = kinds(sql, Sqlite)
+            .into_iter()
+            .filter(|(k, _)| *k != Punctuation)
+            .collect();
+        assert_eq!(
+            k,
+            [
+                (Keyword, "select"),
+                (QuotedIdentifier, "[odd name]"),
+                (QuotedIdentifier, "`b`"),
+                (QuotedIdentifier, "\"c\""),
+                (Parameter, "?1"),
+                (Parameter, ":n"),
+                (Parameter, "@m"),
+                (Parameter, "$v"),
+                (Keyword, "from"),
+                (Identifier, "t"),
+            ]
+        );
+        // PostgreSQL's array brackets stay punctuation there.
+        assert_eq!(kinds("a[1]", Postgres)[1], (Punctuation, "["));
+    }
+
+    #[test]
+    fn mysql_delimiters() {
+        let script = "DELIMITER $$\n\
+            CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT ';$$';\nEND $$\n\
+            DELIMITER ;\n\
+            CALL p();\n\
+            delimiter //\nselect 2 //\n";
+        assert_eq!(
+            stmts(script, Mysql),
+            [
+                "CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT ';$$';\nEND",
+                "CALL p()",
+                "select 2",
+            ]
+        );
+        // "delimiter" as a column name isn't a command.
+        assert_eq!(stmts("select delimiter from t; select 1", Mysql).len(), 2);
     }
 
     #[test]

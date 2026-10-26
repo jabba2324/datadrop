@@ -171,7 +171,7 @@ impl Client {
 
     async fn test(&self, p: &Profile, cancel: &CancellationToken) -> Result<Output> {
         p.validate()?;
-        let mut s = cancellable(cancel, Session::connect(p)).await?;
+        let mut s = cancellable(cancel, Session::connect(p, None)).await?;
         let server_version = s.server_version().await?;
         s.close().await;
         Ok(Output::Connected { server_version })
@@ -185,7 +185,7 @@ impl Client {
         {
             return Ok(pool.clone());
         }
-        let pool = MetaPool::new(&p)?;
+        let pool = MetaPool::new(&p, None)?;
         pools.insert(name.to_owned(), (p, pool.clone()));
         Ok(pool)
     }
@@ -229,7 +229,7 @@ impl Client {
             }
         }
         if guard.is_none() {
-            *guard = Some(cancellable(cancel, Session::connect(profile)).await?);
+            *guard = Some(cancellable(cancel, Session::connect(profile, None)).await?);
         }
 
         let mut out = QueryOutput::default();
@@ -256,6 +256,8 @@ impl Client {
                     if cancelled.is_err() || !matches!(settle, Ok(Ok(_))) {
                         // Couldn't stop it cleanly: drop the connection.
                         guard.take();
+                    } else if let Some(live) = guard.as_ref() {
+                        live.clear_cancel();
                     }
                     out.cancelled = true;
                     out.error = Some(StatementError {
@@ -325,6 +327,7 @@ fn default_schema(p: &Profile, schema: Option<String>) -> Result<String> {
     }
     match p.driver {
         Driver::Postgres => Ok("public".into()),
+        Driver::Sqlite => Ok("main".into()),
         Driver::Mysql => {
             let db = match p.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
                 Some(u) => u.path().trim_start_matches('/').to_owned(),

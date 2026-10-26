@@ -39,12 +39,13 @@ pub enum Command {
     ConnectionTest {
         profile: Profile,
     },
-    /// Schemas (PostgreSQL) or databases (MySQL), without the system ones.
+    /// Schemas (PostgreSQL), databases (MySQL) or attached databases (SQLite), without
+    /// the system ones.
     Schemas {
         profile: String,
     },
     /// Tables and views in a schema. Without `schema`: `public` on PostgreSQL, the
-    /// profile's database on MySQL.
+    /// profile's database on MySQL, `main` on SQLite.
     Tables {
         profile: String,
         #[serde(default)]

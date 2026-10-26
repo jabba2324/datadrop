@@ -32,7 +32,7 @@ enum Cmd {
     /// Manage connection profiles (saved in ~/.datadrop/profiles).
     #[command(subcommand)]
     Profile(ProfileCmd),
-    /// List schemas (PostgreSQL) or databases (MySQL).
+    /// List schemas (PostgreSQL), databases (MySQL) or attached databases (SQLite).
     Schemas { profile: String },
     /// List the tables and views in a schema.
     Tables {
@@ -112,19 +112,23 @@ enum ProfileCmd {
 
 #[derive(Args, Default)]
 struct ProfileFields {
-    /// postgres or mysql (default: from --url, else postgres).
+    /// postgres, mysql or sqlite (default: from --url, else postgres).
     #[arg(long)]
     driver: Option<Driver>,
-    /// A connection URL, e.g. postgres://user@host:5432/db. Its host, port and
-    /// database are used instead of --host, --port and --database.
+    /// A connection URL, e.g. postgres://user@host:5432/db or sqlite:data.db. Its
+    /// host, port and database are used instead of --host, --port and --database.
     #[arg(long)]
     url: Option<String>,
     #[arg(long)]
     host: Option<String>,
     #[arg(long)]
     port: Option<u16>,
+    /// The database name; for SQLite, the database file.
     #[arg(long)]
     database: Option<String>,
+    /// SQLite: create the database file if it doesn't exist.
+    #[arg(long)]
+    create_if_missing: bool,
     #[arg(long, short)]
     user: Option<String>,
     /// Ask for the password (it's saved in the profile file, readable only by you).
@@ -161,7 +165,17 @@ impl ProfileFields {
             p.port = self.port;
         }
         if let Some(d) = self.database {
-            p.database = d;
+            // A relative SQLite path would depend on where you run DataDrop from.
+            p.database = if p.driver.is_file() {
+                std::path::absolute(&d)
+                    .map(|a| a.display().to_string())
+                    .unwrap_or(d)
+            } else {
+                d
+            };
+        }
+        if self.create_if_missing {
+            p.create_if_missing = true;
         }
         if let Some(u) = self.user {
             p.user = u;

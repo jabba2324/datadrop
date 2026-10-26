@@ -18,15 +18,17 @@ pub enum Driver {
     #[default]
     Postgres,
     Mysql,
+    Sqlite,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 2] = [Driver::Postgres, Driver::Mysql];
+    pub const ALL: [Driver; 3] = [Driver::Postgres, Driver::Mysql, Driver::Sqlite];
 
     pub fn default_port(self) -> u16 {
         match self {
             Self::Postgres => 5432,
             Self::Mysql => 3306,
+            Self::Sqlite => 0,
         }
     }
 
@@ -34,17 +36,27 @@ impl Driver {
         match self {
             Self::Postgres => "PostgreSQL",
             Self::Mysql => "MySQL",
+            Self::Sqlite => "SQLite",
         }
+    }
+
+    /// A database file rather than a server.
+    pub fn is_file(self) -> bool {
+        self == Self::Sqlite
     }
 
     /// The driver a connection URL is for, from its scheme.
     pub fn from_url(url: &str) -> Option<Self> {
-        let scheme = url.split_once("://")?.0.to_ascii_lowercase();
+        let scheme = url
+            .split_once("://")
+            .map_or("", |s| s.0)
+            .to_ascii_lowercase();
         match scheme.as_str() {
             "postgres" | "postgresql" => Some(Self::Postgres),
             "mysql" | "mariadb" => Some(Self::Mysql),
             _ => None,
         }
+        .or_else(|| url.starts_with("sqlite:").then_some(Self::Sqlite))
     }
 }
 
@@ -54,7 +66,10 @@ impl std::str::FromStr for Driver {
         match s.to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" | "pg" => Ok(Self::Postgres),
             "mysql" | "mariadb" => Ok(Self::Mysql),
-            _ => Err(format!("unknown driver '{s}' (use postgres or mysql)")),
+            "sqlite" | "sqlite3" => Ok(Self::Sqlite),
+            _ => Err(format!(
+                "unknown driver '{s}' (use postgres, mysql or sqlite)"
+            )),
         }
     }
 }
@@ -64,6 +79,7 @@ impl std::fmt::Display for Driver {
         f.write_str(match self {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
+            Self::Sqlite => "sqlite",
         })
     }
 }
@@ -142,6 +158,9 @@ pub struct Profile {
     /// A CA certificate (PEM) to trust, for servers with a private CA.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssl_root_cert: Option<PathBuf>,
+    /// SQLite: create the database file if it doesn't exist.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub create_if_missing: bool,
 }
 
 /// What a listing shows: no password.
@@ -162,8 +181,15 @@ impl Profile {
         }
     }
 
-    /// `user@host:port/database` (the URL's, if there is one), never with a password.
+    /// `user@host:port/database` (the URL's, if there is one), never with a password;
+    /// for SQLite, the file.
     pub fn target(&self) -> String {
+        if self.driver.is_file() {
+            return match &self.url {
+                Some(u) => u.clone(),
+                None => self.database.clone(),
+            };
+        }
         if let Some(url) = self.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
             let user = if url.username().is_empty() {
                 self.user.clone()
@@ -198,10 +224,16 @@ impl Profile {
     /// Check the profile is usable before saving it.
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.name)?;
+        if self.driver.is_file() && self.url.is_none() && self.database.trim().is_empty() {
+            return Err(CoreError::InvalidProfile(
+                "choose the SQLite database file".into(),
+            ));
+        }
         if let Some(url) = &self.url {
             let driver = Driver::from_url(url).ok_or_else(|| {
                 CoreError::InvalidProfile(
-                    "the connection URL must start with postgres://, postgresql:// or mysql://"
+                    "the connection URL must start with postgres://, postgresql://, mysql:// \
+                     or sqlite:"
                         .into(),
                 )
             })?;
@@ -212,9 +244,11 @@ impl Profile {
                     self.driver.label()
                 )));
             }
-            url::Url::parse(url).map_err(|e| {
-                CoreError::InvalidProfile(format!("the connection URL isn't valid: {e}"))
-            })?;
+            if !driver.is_file() {
+                url::Url::parse(url).map_err(|e| {
+                    CoreError::InvalidProfile(format!("the connection URL isn't valid: {e}"))
+                })?;
+            }
         }
         Ok(())
     }

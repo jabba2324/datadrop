@@ -20,6 +20,7 @@ pub struct ProfileForm {
     pub password: String,
     pub ssl_mode: SslMode,
     pub ssl_root_cert: String,
+    pub create_if_missing: bool,
     show_password: bool,
     test: Option<Task>,
     test_result: Option<Result<String, String>>,
@@ -60,6 +61,7 @@ impl ProfileForm {
                 .as_ref()
                 .map(|c| c.display().to_string())
                 .unwrap_or_default(),
+            create_if_missing: p.create_if_missing,
             show_password: false,
             test: None,
             test_result: None,
@@ -70,6 +72,17 @@ impl ProfileForm {
     }
 
     pub fn build(&self) -> Result<Profile, String> {
+        if self.driver.is_file() {
+            let p = Profile {
+                name: self.name.trim().to_owned(),
+                driver: self.driver,
+                database: self.database.trim().to_owned(),
+                create_if_missing: self.create_if_missing,
+                ..Profile::default()
+            };
+            p.validate().map_err(|e| e.to_string())?;
+            return Ok(p);
+        }
         let mut p = Profile {
             name: self.name.trim().to_owned(),
             driver: self.driver,
@@ -147,10 +160,12 @@ impl ProfileForm {
                 ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
             }
             ui.add_space(6.0);
-            ui.weak(
+            if !self.driver.is_file() {
+                ui.weak(
                 "Passwords are saved as plain text in your profile files (~/.datadrop/profiles), \
                  readable only by your user account.",
-            );
+                );
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let testing = self.test.is_some();
@@ -228,6 +243,10 @@ impl ProfileForm {
                     }
                 });
                 ui.end_row();
+                if self.driver.is_file() {
+                    self.file_fields(ui);
+                    return;
+                }
                 ui.label("Connect with");
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.use_url, false, "Host and port");
@@ -237,7 +256,7 @@ impl ProfileForm {
                 if self.use_url {
                     let hint = match self.driver {
                         Driver::Postgres => "postgres://user@host:5432/database",
-                        Driver::Mysql => "mysql://user@host:3306/database",
+                        Driver::Mysql | Driver::Sqlite => "mysql://user@host:3306/database",
                     };
                     wide(ui, "URL", &mut self.url, hint);
                     // Pick the driver from the URL as it's typed.
@@ -314,6 +333,40 @@ impl ProfileForm {
     }
 }
 
+impl ProfileForm {
+    fn file_fields(&mut self, ui: &mut egui::Ui) {
+        let l = ui.label("File");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.database)
+                    .hint_text("the database file")
+                    .desired_width(ui.available_width() - 70.0),
+            )
+            .labelled_by(l.id);
+            if ui.button("Browse…").clicked() {
+                let dialog = rfd::FileDialog::new()
+                    .add_filter("SQLite databases", &["db", "sqlite", "sqlite3", "db3"])
+                    .add_filter("All files", &["*"]);
+                let picked = if self.create_if_missing {
+                    dialog.set_file_name("database.db").save_file()
+                } else {
+                    dialog.pick_file()
+                };
+                if let Some(f) = picked {
+                    self.database = f.display().to_string();
+                }
+            }
+        });
+        ui.end_row();
+        ui.label("");
+        ui.checkbox(
+            &mut self.create_if_missing,
+            "Create the file if it doesn't exist",
+        );
+        ui.end_row();
+    }
+}
+
 fn short(s: &str) -> String {
     let first: String = s.chars().take(70).collect();
     if first.len() < s.len() {
@@ -349,6 +402,18 @@ mod tests {
         let p = f.build().unwrap();
         assert_eq!(p.url.as_deref(), Some("mysql://h/db"));
         assert!(p.host.is_empty(), "host fields aren't saved with a URL");
+
+        // SQLite needs only the file.
+        let mut lite = ProfileForm::new();
+        lite.name = "local".into();
+        lite.driver = Driver::Sqlite;
+        assert!(lite.build().is_err());
+        lite.database = "/tmp/x.db".into();
+        lite.create_if_missing = true;
+        lite.password = "ignored".into();
+        let l = lite.build().unwrap();
+        assert_eq!(l.database, "/tmp/x.db");
+        assert!(l.create_if_missing && l.password.is_none());
 
         // Editing round-trips.
         let again = ProfileForm::edit(&p).build().unwrap();
