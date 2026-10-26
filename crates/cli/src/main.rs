@@ -561,6 +561,9 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
             )?;
         }
         Output::Plan(p) => render::plan(&mut stdout, p)?,
+        Output::EditsApplied { statements } => {
+            eprintln!("Saved: {statements} statement(s) committed.")
+        }
         Output::Catalog(c) => {
             for t in &c.tables {
                 let name = if t.schema == c.default_schema {

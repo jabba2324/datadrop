@@ -101,6 +101,13 @@ pub enum Command {
         #[serde(default)]
         session: Option<String>,
     },
+    /// Save edits made to a result: the statements from `edit::statements`, run in
+    /// one transaction on their own connection. Each UPDATE and DELETE must change
+    /// exactly one row, or nothing is saved.
+    ApplyEdits {
+        profile: String,
+        statements: Vec<String>,
+    },
     /// Close a session's connection.
     SessionClose {
         session: String,
@@ -158,6 +165,9 @@ pub enum Output {
     Query(QueryOutput),
     Catalog(Catalog),
     SessionClosed,
+    EditsApplied {
+        statements: usize,
+    },
     Plan(Plan),
     Exported {
         path: String,

@@ -3,18 +3,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datadrop_core::export;
 use datadrop_core::sql::{self, Dialect};
 use datadrop_core::{
     Catalog, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, ProfileSummary,
     QueryOutput, StatementError,
 };
+use datadrop_core::{edit, export};
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
 use crate::browser::{Browser, BrowserAction};
 use crate::editor::{self, Document, Find, ResultView};
+use crate::grid_edit::{Editability, Review};
 use crate::history_view::{HistoryAction, HistoryView};
 use crate::profile_form::{FormDone, ProfileForm};
 use crate::results::{self, ResultsAction};
@@ -441,6 +442,52 @@ impl App {
                 _ => {}
             }
         }
+        for doc in &mut self.docs {
+            let Editability::Checking(task, source) = &mut doc.grid.editability else {
+                continue;
+            };
+            let Some(r) = poll(task) else { continue };
+            let source = source.clone();
+            let result = doc.grid.result.unwrap_or(0);
+            let shown: Vec<String> = doc
+                .output
+                .as_ref()
+                .and_then(|o| o.results.get(result))
+                .map(|r| r.columns.iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default();
+            doc.grid.editability = match r {
+                Ok(Output::Columns { columns, .. }) => {
+                    let key: Vec<String> = columns
+                        .iter()
+                        .filter(|c| c.primary_key)
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let missing: Vec<&String> = key.iter().filter(|k| !shown.contains(k)).collect();
+                    if columns.is_empty() {
+                        Editability::ReadOnly(format!("Couldn't find the table {}.", source.table))
+                    } else if key.is_empty() {
+                        Editability::ReadOnly(format!(
+                            "{} has no primary key, so its rows can't be told apart.",
+                            source.table
+                        ))
+                    } else if !missing.is_empty() {
+                        Editability::ReadOnly(format!(
+                            "Add the key column{} {} to the SELECT to edit rows.",
+                            if missing.len() == 1 { "" } else { "s" },
+                            missing
+                                .iter()
+                                .map(|m| m.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    } else {
+                        Editability::Editable { source, key }
+                    }
+                }
+                Ok(_) => Editability::ReadOnly("Unexpected reply.".into()),
+                Err(e) => Editability::ReadOnly(e.to_string()),
+            };
+        }
         let mut changed_schema = vec![];
         for doc in &mut self.docs {
             let Some(r) = poll(&mut doc.running) else {
@@ -461,6 +508,7 @@ impl App {
                 continue;
             }
             doc.shown_result = usize::MAX; // the last result set
+            doc.grid = Default::default();
             self.history.stale = true;
             doc.output = Some(match r {
                 Ok(Output::Query(q)) => {
@@ -1044,6 +1092,176 @@ impl App {
         }
     }
 
+    /// Whether a result can be edited: it must come from one table, whose primary
+    /// key is in the result.
+    fn check_editable(&mut self, doc: usize, result: usize) {
+        let dialect = self.dialect_of(self.docs[doc].profile.as_deref());
+        let d = &mut self.docs[doc];
+        let (Some(out), Some(profile)) = (&d.output, d.profile.clone()) else {
+            return;
+        };
+        let Some(r) = out.results.get(result) else {
+            return;
+        };
+        d.grid.editability = match edit::source_table(&r.sql, dialect) {
+            None => Editability::ReadOnly(
+                "Only results from a single table can be edited (no joins, grouping, DISTINCT \
+                 or subqueries)."
+                    .into(),
+            ),
+            Some(source) => Editability::Checking(
+                Some(self.backend.run(Command::Columns {
+                    profile,
+                    schema: source.schema.clone(),
+                    table: source.table.clone(),
+                })),
+                source,
+            ),
+        };
+    }
+
+    /// Show the SQL that saves a result's edits.
+    fn review_edits(&mut self, doc: usize, result: usize) {
+        let dialect = self.dialect_of(self.docs[doc].profile.as_deref());
+        let d = &mut self.docs[doc];
+        let Some(r) = d.output.as_ref().and_then(|o| o.results.get(result)) else {
+            return;
+        };
+        let Editability::Editable { source, key } = &d.grid.editability else {
+            return;
+        };
+        let columns: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();
+        match edit::statements(dialect, source, key, &columns, &r.rows, &d.grid.edits) {
+            Ok(statements) if statements.is_empty() => {
+                self.toasts.info("Nothing has changed.");
+            }
+            Ok(statements) => {
+                d.grid.review = Some(Review {
+                    statements,
+                    saving: None,
+                    error: None,
+                    refresh: r.sql.clone(),
+                });
+            }
+            Err(e) => {
+                self.toasts.error(e.to_string());
+            }
+        }
+    }
+
+    fn review_dialog(&mut self, ctx: &egui::Context) {
+        let i = self.active;
+        let Some(profile) = self.docs[i].profile.clone() else {
+            return;
+        };
+        let Some(review) = &mut self.docs[i].grid.review else {
+            return;
+        };
+        let mut done = None;
+        if let Some(r) = poll(&mut review.saving) {
+            match r {
+                Ok(_) => done = Some(true),
+                Err(e) => review.error = Some(e.to_string()),
+            }
+        }
+        let mut close = false;
+        let mut save = false;
+        egui::Modal::new(egui::Id::new("review-edits")).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.heading("Save changes");
+            ui.add_space(4.0);
+            ui.label(format!(
+                "{} statement{} will run in one transaction. If any of them doesn't change \
+                 exactly one row, nothing is saved.",
+                review.statements.len(),
+                if review.statements.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+            ui.add_space(6.0);
+            let mut text = review
+                .statements
+                .iter()
+                .map(|s| format!("{s};"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .interactive(true),
+                    );
+                });
+            if let Some(e) = &review.error {
+                ui.add_space(6.0);
+                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(format!("{} Copy SQL", icon::COPY)).clicked() {
+                    ui.ctx().copy_text(text.clone());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let saving = review.saving.is_some();
+                    if ui
+                        .add_enabled(!saving, egui::Button::new(RichText::new("Save").strong()))
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui
+                        .add_enabled(!saving, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    if saving {
+                        ui.spinner();
+                    }
+                });
+            });
+        });
+        if save {
+            review.error = None;
+            review.saving = Some(self.backend.run(Command::ApplyEdits {
+                profile,
+                statements: review.statements.clone(),
+            }));
+        }
+        if close {
+            self.docs[i].grid.review = None;
+        }
+        if done == Some(true) {
+            let refresh = self.docs[i].grid.review.take().map(|r| r.refresh);
+            self.docs[i].grid = Default::default();
+            self.toasts.success("Saved");
+            if let Some(sql) = refresh {
+                self.rerun(i, sql);
+            }
+        }
+    }
+
+    /// Run `sql` in tab `i` (to show a table again after saving, say).
+    fn rerun(&mut self, i: usize, sql: String) {
+        let doc = &mut self.docs[i];
+        let Some(profile) = doc.profile.clone() else {
+            return;
+        };
+        doc.running = Some(self.backend.run(Command::Query {
+            profile,
+            sql,
+            session: Some(doc.session()),
+            max_rows: Some(self.settings.max_rows),
+        }));
+        doc.run_started = Some(Instant::now());
+        doc.view = ResultView::Results;
+    }
+
     /// Save a result to a file. If it was cut short by the row limit (and is a query),
     /// the statement runs again with every row streamed into the file.
     fn export_result(&mut self, doc: usize, result: usize) {
@@ -1151,6 +1369,7 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.review_dialog(ctx);
         if let Some(form) = &mut self.form
             && let Some(done) = form.ui(ctx, &self.backend)
         {
@@ -1328,6 +1547,8 @@ impl eframe::App for App {
                             }
                         }
                         ResultsAction::Export(r) => self.export_result(i, r),
+                        ResultsAction::CheckEditable(r) => self.check_editable(i, r),
+                        ResultsAction::Review(r) => self.review_edits(i, r),
                         ResultsAction::None => {}
                     }
                 });

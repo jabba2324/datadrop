@@ -6,6 +6,7 @@ use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 
 use crate::editor::{Document, ResultView};
+use crate::grid_edit::{CellEditor, Editability, GridEdit};
 
 /// Longest text shown in a cell; the full value is in its tooltip and copies.
 const CELL_CHARS: usize = 120;
@@ -15,6 +16,10 @@ pub enum ResultsAction {
     Stop,
     /// Export this result (an index into the output's results).
     Export(usize),
+    /// Find out whether this result can be edited.
+    CheckEditable(usize),
+    /// Show the SQL that would save the edits.
+    Review(usize),
 }
 
 pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
@@ -97,6 +102,13 @@ pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
     }
     let mut action = ResultsAction::None;
     if let Some(&i) = sets.get(doc.shown_result) {
+        if doc.grid.result != Some(i) {
+            doc.grid = GridEdit::for_result(i);
+        }
+        if matches!(doc.grid.editability, Editability::Unknown) {
+            action = ResultsAction::CheckEditable(i);
+        }
+        let rows = &out.results[i].rows;
         ui.horizontal(|ui| {
             let exporting = doc.exporting.is_some();
             if exporting {
@@ -116,9 +128,61 @@ pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
             {
                 ui.ctx().copy_text(tsv_all(&out.results[i]));
             }
+            ui.separator();
+            let grid = &mut doc.grid;
+            match &grid.editability {
+                Editability::Editable { source, .. } => {
+                    if ui
+                        .small_button(format!("{} Row", icon::PLUS))
+                        .on_hover_text(format!("Add a row to {}", source.table))
+                        .clicked()
+                    {
+                        grid.edits.inserted.push(Default::default());
+                        let row = rows.len() + grid.edits.inserted.len() - 1;
+                        grid.editing = Some(CellEditor {
+                            row,
+                            col: 0,
+                            buffer: String::new(),
+                            focus: true,
+                        });
+                    }
+                    let n = grid.edits.count();
+                    if n > 0 {
+                        if ui
+                            .small_button(format!("{} Revert", icon::ARROW_COUNTER_CLOCKWISE))
+                            .on_hover_text("Forget the changes")
+                            .clicked()
+                        {
+                            grid.edits = Default::default();
+                            grid.editing = None;
+                        }
+                        if ui
+                            .button(
+                                RichText::new(format!(
+                                    "{} Review and save ({n})",
+                                    icon::FLOPPY_DISK
+                                ))
+                                .strong(),
+                            )
+                            .on_hover_text("See the SQL that saves your changes, then run it")
+                            .clicked()
+                        {
+                            grid.commit(rows);
+                            action = ResultsAction::Review(i);
+                        }
+                    } else {
+                        ui.weak("Double-click a cell to edit it");
+                    }
+                }
+                Editability::ReadOnly(why) => {
+                    ui.weak(format!("{} Read-only", icon::LOCK_SIMPLE))
+                        .on_hover_text(why);
+                }
+                _ => {}
+            }
         });
         ui.separator();
-        table(ui, &out.results[i], doc.id);
+        table(ui, &out.results[i], doc.id, &mut doc.grid);
     }
     action
 }
@@ -220,13 +284,24 @@ fn shorten(s: &str, max: usize) -> (String, bool) {
     (out, true)
 }
 
-fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64) {
+fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64, grid: &mut GridEdit) {
     if r.columns.is_empty() {
         return;
     }
+    let editable = grid.is_editable();
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
     let font = egui::TextStyle::Monospace.resolve(ui.style());
     let null_color = ui.visuals().weak_text_color();
+    let dark = ui.visuals().dark_mode;
+    let changed_bg = if dark {
+        egui::Color32::from_rgba_unmultiplied(0xE0, 0xB0, 0x30, 40)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(0xF0, 0xC0, 0x30, 70)
+    };
+    let new_bg =
+        egui::Color32::from_rgba_unmultiplied(0x40, 0xC0, 0x60, if dark { 35 } else { 50 });
+    let deleted_bg =
+        egui::Color32::from_rgba_unmultiplied(0xE0, 0x40, 0x40, if dark { 40 } else { 45 });
     // Initial widths from the header and the first rows.
     let widths: Vec<f32> = (0..r.columns.len())
         .map(|c| {
@@ -241,8 +316,21 @@ fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64) {
             (longest as f32 * font.size * 0.62 + 16.0).clamp(50.0, 420.0)
         })
         .collect();
-    let index_width =
-        (r.rows.len().max(1).to_string().len() as f32 * font.size * 0.62 + 14.0).max(32.0);
+    let n = r.rows.len();
+    let total = n + if editable {
+        grid.edits.inserted.len()
+    } else {
+        0
+    };
+    let index_width = (total.max(1).to_string().len() as f32 * font.size * 0.62 + 30.0).max(40.0);
+
+    // Changes made this frame, applied after the table (which borrows `grid`).
+    let mut set: Option<(usize, usize, Option<String>)> = None;
+    let mut start_edit: Option<(usize, usize, String)> = None;
+    let mut toggle_delete: Option<usize> = None;
+    let mut revert: Option<(usize, usize)> = None;
+    let mut commit = false;
+    let mut cancel = false;
 
     egui::ScrollArea::horizontal()
         .id_salt(("results-h", doc_id))
@@ -267,33 +355,138 @@ fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64) {
                 }
             })
             .body(|body| {
-                body.rows(row_height, r.rows.len(), |mut row| {
+                body.rows(row_height, total, |mut row| {
                     let i = row.index();
-                    let values = &r.rows[i];
+                    let is_new = i >= n;
+                    let deleted = grid.edits.deleted.contains(&i);
+                    let original = r.rows.get(i);
                     row.col(|ui| {
-                        ui.weak((i + 1).to_string());
-                    });
-                    for (c, v) in values.iter().enumerate() {
-                        row.col(|ui| {
-                            let resp = match v {
-                                None => ui.label(
-                                    RichText::new("NULL")
-                                        .italics()
-                                        .color(null_color)
-                                        .font(font.clone()),
-                                ),
-                                Some(s) => {
-                                    let (shown, cut) = shorten(s, CELL_CHARS);
-                                    let resp = ui.label(RichText::new(shown).font(font.clone()));
-                                    if cut { resp.on_hover_text(s) } else { resp }
-                                }
-                            };
+                        if deleted {
+                            ui.painter().rect_filled(ui.max_rect(), 0.0, deleted_bg);
+                        } else if is_new {
+                            ui.painter().rect_filled(ui.max_rect(), 0.0, new_bg);
+                        }
+                        let label = if is_new {
+                            "new".to_owned()
+                        } else {
+                            (i + 1).to_string()
+                        };
+                        let resp = ui.add(
+                            egui::Label::new(RichText::new(label).weak())
+                                .sense(egui::Sense::click()),
+                        );
+                        if editable && !is_new {
                             resp.context_menu(|ui| {
+                                let text = if deleted {
+                                    "Restore the row"
+                                } else {
+                                    "Delete the row"
+                                };
+                                if ui.button(text).clicked() {
+                                    toggle_delete = Some(i);
+                                }
+                            });
+                        }
+                    });
+                    for c in 0..r.columns.len() {
+                        row.col(|ui| {
+                            let edited = if is_new {
+                                grid.edits.inserted.get(i - n).and_then(|m| m.get(&c))
+                            } else {
+                                grid.edits.cells.get(&(i, c))
+                            };
+                            let value: Option<&Option<String>> =
+                                edited.or_else(|| original.map(|o| &o[c]));
+                            if deleted {
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, deleted_bg);
+                            } else if edited.is_some() {
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, changed_bg);
+                            } else if is_new {
+                                ui.painter().rect_filled(ui.max_rect(), 0.0, new_bg);
+                            }
+
+                            // The cell being typed in.
+                            if let Some(e) =
+                                grid.editing.as_mut().filter(|e| e.row == i && e.col == c)
+                            {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut e.buffer)
+                                        .font(font.clone())
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if e.focus {
+                                    resp.request_focus();
+                                    e.focus = false;
+                                }
+                                if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                                    cancel = true;
+                                } else if resp.lost_focus() {
+                                    commit = true;
+                                }
+                                return;
+                            }
+
+                            let mut text = match value {
+                                Some(None) => RichText::new("NULL").italics().color(null_color),
+                                Some(Some(s)) => RichText::new(shorten(s, CELL_CHARS).0),
+                                None => RichText::new("default").italics().color(null_color),
+                            }
+                            .font(font.clone());
+                            if deleted {
+                                text = text.strikethrough();
+                            }
+                            let mut resp =
+                                ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                            if let Some(Some(s)) = value
+                                && shorten(s, CELL_CHARS).1
+                            {
+                                resp = resp.on_hover_text(s);
+                            }
+                            if editable && !deleted && resp.double_clicked() {
+                                let current = value.cloned().flatten().unwrap_or_default();
+                                start_edit = Some((i, c, current));
+                            }
+                            let values: Vec<Option<String>> = (0..r.columns.len())
+                                .map(|k| {
+                                    if is_new {
+                                        grid.edits.inserted[i - n].get(&k).cloned().flatten()
+                                    } else {
+                                        grid.edits
+                                            .cells
+                                            .get(&(i, k))
+                                            .cloned()
+                                            .unwrap_or_else(|| r.rows[i][k].clone())
+                                    }
+                                })
+                                .collect();
+                            resp.context_menu(|ui| {
+                                if editable && !deleted {
+                                    if ui.button("Edit the value").clicked() {
+                                        let current = value.cloned().flatten().unwrap_or_default();
+                                        start_edit = Some((i, c, current));
+                                    }
+                                    if ui.button("Set to NULL").clicked() {
+                                        set = Some((i, c, None));
+                                    }
+                                    if edited.is_some() && ui.button("Undo this change").clicked() {
+                                        revert = Some((i, c));
+                                    }
+                                    if !is_new && ui.button("Delete the row").clicked() {
+                                        toggle_delete = Some(i);
+                                    }
+                                    ui.separator();
+                                } else if editable
+                                    && deleted
+                                    && ui.button("Restore the row").clicked()
+                                {
+                                    toggle_delete = Some(i);
+                                }
                                 if ui.button("Copy value").clicked() {
-                                    ui.ctx().copy_text(v.clone().unwrap_or_default());
+                                    ui.ctx()
+                                        .copy_text(value.cloned().flatten().unwrap_or_default());
                                 }
                                 if ui.button("Copy row").clicked() {
-                                    ui.ctx().copy_text(tsv_row(values));
+                                    ui.ctx().copy_text(tsv_row(&values));
                                 }
                                 if ui.button("Copy all rows (with headers)").clicked() {
                                     ui.ctx().copy_text(tsv_all(r));
@@ -310,6 +503,38 @@ fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64) {
                 });
             });
         });
+
+    if cancel {
+        grid.editing = None;
+    } else if commit {
+        grid.commit(&r.rows);
+    }
+    if let Some((row, col, current)) = start_edit {
+        grid.commit(&r.rows);
+        grid.editing = Some(CellEditor {
+            row,
+            col,
+            buffer: current,
+            focus: true,
+        });
+    }
+    if let Some((row, col, value)) = set {
+        grid.set(row, col, value, &r.rows);
+    }
+    if let Some((row, col)) = revert {
+        if row >= n {
+            if let Some(m) = grid.edits.inserted.get_mut(row - n) {
+                m.remove(&col);
+            }
+        } else {
+            grid.edits.cells.remove(&(row, col));
+        }
+    }
+    if let Some(row) = toggle_delete
+        && !grid.edits.deleted.remove(&row)
+    {
+        grid.edits.deleted.insert(row);
+    }
 }
 
 fn tsv_field(v: &Option<String>) -> String {

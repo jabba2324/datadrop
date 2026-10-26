@@ -346,3 +346,85 @@ fn autocompletes_tables_and_columns() {
     assert!(h.state().docs[0].completion.is_none());
     assert!(h.state().docs[0].text.ends_with("f.n"));
 }
+
+#[test]
+fn edits_rows_in_the_grid() {
+    use crate::grid_edit::Editability;
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(
+        &mut h,
+        "create table pets (id integer primary key, name text); \
+         insert into pets values (1, 'Rex'), (2, 'Tom'), (3, 'Bo')",
+    );
+    run_tab(&mut h, "select id, name from pets order by id");
+    until(&mut h, "the grid to become editable", |a| {
+        a.docs[0].grid.is_editable()
+    });
+
+    // Right-click a cell: delete its row.
+    h.get_by_label("Tom").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Delete the row").click();
+    h.run_steps(2);
+    // Change another cell (as typing in it would) and add a row.
+    {
+        let a = h.state_mut();
+        let rows = a.docs[0].output.as_ref().unwrap().results[0].rows.clone();
+        a.docs[0].grid.set(0, 1, Some("Rex's".into()), &rows);
+        a.docs[0].grid.edits.inserted.push(Default::default());
+        a.docs[0].grid.set(3, 0, Some("4".into()), &rows);
+        a.docs[0].grid.set(3, 1, None, &rows);
+    }
+    h.run_steps(2);
+    h.get_by_label_contains("Review and save (3)").click();
+    h.run_steps(3);
+    let statements = h.state().docs[0]
+        .grid
+        .review
+        .as_ref()
+        .unwrap()
+        .statements
+        .clone();
+    assert_eq!(
+        statements,
+        [
+            "UPDATE \"pets\" SET \"name\" = 'Rex''s' WHERE \"id\" = '1'",
+            "DELETE FROM \"pets\" WHERE \"id\" = '2'",
+            "INSERT INTO \"pets\" (\"id\", \"name\") VALUES ('4', NULL)",
+        ]
+    );
+    h.get_by_label("Save").click();
+    until(&mut h, "the save and the refresh", |a| {
+        a.docs[0].grid.review.is_none()
+            && a.docs[0].running.is_none()
+            && a.docs[0]
+                .output
+                .as_ref()
+                .is_some_and(|o| o.results[0].rows.len() == 3)
+    });
+    let rows = h.state().docs[0].output.clone().unwrap().results[0]
+        .rows
+        .clone();
+    assert_eq!(
+        rows,
+        [
+            vec![Some("1".to_owned()), Some("Rex's".to_owned())],
+            vec![Some("3".to_owned()), Some("Bo".to_owned())],
+            vec![Some("4".to_owned()), None],
+        ]
+    );
+
+    // A join isn't editable.
+    run_tab(
+        &mut h,
+        "select a.id, b.name from pets a join pets b on a.id = b.id",
+    );
+    h.run_steps(3);
+    assert!(matches!(
+        h.state().docs[0].grid.editability,
+        Editability::ReadOnly(_)
+    ));
+}

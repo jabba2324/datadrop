@@ -41,6 +41,8 @@ pub struct Document {
     /// Which result set is shown when a script returned several.
     pub shown_result: usize,
     pub running: Option<Task>,
+    /// Editing the shown result.
+    pub grid: crate::grid_edit::GridEdit,
     pub view: ResultView,
     pub plan: Option<datadrop_core::Plan>,
     pub plan_error: Option<String>,
@@ -74,6 +76,7 @@ impl Document {
             output: None,
             shown_result: 0,
             running: None,
+            grid: Default::default(),
             view: ResultView::Results,
             plan: None,
             plan_error: None,

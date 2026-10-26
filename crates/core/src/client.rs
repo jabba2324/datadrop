@@ -179,6 +179,16 @@ impl Client {
                 self.remember(&p.name, &sql, &out);
                 Ok(Output::Query(out))
             }
+            Command::ApplyEdits {
+                profile,
+                statements,
+            } => {
+                let p = self.store.get(&profile)?;
+                self.apply_edits(&p, &statements, cancel).await?;
+                Ok(Output::EditsApplied {
+                    statements: statements.len(),
+                })
+            }
             Command::Explain {
                 profile,
                 sql,
@@ -381,6 +391,53 @@ impl Client {
             *guard = Some(cancellable(cancel, Session::connect(profile, None)).await?);
         }
         Ok(())
+    }
+
+    async fn apply_edits(
+        &self,
+        profile: &Profile,
+        statements: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let mut s = cancellable(cancel, Session::connect(profile, None)).await?;
+        let begin = if profile.driver == Driver::Mysql {
+            "START TRANSACTION"
+        } else {
+            "BEGIN"
+        };
+        let result = async {
+            s.run(begin, 1).await?;
+            for (i, st) in statements.iter().enumerate() {
+                let r = s.run(st, 1).await.map_err(|e| {
+                    CoreError::Database(format!(
+                        "statement {} failed, nothing was saved: {e}",
+                        i + 1
+                    ))
+                })?;
+                let kind = sql::first_keyword(st, profile.driver.into()).unwrap_or_default();
+                // MySQL counts an UPDATE that sets the same values as changing nothing.
+                let unchanged_ok = kind == "UPDATE" && profile.driver == Driver::Mysql;
+                let n = r.rows_affected;
+                if n > 1 || (n == 0 && !unchanged_ok) {
+                    return Err(CoreError::Database(format!(
+                        "statement {} changed {n} rows instead of 1 (was the row changed or \
+                         deleted meanwhile?), so nothing was saved",
+                        i + 1
+                    )));
+                }
+            }
+            s.run("COMMIT", 1).await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = s.run("ROLLBACK", 1).await;
+        }
+        s.close().await;
+        result
     }
 
     async fn explain(

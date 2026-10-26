@@ -711,3 +711,80 @@ both!(explains_queries, |driver, schema| async move {
     // One statement at a time.
     assert!(explain("SELECT 1; SELECT 2".into(), false).await.is_err());
 });
+
+both!(
+    saves_edits_in_one_transaction,
+    |driver, schema| async move {
+        use datadrop_core::edit::{self, Edits};
+        use std::collections::BTreeMap;
+        let Some(db) = setup(driver, schema).await else {
+            return;
+        };
+        let p = prefix(&db, schema);
+        ok(run(
+            &db.client,
+            "test",
+            &format!(
+                "CREATE TABLE {p}pets (id int PRIMARY KEY, name varchar(20), age int); \
+             INSERT INTO {p}pets VALUES (1, 'Rex', 3), (2, 'Tom', 5), (3, 'Bo', 1)"
+            ),
+            None,
+        )
+        .await);
+        let select = format!("SELECT id, name, age FROM {p}pets ORDER BY id");
+        let q = ok(run(&db.client, "test", &select, None).await);
+        let result = &q.results[0];
+        let dialect = driver.into();
+        let source = edit::source_table(&select, dialect).expect("editable");
+        let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+
+        let mut e = Edits::default();
+        e.cells.insert((0, 1), Some("Rex's".into()));
+        e.cells.insert((1, 2), None);
+        e.deleted.insert(2);
+        e.inserted.push(BTreeMap::from([
+            (0, Some("4".into())),
+            (1, Some("Kit".into())),
+        ]));
+        let statements =
+            edit::statements(dialect, &source, &["id".into()], &columns, &result.rows, &e).unwrap();
+        assert_eq!(statements.len(), 4, "{statements:#?}");
+        db.client
+            .execute(Command::ApplyEdits {
+                profile: "test".into(),
+                statements,
+            })
+            .await
+            .unwrap();
+        let q = ok(run(&db.client, "test", &select, None).await);
+        let rows: Vec<Vec<Option<&str>>> = q.results[0]
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|v| v.as_deref()).collect())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                vec![Some("1"), Some("Rex's"), Some("3")],
+                vec![Some("2"), Some("Tom"), None],
+                vec![Some("4"), Some("Kit"), None],
+            ]
+        );
+
+        // A row that's gone: nothing is saved, not even the statements before it.
+        let err = db
+            .client
+            .execute(Command::ApplyEdits {
+                profile: "test".into(),
+                statements: vec![
+                    format!("UPDATE {p}pets SET name = 'Changed' WHERE id = '1'"),
+                    format!("DELETE FROM {p}pets WHERE id = '99'"),
+                ],
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing was saved"), "{err}");
+        let q = ok(run(&db.client, "test", &select, None).await);
+        assert_eq!(q.results[0].rows[0][1].as_deref(), Some("Rex's"));
+    }
+);
