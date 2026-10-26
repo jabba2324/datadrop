@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod command;
+pub mod complete;
 pub mod db;
 pub mod error;
 pub mod export;
@@ -17,7 +18,8 @@ pub mod sql;
 
 pub use client::{Client, ConfigDir};
 pub use command::{Command, DEFAULT_MAX_ROWS, Output, QueryOutput, StatementError};
-pub use db::{Column, ColumnInfo, StatementResult, TableInfo, TableKind};
+pub use complete::{Catalog, Completion, ItemKind};
+pub use db::{CatalogTable, Column, ColumnInfo, StatementResult, TableInfo, TableKind};
 pub use error::{CoreError, Result};
 pub use export::ExportFormat;
 pub use history::HistoryEntry;

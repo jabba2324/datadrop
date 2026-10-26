@@ -8,9 +8,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use datadrop_core::QueryOutput;
+use datadrop_core::complete::{self, Catalog, Completion, ItemKind};
 use datadrop_core::sql::{self, Dialect};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{FontId, Galley, TextBuffer};
+use egui::{Key, Modifiers};
+use egui_phosphor::regular as icon;
 
 use crate::backend::Task;
 use crate::theme;
@@ -51,6 +54,9 @@ pub struct Document {
     /// Scroll so this byte offset is visible on the next frame.
     pub scroll_to: Option<usize>,
     pub request_focus: bool,
+    pub completion: Option<CompletionPopup>,
+    /// Show suggestions now, even with nothing typed (Ctrl+Space).
+    pub force_completion: bool,
     layout_cache: Option<(u64, Arc<Galley>)>,
     /// Where the cursor was last frame (char index), to scroll when it moves.
     last_cursor: Option<usize>,
@@ -77,6 +83,8 @@ impl Document {
             select: None,
             scroll_to: None,
             request_focus: true,
+            completion: None,
+            force_completion: false,
             layout_cache: None,
             last_cursor: None,
         }
@@ -238,10 +246,40 @@ pub fn editor_ui(
     matches: &[Range<usize>],
     current: Option<usize>,
     font_size: f32,
+    catalog: &Catalog,
 ) {
     let id = doc.editor_id();
     let font = FontId::monospace(font_size);
     let dark = ui.visuals().dark_mode;
+
+    // The suggestions list takes the arrow keys, Enter, Tab and Esc while it's open
+    // (before the text area sees them).
+    if let Some(popup) = &mut doc.completion {
+        let n = popup.items.len();
+        let (up, down, accept, close) = ui.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::Enter)
+                    || i.consume_key(Modifiers::NONE, Key::Tab),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
+        });
+        if up {
+            popup.selected = (popup.selected + n - 1) % n;
+            popup.scroll = true;
+        }
+        if down {
+            popup.selected = (popup.selected + 1) % n;
+            popup.scroll = true;
+        }
+        if accept {
+            let i = popup.selected;
+            accept_completion(doc, i);
+        } else if close {
+            doc.completion = None;
+        }
+    }
 
     if let Some(sel) = doc.select.take() {
         let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
@@ -255,6 +293,9 @@ pub fn editor_ui(
         egui::TextEdit::store_state(ui.ctx(), id, state);
     }
 
+    // What happened in the text area this frame: the cursor (char index), whether
+    // the text changed, and where the cursor is on screen.
+    let mut typed: Option<(Option<usize>, bool, egui::Rect)> = None;
     let outer = ui.available_size();
     let bg = if dark {
         egui::Color32::from_gray(24)
@@ -351,6 +392,10 @@ pub fn editor_ui(
                             let cursor = out.cursor_range.map(|r| r.primary.index.0);
                             let moved = cursor != *last_cursor;
                             *last_cursor = cursor;
+                            if out.response.response.has_focus() {
+                                let anchor = at(cursor.unwrap_or(0));
+                                typed = Some((cursor, out.response.response.changed(), anchor));
+                            }
                             match cursor {
                                 Some(ci) if moved || out.response.response.changed() => {
                                     let rect = at(ci).expand2(egui::vec2(8.0, 4.0));
@@ -367,6 +412,151 @@ pub fn editor_ui(
                 });
             });
     });
+
+    update_completion(ui.ctx(), doc, dialect, catalog, typed);
+    completion_popup(ui.ctx(), doc);
+}
+
+/// The suggestions list under the cursor.
+pub struct CompletionPopup {
+    /// The text the chosen suggestion replaces (bytes).
+    pub range: Range<usize>,
+    pub items: Vec<Completion>,
+    pub selected: usize,
+    /// Where it's shown: just under the cursor.
+    anchor: egui::Pos2,
+    /// The cursor when it opened (char index); moving away closes it.
+    cursor: usize,
+    scroll: bool,
+}
+
+/// Open, refresh or close the suggestions after this frame's typing.
+fn update_completion(
+    ctx: &egui::Context,
+    doc: &mut Document,
+    dialect: Dialect,
+    catalog: &Catalog,
+    typed: Option<(Option<usize>, bool, egui::Rect)>,
+) {
+    let force = std::mem::take(&mut doc.force_completion);
+    let Some((Some(ci), changed, rect)) = typed else {
+        // Clicking a suggestion takes focus from the text: keep the list for the click.
+        let over_list = ctx.pointer_latest_pos().is_some_and(|pos| {
+            ctx.layer_id_at(pos)
+                .is_some_and(|l| l.id == egui::Id::new(("completion", doc.id)))
+        });
+        if !force && !over_list {
+            doc.completion = None;
+        }
+        return;
+    };
+    let cursor = char_to_byte(&doc.text, ci);
+    let before = doc.text[..cursor].chars().next_back();
+    let word_char = before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.');
+    let still_here = doc.completion.as_ref().is_some_and(|p| p.cursor == ci);
+    if force || (changed && word_char) || (still_here && !changed) {
+        if still_here && !changed && !force {
+            return; // nothing new
+        }
+        let (range, items) = complete::complete(&doc.text, dialect, cursor, catalog);
+        let typed_something = !range.is_empty() || doc.text[..range.start].ends_with('.');
+        if items.is_empty() || !(force || typed_something) {
+            doc.completion = None;
+            return;
+        }
+        let keep = doc
+            .completion
+            .as_ref()
+            .map(|p| p.items[p.selected].label.clone());
+        let selected = keep
+            .and_then(|l| items.iter().position(|i| i.label == l))
+            .unwrap_or(0);
+        doc.completion = Some(CompletionPopup {
+            range,
+            items,
+            selected,
+            anchor: rect.left_bottom() + egui::vec2(0.0, 2.0),
+            cursor: ci,
+            scroll: true,
+        });
+        ctx.request_repaint();
+    } else {
+        // Typed something else, or moved the cursor.
+        doc.completion = None;
+    }
+}
+
+fn accept_completion(doc: &mut Document, i: usize) {
+    let Some(popup) = doc.completion.take() else {
+        return;
+    };
+    let Some(item) = popup.items.get(i) else {
+        return;
+    };
+    if popup.range.end > doc.text.len() || !doc.text.is_char_boundary(popup.range.start) {
+        return;
+    }
+    doc.text.replace_range(popup.range.clone(), &item.insert);
+    let end = popup.range.start + item.insert.len();
+    doc.select = Some(end..end);
+}
+
+fn completion_popup(ctx: &egui::Context, doc: &mut Document) {
+    let Some(popup) = &mut doc.completion else {
+        return;
+    };
+    let mut clicked = None;
+    egui::Area::new(egui::Id::new(("completion", doc.id)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup.anchor)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(240.0);
+                ui.set_max_width(420.0);
+                let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+                let height = (popup.items.len() as f32 * row).min(260.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .min_scrolled_height(height)
+                    .auto_shrink([true, true])
+                    .show(ui, |ui| {
+                        for (i, item) in popup.items.iter().enumerate() {
+                            let glyph = match item.kind {
+                                ItemKind::Column => icon::COLUMNS,
+                                ItemKind::Table => icon::TABLE,
+                                ItemKind::View => icon::EYE,
+                                ItemKind::Alias => icon::AT,
+                                ItemKind::Schema => icon::FOLDER_SIMPLE,
+                                ItemKind::Keyword => icon::TEXT_AA,
+                            };
+                            let selected = i == popup.selected;
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    let r = ui.add(egui::Button::selectable(
+                                        selected,
+                                        format!("{glyph}  {}", item.label),
+                                    ));
+                                    if !item.detail.is_empty() {
+                                        ui.weak(&item.detail);
+                                    }
+                                    r
+                                })
+                                .inner;
+                            if selected && popup.scroll {
+                                resp.scroll_to_me(None);
+                            }
+                            if resp.clicked() {
+                                clicked = Some(i);
+                            }
+                        }
+                    });
+            });
+        });
+    popup.scroll = false;
+    if let Some(i) = clicked {
+        accept_completion(doc, i);
+        doc.request_focus = true;
+    }
 }
 
 /// The layout for highlighted SQL: token colours, plus backgrounds for find matches.

@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::command::{Command, DEFAULT_MAX_ROWS, Output, QueryOutput, StatementError};
+use crate::complete::Catalog;
 use crate::db::{MetaPool, Session};
 use crate::error::{CoreError, Result};
 use crate::export::{ExportFormat, ExportWriter};
@@ -147,6 +148,17 @@ impl Client {
                     table,
                     columns,
                 })
+            }
+            Command::Catalog { profile } => {
+                let p = self.store.get(&profile)?;
+                let pool = self.pool(&profile)?;
+                let schemas = cancellable(cancel, pool.schemas()).await?;
+                let tables = cancellable(cancel, pool.catalog()).await?;
+                Ok(Output::Catalog(Catalog {
+                    default_schema: default_schema(&p, None).unwrap_or_default(),
+                    schemas,
+                    tables,
+                }))
             }
             Command::Query {
                 profile,

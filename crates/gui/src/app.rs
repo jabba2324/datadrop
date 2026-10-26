@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use datadrop_core::export;
 use datadrop_core::sql::{self, Dialect};
 use datadrop_core::{
-    Command, ConfigDir, CoreError, Driver, ExportFormat, Output, ProfileSummary, QueryOutput,
-    StatementError,
+    Catalog, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, ProfileSummary,
+    QueryOutput, StatementError,
 };
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
@@ -32,6 +34,12 @@ pub enum LeftView {
     History,
 }
 
+enum CatalogState {
+    Loading(Option<Task>),
+    Ready(Arc<Catalog>),
+    Failed,
+}
+
 pub struct Confirm {
     pub kind: ConfirmKind,
     pub title: String,
@@ -52,6 +60,8 @@ pub struct App {
     pub left: LeftView,
     pub history: HistoryView,
     pub find: Find,
+    /// Tables and columns per connection, for autocompletion.
+    catalogs: HashMap<String, CatalogState>,
     pub form: Option<ProfileForm>,
     pub confirm: Option<Confirm>,
     delete_task: Option<Task>,
@@ -75,6 +85,7 @@ const EXPLAIN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key:
 const REPLACE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 const FIND_PREV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F3);
 const FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F3);
+const COMPLETE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Space);
 
 enum Shortcut {
     RunAll,
@@ -90,6 +101,7 @@ enum Shortcut {
     Replace,
     FindPrev,
     FindNext,
+    Complete,
 }
 
 impl App {
@@ -111,6 +123,7 @@ impl App {
             left: LeftView::Connections,
             history: HistoryView::default(),
             find: Find::default(),
+            catalogs: HashMap::new(),
             form: None,
             confirm: None,
             delete_task: None,
@@ -353,6 +366,34 @@ impl App {
         doc.plan_error = None;
     }
 
+    /// The catalog for autocompletion on `profile`, loading it if needed (empty until
+    /// it arrives, so keywords are still offered).
+    fn catalog_for(&mut self, profile: Option<String>) -> Arc<Catalog> {
+        let Some(profile) = profile else {
+            return Arc::default();
+        };
+        let state = self.catalogs.entry(profile.clone()).or_insert_with(|| {
+            CatalogState::Loading(Some(self.backend.run(Command::Catalog { profile })))
+        });
+        if let CatalogState::Loading(task) = state {
+            match poll(task) {
+                Some(Ok(Output::Catalog(c))) => *state = CatalogState::Ready(Arc::new(c)),
+                Some(_) => *state = CatalogState::Failed,
+                None => {}
+            }
+        }
+        match state {
+            CatalogState::Ready(c) => c.clone(),
+            _ => Arc::default(),
+        }
+    }
+
+    /// Something changed a profile's tables (or it was edited): read them again.
+    fn schema_changed(&mut self, profile: &str) {
+        self.browser.forget(profile);
+        self.catalogs.remove(profile);
+    }
+
     fn poll_tasks(&mut self) {
         if let Some(r) = poll(&mut self.profiles_task) {
             match r {
@@ -376,7 +417,7 @@ impl App {
         if let Some(r) = poll(&mut self.delete_task) {
             match r {
                 Ok(Output::ProfileRemoved { name }) => {
-                    self.browser.forget(&name);
+                    self.schema_changed(&name);
                     self.toasts.success(format!("Deleted {name}"));
                 }
                 Ok(_) => {}
@@ -448,7 +489,7 @@ impl App {
             });
         }
         for p in changed_schema {
-            self.browser.forget(&p);
+            self.schema_changed(&p);
         }
         self.browser.poll();
         self.history.poll();
@@ -475,6 +516,7 @@ impl App {
                 (REPLACE, Shortcut::Replace),
                 (FIND_PREV, Shortcut::FindPrev),
                 (FIND_NEXT, Shortcut::FindNext),
+                (COMPLETE, Shortcut::Complete),
             ]
             .into_iter()
             .find(|(k, _)| i.consume_shortcut(k))
@@ -500,6 +542,7 @@ impl App {
             Some(Shortcut::Replace) => self.open_find(ctx, true),
             Some(Shortcut::FindPrev) => self.find_step(false),
             Some(Shortcut::FindNext) => self.find_step(true),
+            Some(Shortcut::Complete) => self.docs[self.active].force_completion = true,
             None => {}
         }
         if self.find.open && ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -670,7 +713,7 @@ impl App {
                     self.refresh_profiles();
                     let names: Vec<_> = self.profiles.iter().map(|p| p.name.clone()).collect();
                     for n in names {
-                        self.browser.forget(&n);
+                        self.schema_changed(&n);
                     }
                 }
             });
@@ -1112,16 +1155,17 @@ impl App {
             && let Some(done) = form.ui(ctx, &self.backend)
         {
             if let FormDone::Saved(name) = done {
-                if let Some(old) = &form.previous {
-                    self.browser.forget(old);
+                if let Some(old) = form.previous.clone() {
+                    self.browser.forget(&old);
+                    self.catalogs.remove(&old);
                     // Tabs on the old name follow the rename.
                     for d in &mut self.docs {
-                        if d.profile.as_deref() == Some(old) {
+                        if d.profile.as_deref() == Some(old.as_str()) {
                             d.profile = Some(name.clone());
                         }
                     }
                 }
-                self.browser.forget(&name);
+                self.schema_changed(&name);
                 self.toasts.success(format!("Saved {name}"));
                 if self.settings.last_profile.is_none() {
                     self.settings.last_profile = Some(name);
@@ -1291,7 +1335,16 @@ impl eframe::App for App {
             let matches = self.find.matches(&self.docs[i].text);
             let current = self.find.current;
             let size = self.settings.editor_font_size;
-            editor::editor_ui(ui, &mut self.docs[i], dialect, &matches, current, size);
+            let catalog = self.catalog_for(self.docs[i].profile.clone());
+            editor::editor_ui(
+                ui,
+                &mut self.docs[i],
+                dialect,
+                &matches,
+                current,
+                size,
+                &catalog,
+            );
         });
 
         self.dialogs(&ctx);

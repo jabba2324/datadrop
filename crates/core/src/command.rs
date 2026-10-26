@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::complete::Catalog;
 use crate::db::{ColumnInfo, StatementResult, TableInfo};
 use crate::export::ExportFormat;
 use crate::history::HistoryEntry;
@@ -61,6 +62,10 @@ pub enum Command {
         #[serde(default)]
         schema: Option<String>,
         table: String,
+    },
+    /// Every table and column, for autocompletion.
+    Catalog {
+        profile: String,
     },
     /// Run SQL: one statement or a script, statement by statement, stopping at the
     /// first error. With a `session` the connection stays open for the next query
@@ -151,6 +156,7 @@ pub enum Output {
         columns: Vec<ColumnInfo>,
     },
     Query(QueryOutput),
+    Catalog(Catalog),
     SessionClosed,
     Plan(Plan),
     Exported {

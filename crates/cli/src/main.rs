@@ -48,6 +48,8 @@ enum Cmd {
         #[arg(long, short)]
         schema: Option<String>,
     },
+    /// Every table and view with its columns (what autocompletion uses).
+    Catalog { profile: String },
     /// Run SQL: from the argument, a file (-f), or standard input.
     Query {
         profile: String,
@@ -273,6 +275,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let (cmd, format) = match cli.command {
         Cmd::Profile(p) => (profile_command(&client, p)?, Format::Table),
         Cmd::Schemas { profile } => (Command::Schemas { profile }, Format::Table),
+        Cmd::Catalog { profile } => (Command::Catalog { profile }, Format::Table),
         Cmd::Tables { profile, schema } => (Command::Tables { profile, schema }, Format::Table),
         Cmd::Columns {
             profile,
@@ -558,6 +561,17 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
             )?;
         }
         Output::Plan(p) => render::plan(&mut stdout, p)?,
+        Output::Catalog(c) => {
+            for t in &c.tables {
+                let name = if t.schema == c.default_schema {
+                    t.name.clone()
+                } else {
+                    format!("{}.{}", t.schema, t.name)
+                };
+                let kind = if t.view { " (view)" } else { "" };
+                writeln!(stdout, "{name}{kind}: {}", t.columns.join(", "))?;
+            }
+        }
         Output::Exported { path, rows } => {
             eprintln!(
                 "Wrote {rows} row{} to {path}.",

@@ -301,3 +301,48 @@ fn exports_results() {
         serde_json::from_str(&std::fs::read_to_string(json).unwrap()).unwrap();
     assert_eq!(v, serde_json::json!([{"x": "a"}, {"x": null}]));
 }
+
+#[test]
+fn autocompletes_tables_and_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(&mut h, "create table fruit (name text, ripe boolean)");
+    // The table change reloads the catalog; give it a moment.
+    for _ in 0..20 {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    h.state_mut().docs[0].text.clear();
+    h.run_steps(2);
+    let editor = || egui::accesskit::Role::MultilineTextInput;
+    h.get_by_role(editor()).focus();
+    h.run_steps(1);
+    h.get_by_role(editor()).type_text("select * from fr");
+    until(&mut h, "suggestions", |a| a.docs[0].completion.is_some());
+    h.run_steps(1);
+    h.get_by_label_contains("fruit");
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    assert_eq!(h.state().docs[0].text, "select * from fruit");
+    assert!(h.state().docs[0].completion.is_none());
+
+    h.get_by_role(editor()).type_text(" f where f.r");
+    until(&mut h, "column suggestions", |a| {
+        a.docs[0].completion.is_some()
+    });
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().docs[0].text, "select * from fruit f where f.ripe");
+
+    // Esc closes the list without changing anything.
+    h.get_by_role(editor()).type_text(" and f.n");
+    until(&mut h, "more suggestions", |a| {
+        a.docs[0].completion.is_some()
+    });
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().docs[0].completion.is_none());
+    assert!(h.state().docs[0].text.ends_with("f.n"));
+}

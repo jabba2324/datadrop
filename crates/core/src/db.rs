@@ -77,6 +77,15 @@ pub struct TableInfo {
     pub kind: TableKind,
 }
 
+/// A table or view and its column names, for autocompletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogTable {
+    pub schema: String,
+    pub name: String,
+    pub view: bool,
+    pub columns: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnInfo {
     pub name: String,
@@ -746,6 +755,75 @@ impl MetaPool {
                 })
             })
             .collect())
+    }
+
+    /// Every table and view with its columns (for autocompletion), outside the
+    /// system schemas, up to a limit that keeps huge databases responsive.
+    pub async fn catalog(&self) -> Result<Vec<CatalogTable>> {
+        let rows: Vec<[Option<String>; 4]> = match self {
+            MetaPool::Pg(p) => sqlx::query(
+                "SELECT n.nspname::text, c.relname::text, c.relkind::text, a.attname::text \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition \
+                 AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' \
+                 ORDER BY 1, 2, a.attnum LIMIT 100000",
+            )
+            .fetch_all(p)
+            .await?
+            .iter()
+            .map(|r| std::array::from_fn(|i| text_col(r, i)))
+            .collect(),
+            MetaPool::My(p) => sqlx::query(
+                "SELECT CAST(t.table_schema AS CHAR), CAST(t.table_name AS CHAR), \
+                 CAST(t.table_type AS CHAR), CAST(c.column_name AS CHAR) \
+                 FROM information_schema.tables t LEFT JOIN information_schema.columns c \
+                 ON c.table_schema = t.table_schema AND c.table_name = t.table_name \
+                 WHERE t.table_schema NOT IN ('mysql', 'performance_schema', 'sys', 'information_schema') \
+                 ORDER BY 1, 2, c.ordinal_position LIMIT 100000",
+            )
+            .fetch_all(p)
+            .await?
+            .iter()
+            .map(|r| std::array::from_fn(|i| text_col(r, i)))
+            .collect(),
+            MetaPool::Lite(p) => sqlx::query(
+                "SELECT 'main', m.name, m.type, c.name FROM sqlite_master m \
+                 LEFT JOIN pragma_table_info(m.name) c \
+                 WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                 ORDER BY m.name, c.cid LIMIT 100000",
+            )
+            .fetch_all(p)
+            .await?
+            .iter()
+            .map(|r| std::array::from_fn(|i| text_col(r, i)))
+            .collect(),
+        };
+        let mut out: Vec<CatalogTable> = vec![];
+        for [schema, table, kind, column] in rows {
+            let (Some(schema), Some(table)) = (schema, table) else {
+                continue;
+            };
+            let same = out
+                .last()
+                .is_some_and(|t| t.schema == schema && t.name == table);
+            if !same {
+                let view = matches!(
+                    kind.as_deref(),
+                    Some("v" | "m" | "VIEW" | "SYSTEM VIEW" | "view")
+                );
+                out.push(CatalogTable {
+                    schema,
+                    name: table,
+                    view,
+                    columns: vec![],
+                });
+            }
+            if let Some(c) = column {
+                out.last_mut().expect("pushed above").columns.push(c);
+            }
+        }
+        Ok(out)
     }
 
     pub async fn close(&self) {

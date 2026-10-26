@@ -544,6 +544,11 @@ const KEYWORDS: &[&str] = &[
     "WITHOUT",
 ];
 
+/// The keywords the lexer knows, upper case.
+pub fn keywords() -> &'static [&'static str] {
+    KEYWORDS
+}
+
 pub fn is_keyword(word: &str) -> bool {
     word.len() <= 20
         && KEYWORDS
