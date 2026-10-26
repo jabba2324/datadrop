@@ -1,0 +1,31 @@
+[package]
+name = "datadrop-gui"
+description = "DataDrop desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "datadrop-gui"
+path = "src/main.rs"
+
+[dependencies]
+datadrop-core.workspace = true
+# egui-phosphor and egui-notify each target one egui version: move the egui family
+# together, when they do.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "accesskit", "wayland", "x11"] }
+egui = "0.36"
+egui_extras = { version = "0.36", default-features = false }
+egui-phosphor = "0.14"
+egui-notify = "0.23"
+rfd = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe"] }
+tempfile.workspace = true

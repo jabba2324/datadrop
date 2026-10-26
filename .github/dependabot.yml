@@ -1,0 +1,31 @@
+# Weekly pull requests for dependency updates (security fixes arrive as soon as they're
+# published).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Patch releases are compatible, so they come as one PR. Minor and major updates
+      # each get their own PR: for 0.x crates a minor bump is a breaking change, and one
+      # that needs work shouldn't hold up the rest.
+      rust-patches:
+        update-types: ["patch"]
+    ignore:
+      # egui-notify and egui-phosphor each target one egui version, so the egui family
+      # only moves when they do. Their own update PR (which fails until then) is the cue
+      # to bump egui, eframe, egui_extras and egui_kittest together by hand.
+      - dependency-name: "egui"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "egui_*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "eframe"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

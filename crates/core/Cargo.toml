@@ -1,0 +1,22 @@
+[package]
+name = "datadrop-core"
+description = "DataDrop core: connection profiles, SQL parsing and the commands shared by the CLI and the desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+url.workspace = true

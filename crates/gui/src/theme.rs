@@ -1,0 +1,103 @@
+//! Fonts, icons, colours.
+
+use datadrop_core::sql::TokenKind;
+use egui::Color32;
+
+use crate::settings::Theme;
+
+pub const ACCENT: Color32 = Color32::from_rgb(0x3B, 0x9E, 0xF5);
+/// Readable on light backgrounds too.
+pub const ACCENT_DEEP: Color32 = Color32::from_rgb(0x1B, 0x6F, 0xC2);
+
+pub fn install(ctx: &egui::Context, theme: Theme) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+    apply_theme(ctx, theme);
+    for (t, accent) in [
+        (egui::Theme::Dark, ACCENT),
+        (egui::Theme::Light, ACCENT_DEEP),
+    ] {
+        ctx.style_mut_of(t, |style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+            // An app, not a document: clicks on labels select rows, not words.
+            style.interaction.selectable_labels = false;
+            style.spacing.button_padding = egui::vec2(7.0, 3.0);
+            let v = &mut style.visuals;
+            v.hyperlink_color = accent;
+            v.selection.bg_fill = accent.gamma_multiply(0.35);
+            v.selection.stroke.color = accent;
+        });
+    }
+}
+
+pub fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    ctx.set_theme(match theme {
+        Theme::System => egui::ThemePreference::System,
+        Theme::Light => egui::ThemePreference::Light,
+        Theme::Dark => egui::ThemePreference::Dark,
+    });
+}
+
+/// Syntax colours, for the current light or dark theme.
+pub fn token_color(kind: TokenKind, dark: bool) -> Color32 {
+    use TokenKind::*;
+    let (d, l) = match kind {
+        Keyword => ((0xC6, 0x8C, 0xF5), (0x8A, 0x2B, 0xC9)),
+        String => ((0x9B, 0xD1, 0x7B), (0x23, 0x7A, 0x1F)),
+        Number => ((0xF0, 0xA4, 0x5D), (0xB3, 0x56, 0x00)),
+        Comment => ((0x7F, 0x88, 0x94), (0x7A, 0x80, 0x88)),
+        QuotedIdentifier => ((0x6C, 0xC4, 0xD8), (0x0E, 0x6E, 0x86)),
+        Parameter => ((0xF0, 0x7C, 0x9A), (0xB0, 0x24, 0x52)),
+        Operator | Punctuation => ((0xB8, 0xC0, 0xCC), (0x50, 0x58, 0x66)),
+        Identifier | Whitespace => ((0xDD, 0xE1, 0xE6), (0x1F, 0x23, 0x28)),
+    };
+    let (r, g, b) = if dark { d } else { l };
+    Color32::from_rgb(r, g, b)
+}
+
+/// Background for find matches (the current one is stronger).
+pub fn match_bg(current: bool, dark: bool) -> Color32 {
+    match (current, dark) {
+        (true, true) => Color32::from_rgb(0x8A, 0x6D, 0x00),
+        (false, true) => Color32::from_rgb(0x4A, 0x40, 0x10),
+        (true, false) => Color32::from_rgb(0xFF, 0xC8, 0x3D),
+        (false, false) => Color32::from_rgb(0xFF, 0xEE, 0xA8),
+    }
+}
+
+/// The window icon: a blue drop, drawn rather than shipped as a file.
+pub fn icon() -> egui::IconData {
+    const N: u32 = 64;
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    let n = N as f32;
+    for y in 0..N {
+        for x in 0..N {
+            // A circle for the bottom of the drop, narrowing to a point at the top.
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let (cx, cy, r) = (n / 2.0, n * 0.62, n * 0.30);
+            let in_circle = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() - r;
+            let t = ((cy - fy) / (cy - n * 0.06)).clamp(0.0, 1.0);
+            let half = r * (1.0 - t).powf(1.3);
+            let in_cone = if fy < cy {
+                (fx - cx).abs() - half
+            } else {
+                f32::MAX
+            };
+            let d = in_circle.min(in_cone);
+            let alpha = (0.5 - d).clamp(0.0, 1.0);
+            let shade = 1.0 - 0.25 * ((fx + fy) / (2.0 * n));
+            rgba.extend_from_slice(&[
+                (ACCENT.r() as f32 * shade) as u8,
+                (ACCENT.g() as f32 * shade) as u8,
+                (ACCENT.b() as f32 * shade) as u8,
+                (alpha * 255.0) as u8,
+            ]);
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: N,
+        height: N,
+    }
+}

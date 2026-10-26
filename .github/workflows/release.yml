@@ -1,0 +1,111 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the workspace version) to build and publish.
+# Running it by hand (Actions → Release → Run workflow) builds everything without
+# publishing, to check the release builds.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [[ "${GITHUB_REF_NAME}" == "v${version}" ]] || {
+            echo "Tag ${GITHUB_REF_NAME} doesn't match workspace version ${version}" >&2; exit 1; }
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p datadrop-cli -p datadrop-gui
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          version="${GITHUB_REF_NAME}"; [[ "${GITHUB_REF}" == refs/tags/* ]] || version="dev"
+          mkdir dist
+          for bin in datadrop datadrop-gui; do
+            name="${bin}-${version}-${{ matrix.target }}"
+            mkdir "$name"
+            cp "target/${{ matrix.target }}/release/${bin}${ext}" README.md LICENSE "$name/"
+            if [[ -n "$ext" ]]; then
+              7z a -bd "dist/${name}.zip" "$name" >/dev/null
+            else
+              tar -czf "dist/${name}.tar.gz" "$name"
+            fi
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      # Signs the checksums with the project's minisign key (repo secret
+      # MINISIGN_SECRET_KEY; public key in minisign.pub). Verify with
+      # `minisign -Vm SHA256SUMS -p minisign.pub`, then `sha256sum -c SHA256SUMS`.
+      - name: Sign
+        working-directory: dist
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY isn't set, so this release is unsigned"
+            exit 0
+          fi
+          sudo apt-get install -y -qq minisign >/dev/null
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m SHA256SUMS -t "datadrop ${GITHUB_REF_NAME}"
+          rm -f "$RUNNER_TEMP/minisign.key"
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "DataDrop ${GITHUB_REF_NAME}" \
+            --generate-notes

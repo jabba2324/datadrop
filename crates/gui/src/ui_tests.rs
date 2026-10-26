@@ -1,0 +1,213 @@
+//! UI tests: the real app in egui's test harness (no window or GPU needed).
+
+use datadrop_core::{Client, Command, ConfigDir, Driver, Profile};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+
+use crate::app::{App, ConfirmKind};
+
+fn app(dir: &std::path::Path) -> Harness<'static, App> {
+    let config = ConfigDir::new(dir);
+    Harness::builder()
+        .with_size(egui::vec2(1200.0, 760.0))
+        .build_eframe(move |cc| App::new(&cc.egui_ctx, config))
+}
+
+/// Run frames until `done` holds (background commands need real time).
+fn until(h: &mut Harness<'static, App>, what: &str, done: impl Fn(&App) -> bool) {
+    for _ in 0..400 {
+        h.run_steps(1);
+        if done(h.state()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn save_profile(dir: &std::path::Path, profile: Profile) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let client = Client::new(&ConfigDir::new(dir));
+    rt.block_on(client.execute(Command::ProfileSave {
+        profile,
+        previous_name: None,
+        overwrite: true,
+    }))
+    .unwrap();
+}
+
+#[test]
+fn first_run_offers_to_add_a_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = app(dir.path());
+    h.run_steps(5);
+    h.get_by_label("No connections yet.");
+    h.get_by_label_contains("Add a connection").click();
+    h.run_steps(3);
+    assert!(h.state().form.is_some());
+    h.get_by_label("New connection");
+}
+
+#[test]
+fn the_form_saves_a_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = app(dir.path());
+    h.run_steps(3);
+    h.state_mut().form = Some(crate::profile_form::ProfileForm::new());
+    h.run_steps(3);
+    // The name field has focus when the form opens.
+    h.get_by_label("Name").type_text("Shop");
+    h.run_steps(2);
+    h.get_by_label("Host").click();
+    h.run_steps(1);
+    h.get_by_label("Host").type_text("db.internal");
+    h.run_steps(1);
+    h.get_by_label("Port").click();
+    h.run_steps(1);
+    h.get_by_label("Port").type_text("6543");
+    h.run_steps(1);
+    h.get_by_label("Password").click();
+    h.run_steps(1);
+    h.get_by_label("Password").type_text("pw");
+    h.run_steps(1);
+    h.get_by_label("Save").click();
+    until(&mut h, "the profile to save", |a| {
+        a.form.is_none() && a.profiles.iter().any(|p| p.name == "Shop")
+    });
+    let saved = Client::new(&ConfigDir::new(dir.path()))
+        .store()
+        .get("Shop")
+        .unwrap();
+    assert_eq!(saved.host, "db.internal");
+    assert_eq!(saved.port, Some(6543));
+    assert_eq!(saved.password.as_deref(), Some("pw"));
+    // New tabs use it.
+    assert_eq!(h.state().docs[0].profile.as_deref(), Some("Shop"));
+}
+
+#[test]
+fn find_and_replace() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = app(dir.path());
+    h.run_steps(3);
+    h.state_mut().docs[0].text = "select a from t;\nSELECT b from t;".into();
+    {
+        let a = h.state_mut();
+        a.find.open = true;
+        a.find.replace = true;
+        a.find.query = "select".into();
+        a.find.replacement = "SELECT DISTINCT".into();
+    }
+    h.run_steps(2);
+    h.get_by_label("2 found");
+    h.get_by_label("Replace all").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().docs[0].text,
+        "SELECT DISTINCT a from t;\nSELECT DISTINCT b from t;"
+    );
+    // Match case finds nothing lower-case now.
+    h.state_mut().find.match_case = true;
+    h.state_mut().find.query = "distinct".into();
+    h.run_steps(2);
+    h.get_by_label("No matches");
+}
+
+#[test]
+fn closing_an_unsaved_tab_asks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = app(dir.path());
+    h.run_steps(3);
+    h.state_mut().new_tab(None);
+    h.state_mut().docs[1].text = "select 1".into();
+    h.run_steps(2);
+    h.state_mut().request_close_tab(1);
+    h.run_steps(2);
+    assert!(matches!(
+        h.state().confirm.as_ref().map(|c| &c.kind),
+        Some(ConfirmKind::CloseTab(_))
+    ));
+    h.get_by_label("Don't save").click();
+    h.run_steps(2);
+    assert_eq!(h.state().docs.len(), 1);
+
+    // A tab without changes closes straight away.
+    h.state_mut().new_tab(None);
+    h.state_mut().request_close_tab(1);
+    h.run_steps(2);
+    assert!(h.state().confirm.is_none());
+    assert_eq!(h.state().docs.len(), 1);
+}
+
+#[test]
+fn opens_and_saves_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report.sql");
+    std::fs::write(&file, "select 42;\n").unwrap();
+    let mut h = app(dir.path());
+    h.run_steps(3);
+    h.state_mut().open_path(&file);
+    h.run_steps(2);
+    // It replaced the empty tab.
+    assert_eq!(h.state().docs.len(), 1);
+    h.get_by_label("report.sql");
+    h.state_mut().docs[0].text.push_str("select 43;\n");
+    h.run_steps(2);
+    assert!(h.state().docs[0].dirty());
+    assert!(h.state_mut().save(0, false));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "select 42;\nselect 43;\n"
+    );
+    assert!(!h.state().docs[0].dirty());
+    // Open files come back next time.
+    h.run_steps(2);
+    drop(h);
+    let mut again = app(dir.path());
+    again.run_steps(3);
+    assert_eq!(again.state().docs[0].path.as_deref(), Some(file.as_path()));
+}
+
+/// With a real PostgreSQL (`DATADROP_TEST_POSTGRES_URL`): browse, run, see results.
+#[test]
+fn runs_queries_against_postgres() {
+    let Ok(url) = std::env::var("DATADROP_TEST_POSTGRES_URL") else {
+        eprintln!("DATADROP_TEST_POSTGRES_URL isn't set; skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    save_profile(
+        dir.path(),
+        Profile {
+            name: "pg".into(),
+            driver: Driver::Postgres,
+            url: Some(url),
+            ..Profile::default()
+        },
+    );
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    h.state_mut().docs[0].text = "select 1 as a;\nselect 'x' as b, null as c;".into();
+    let ctx = h.ctx.clone();
+    h.state_mut().run(&ctx, true);
+    until(&mut h, "the query", |a| a.docs[0].output.is_some());
+    let out = h.state().docs[0].output.clone().unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(out.results.len(), 2);
+    h.run_steps(3);
+    // The last result is shown, NULL included.
+    h.get_by_label("Result 2 (1 rows)");
+    h.get_by_label("NULL");
+
+    // The schema browser lists the server's schemas when opened.
+    h.get_by_label_contains("pg").click();
+    until(&mut h, "the schemas", |_| true);
+    for _ in 0..80 {
+        h.run_steps(1);
+        if h.query_by_label_contains("public").is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("the public schema never showed");
+}
