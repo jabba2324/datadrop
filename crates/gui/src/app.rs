@@ -12,7 +12,7 @@ use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
 use crate::browser::{Browser, BrowserAction};
-use crate::editor::{self, Document, Find};
+use crate::editor::{self, Document, Find, ResultView};
 use crate::history_view::{HistoryAction, HistoryView};
 use crate::profile_form::{FormDone, ProfileForm};
 use crate::results::{self, ResultsAction};
@@ -69,6 +69,9 @@ const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O)
 const NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const ANALYZE: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
+const EXPLAIN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
 const REPLACE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 const FIND_PREV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F3);
 const FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F3);
@@ -76,6 +79,8 @@ const FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::
 enum Shortcut {
     RunAll,
     Run,
+    Analyze,
+    Explain,
     SaveAs,
     Save,
     Open,
@@ -285,17 +290,19 @@ impl App {
     }
 
     /// Run the selection or the statement under the cursor (or the whole tab).
-    pub fn run(&mut self, ctx: &egui::Context, whole: bool) {
+    /// The tab's connection and the SQL to run: the whole tab, the selection, or the
+    /// statement at the cursor. `None` (after saying why) if there's nothing to run.
+    fn sql_to_run(&mut self, ctx: &egui::Context, whole: bool) -> Option<(String, String)> {
         let i = self.active;
         let dialect = self.dialect_of(self.docs[i].profile.as_deref());
-        let doc = &mut self.docs[i];
+        let doc = &self.docs[i];
         if doc.running.is_some() {
-            return;
+            return None;
         }
         let Some(profile) = doc.profile.clone() else {
             self.toasts
                 .warning("Choose a connection for this tab first.");
-            return;
+            return None;
         };
         let sql = if whole {
             Some(doc.text.clone())
@@ -307,16 +314,43 @@ impl App {
         };
         let Some(sql) = sql.filter(|s| !sql::split_statements(s, dialect).is_empty()) else {
             self.toasts.info("There's no SQL to run here.");
+            return None;
+        };
+        self.settings.last_profile = Some(profile.clone());
+        Some((profile, sql))
+    }
+
+    /// Run the selection or the statement under the cursor (or the whole tab).
+    pub fn run(&mut self, ctx: &egui::Context, whole: bool) {
+        let Some((profile, sql)) = self.sql_to_run(ctx, whole) else {
             return;
         };
+        let doc = &mut self.docs[self.active];
         doc.running = Some(self.backend.run(Command::Query {
-            profile: profile.clone(),
+            profile,
             sql,
             session: Some(doc.session()),
             max_rows: Some(self.settings.max_rows),
         }));
         doc.run_started = Some(Instant::now());
-        self.settings.last_profile = Some(profile);
+        doc.view = ResultView::Results;
+    }
+
+    /// Show the plan for the selection or the statement under the cursor.
+    pub fn explain(&mut self, ctx: &egui::Context, analyze: bool) {
+        let Some((profile, sql)) = self.sql_to_run(ctx, false) else {
+            return;
+        };
+        let doc = &mut self.docs[self.active];
+        doc.running = Some(self.backend.run(Command::Explain {
+            profile,
+            sql,
+            analyze,
+            session: Some(doc.session()),
+        }));
+        doc.run_started = Some(Instant::now());
+        doc.view = ResultView::Plan;
+        doc.plan_error = None;
     }
 
     fn poll_tasks(&mut self) {
@@ -371,6 +405,20 @@ impl App {
             let Some(r) = poll(&mut doc.running) else {
                 continue;
             };
+            if doc.view == ResultView::Plan {
+                match r {
+                    Ok(Output::Plan(p)) => {
+                        doc.plan = Some(p);
+                        doc.plan_collapsed.clear();
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        doc.plan = None;
+                        doc.plan_error = Some(e.to_string());
+                    }
+                }
+                continue;
+            }
             doc.shown_result = usize::MAX; // the last result set
             self.history.stale = true;
             doc.output = Some(match r {
@@ -416,6 +464,8 @@ impl App {
             [
                 (RUN_ALL, Shortcut::RunAll),
                 (RUN, Shortcut::Run),
+                (ANALYZE, Shortcut::Analyze),
+                (EXPLAIN, Shortcut::Explain),
                 (SAVE_AS, Shortcut::SaveAs),
                 (SAVE, Shortcut::Save),
                 (OPEN, Shortcut::Open),
@@ -433,6 +483,8 @@ impl App {
         match pressed {
             Some(Shortcut::RunAll) => self.run(ctx, true),
             Some(Shortcut::Run) => self.run(ctx, false),
+            Some(Shortcut::Analyze) => self.explain(ctx, true),
+            Some(Shortcut::Explain) => self.explain(ctx, false),
             Some(Shortcut::SaveAs) => {
                 self.save(self.active, true);
             }
@@ -598,6 +650,12 @@ impl App {
                 if ui.button("Run all").clicked() {
                     self.run(ui.ctx(), true);
                 }
+                if ui.button("Explain").clicked() {
+                    self.explain(ui.ctx(), false);
+                }
+                if ui.button("Explain analyze").clicked() {
+                    self.explain(ui.ctx(), true);
+                }
                 if ui.button("Stop").clicked()
                     && let Some(t) = &self.docs[self.active].running
                 {
@@ -747,6 +805,27 @@ impl App {
                     .clicked()
                 {
                     self.run(ui.ctx(), true);
+                }
+                if ui
+                    .button(format!("{} Explain", icon::TREE_STRUCTURE))
+                    .on_hover_text(format!(
+                        "Show how the database will run the statement, without running it ({})",
+                        ui.ctx().format_shortcut(&EXPLAIN)
+                    ))
+                    .clicked()
+                {
+                    self.explain(ui.ctx(), false);
+                }
+                if ui
+                    .button(format!("{} Analyze", icon::TIMER))
+                    .on_hover_text(format!(
+                        "Run the statement and time each step ({}). Changes to data are \
+                         rolled back.",
+                        ui.ctx().format_shortcut(&ANALYZE)
+                    ))
+                    .clicked()
+                {
+                    self.explain(ui.ctx(), true);
                 }
             });
             if running

@@ -8,6 +8,7 @@ mod backend;
 mod browser;
 mod editor;
 mod history_view;
+mod plan_view;
 mod profile_form;
 mod results;
 mod settings;

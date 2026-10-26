@@ -637,3 +637,77 @@ both!(exports_stream_to_files, |driver, schema| async move {
         "no temporary files left"
     );
 });
+
+both!(explains_queries, |driver, schema| async move {
+    let Some(db) = setup(driver, schema).await else {
+        return;
+    };
+    let p = prefix(&db, schema);
+    ok(run(
+        &db.client,
+        "test",
+        &format!(
+            "CREATE TABLE {p}things (id int PRIMARY KEY, n int); \
+             INSERT INTO {p}things VALUES (1, 10), (2, 20), (3, 30)"
+        ),
+        None,
+    )
+    .await);
+    let explain = |sql: String, analyze: bool| {
+        let client = &db.client;
+        async move {
+            client
+                .execute(Command::Explain {
+                    profile: "test".into(),
+                    sql,
+                    analyze,
+                    session: None,
+                })
+                .await
+                .map(|o| match o {
+                    Output::Plan(plan) => plan,
+                    o => panic!("{o:?}"),
+                })
+        }
+    };
+    let plan = explain(format!("SELECT * FROM {p}things WHERE n > 15"), false)
+        .await
+        .unwrap();
+    let text = format!("{plan:?}").to_lowercase();
+    assert!(text.contains("things"), "{plan:#?}");
+    assert!(!plan.analyzed);
+
+    if driver == Driver::Sqlite {
+        let err = explain(format!("SELECT * FROM {p}things"), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("SQLite"), "{err}");
+        return;
+    }
+    let plan = explain(format!("SELECT * FROM {p}things WHERE n > 15"), true)
+        .await
+        .unwrap();
+    assert!(plan.analyzed);
+    assert!(plan.execution_ms.is_some(), "{plan:#?}");
+    let mut node = &plan.roots[0];
+    while node.actual_rows.is_none() && !node.children.is_empty() {
+        node = &node.children[0];
+    }
+    assert!(node.actual_rows.is_some(), "{plan:#?}");
+
+    // Analyzing a DELETE runs it, then rolls it back.
+    explain(format!("DELETE FROM {p}things WHERE n > 15"), true)
+        .await
+        .unwrap();
+    let q = ok(run(
+        &db.client,
+        "test",
+        &format!("SELECT count(*) FROM {p}things"),
+        None,
+    )
+    .await);
+    assert_eq!(q.results[0].rows[0][0].as_deref(), Some("3"));
+
+    // One statement at a time.
+    assert!(explain("SELECT 1; SELECT 2".into(), false).await.is_err());
+});

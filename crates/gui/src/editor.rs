@@ -15,6 +15,14 @@ use egui::{FontId, Galley, TextBuffer};
 use crate::backend::Task;
 use crate::theme;
 
+/// What the results pane shows.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResultView {
+    #[default]
+    Results,
+    Plan,
+}
+
 /// One editor tab.
 pub struct Document {
     /// Unique for the app's lifetime: the tab's widget ids and its database session.
@@ -30,6 +38,11 @@ pub struct Document {
     /// Which result set is shown when a script returned several.
     pub shown_result: usize,
     pub running: Option<Task>,
+    pub view: ResultView,
+    pub plan: Option<datadrop_core::Plan>,
+    pub plan_error: Option<String>,
+    /// Plan steps folded away (by position in the tree).
+    pub plan_collapsed: std::collections::HashSet<String>,
     /// Exporting a result to a file.
     pub exporting: Option<Task>,
     pub run_started: Option<Instant>,
@@ -55,6 +68,10 @@ impl Document {
             output: None,
             shown_result: 0,
             running: None,
+            view: ResultView::Results,
+            plan: None,
+            plan_error: None,
+            plan_collapsed: Default::default(),
             exporting: None,
             run_started: None,
             select: None,

@@ -66,6 +66,18 @@ enum Cmd {
         #[arg(long, short)]
         output: Option<PathBuf>,
     },
+    /// Show how the database will run a statement (its query plan).
+    Explain {
+        profile: String,
+        /// One statement.
+        sql: Option<String>,
+        #[arg(long, short, conflicts_with = "sql")]
+        file: Option<PathBuf>,
+        /// Run the statement and time each step. Statements that change data are
+        /// rolled back afterwards.
+        #[arg(long)]
+        analyze: bool,
+    },
     /// Queries run before, from the app and the command line.
     #[command(subcommand)]
     History(HistoryCmd),
@@ -282,19 +294,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             format,
             output,
         } => {
-            let sql = match (sql, file) {
-                (Some(s), _) => s,
-                (None, Some(f)) => std::fs::read_to_string(&f)
-                    .with_context(|| format!("reading {}", f.display()))?,
-                (None, None) => {
-                    if std::io::stdin().is_terminal() {
-                        bail!("give the SQL as an argument, with --file, or on standard input");
-                    }
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
-                    s
-                }
-            };
+            let sql = read_sql(sql, file)?;
             if let Some(path) = output {
                 let format = match format {
                     Format::Csv => Some(ExportFormat::Csv),
@@ -325,6 +325,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 )
             }
         }
+        Cmd::Explain {
+            profile,
+            sql,
+            file,
+            analyze,
+        } => (
+            Command::Explain {
+                profile,
+                sql: read_sql(sql, file)?,
+                analyze,
+                session: None,
+            },
+            Format::Table,
+        ),
         Cmd::History(HistoryCmd::List {
             profile,
             search,
@@ -365,6 +379,24 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         print_output(&out, format)?;
     }
     Ok(exit_code(&out))
+}
+
+/// SQL from the argument, a file, or standard input.
+fn read_sql(sql: Option<String>, file: Option<PathBuf>) -> Result<String> {
+    Ok(match (sql, file) {
+        (Some(s), _) => s,
+        (None, Some(f)) => {
+            std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?
+        }
+        (None, None) => {
+            if std::io::stdin().is_terminal() {
+                bail!("give the SQL as an argument, with --file, or on standard input");
+            }
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        }
+    })
 }
 
 fn exit_code(out: &Output) -> ExitCode {
@@ -525,6 +557,7 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
                 &rows,
             )?;
         }
+        Output::Plan(p) => render::plan(&mut stdout, p)?,
         Output::Exported { path, rows } => {
             eprintln!(
                 "Wrote {rows} row{} to {path}.",

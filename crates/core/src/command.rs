@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{ColumnInfo, StatementResult, TableInfo};
 use crate::export::ExportFormat;
 use crate::history::HistoryEntry;
+use crate::plan::Plan;
 use crate::profile::{Profile, ProfileSummary};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +85,17 @@ pub enum Command {
         #[serde(default)]
         session: Option<String>,
     },
+    /// The query plan for one statement. With `analyze` it really runs, to measure
+    /// each step; statements that change data are then rolled back (on a separate
+    /// connection, so the session's own transaction isn't touched).
+    Explain {
+        profile: String,
+        sql: String,
+        #[serde(default)]
+        analyze: bool,
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// Close a session's connection.
     SessionClose {
         session: String,
@@ -108,7 +120,7 @@ pub enum Command {
 
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Output {
     Profiles {
@@ -140,6 +152,7 @@ pub enum Output {
     },
     Query(QueryOutput),
     SessionClosed,
+    Plan(Plan),
     Exported {
         path: String,
         rows: u64,

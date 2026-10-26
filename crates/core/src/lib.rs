@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod export;
 pub mod history;
+pub mod plan;
 pub mod profile;
 pub mod sql;
 
@@ -20,5 +21,6 @@ pub use db::{Column, ColumnInfo, StatementResult, TableInfo, TableKind};
 pub use error::{CoreError, Result};
 pub use export::ExportFormat;
 pub use history::HistoryEntry;
+pub use plan::{Plan, PlanNode};
 pub use profile::{Driver, Profile, ProfileStore, ProfileSummary, SslMode};
 pub use tokio_util::sync::CancellationToken;

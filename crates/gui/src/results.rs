@@ -5,7 +5,7 @@ use egui::RichText;
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 
-use crate::editor::Document;
+use crate::editor::{Document, ResultView};
 
 /// Longest text shown in a cell; the full value is in its tooltip and copies.
 const CELL_CHARS: usize = 120;
@@ -40,6 +40,23 @@ pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
         return action;
+    }
+    // Switch between the last results and the last plan, when there are both.
+    let has_plan = doc.plan.is_some() || doc.plan_error.is_some();
+    if has_plan && doc.output.is_some() {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut doc.view, ResultView::Results, "Results");
+            ui.selectable_value(&mut doc.view, ResultView::Plan, "Plan");
+        });
+    }
+    if doc.view == ResultView::Plan && has_plan {
+        if let Some(e) = &doc.plan_error {
+            ui.add_space(6.0);
+            ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+        } else if let Some(plan) = &doc.plan {
+            crate::plan_view::plan_ui(ui, plan, &mut doc.plan_collapsed, doc.id);
+        }
+        return ResultsAction::None;
     }
     let Some(out) = &doc.output else {
         ui.add_space(10.0);

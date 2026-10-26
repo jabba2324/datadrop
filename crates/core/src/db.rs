@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{CoreError, Result};
 use crate::export::ExportWriter;
+use crate::plan::{self, Plan};
 use crate::profile::{Driver, Profile, SslMode};
 use crate::sql::{self, Dialect};
 
@@ -326,7 +327,7 @@ macro_rules! export_text {
     }};
 }
 
-fn looks_like_query(sql: &str, dialect: Dialect) -> bool {
+pub(crate) fn looks_like_query(sql: &str, dialect: Dialect) -> bool {
     matches!(
         sql::first_keyword(sql, dialect).as_deref(),
         Some("SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC")
@@ -417,6 +418,56 @@ impl Session {
             rows_affected: affected,
             elapsed_ms: started.elapsed().as_millis() as u64,
         })
+    }
+
+    /// The plan for one statement. With `analyze` the statement really runs.
+    pub async fn explain(&mut self, sql: &str, analyze: bool) -> Result<Plan> {
+        let first_value = |r: StatementResult| -> Result<String> {
+            r.rows
+                .into_iter()
+                .flatten()
+                .flatten()
+                .next()
+                .ok_or_else(|| CoreError::Database("the database returned no plan".into()))
+        };
+        match self.profile.driver {
+            Driver::Postgres => {
+                let opts = if analyze {
+                    "FORMAT JSON, ANALYZE, BUFFERS"
+                } else {
+                    "FORMAT JSON"
+                };
+                let r = self.run(&format!("EXPLAIN ({opts}) {sql}"), 1).await?;
+                plan::parse_postgres(&first_value(r)?, analyze)
+            }
+            Driver::Mysql => {
+                let how = if analyze { "ANALYZE" } else { "FORMAT=TREE" };
+                let r = self.run(&format!("EXPLAIN {how} {sql}"), 1).await?;
+                plan::parse_mysql_tree(&first_value(r)?, analyze)
+            }
+            Driver::Sqlite => {
+                if analyze {
+                    return Err(CoreError::Invalid(
+                        "SQLite can't time each step of a query; use Explain without analyze"
+                            .into(),
+                    ));
+                }
+                let r = self
+                    .run(&format!("EXPLAIN QUERY PLAN {sql}"), 10_000)
+                    .await?;
+                let rows: Vec<(i64, i64, String)> = r
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let id = row.first()?.as_deref()?.parse().ok()?;
+                        let parent = row.get(1)?.as_deref()?.parse().ok()?;
+                        let detail = row.get(3)?.clone()?;
+                        Some((id, parent, detail))
+                    })
+                    .collect();
+                plan::parse_sqlite(&rows)
+            }
+        }
     }
 
     /// Run one statement, writing all its rows to `w`. Returns whether it returned a

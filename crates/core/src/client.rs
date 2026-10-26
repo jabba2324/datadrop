@@ -10,6 +10,7 @@ use crate::db::{MetaPool, Session};
 use crate::error::{CoreError, Result};
 use crate::export::{ExportFormat, ExportWriter};
 use crate::history::{self, History, HistoryEntry};
+use crate::plan::Plan;
 use crate::profile::{Driver, Profile, ProfileStore};
 use crate::sql::{self, Dialect};
 
@@ -165,6 +166,16 @@ impl Client {
                     .await?;
                 self.remember(&p.name, &sql, &out);
                 Ok(Output::Query(out))
+            }
+            Command::Explain {
+                profile,
+                sql,
+                analyze,
+                session,
+            } => {
+                let p = self.store.get(&profile)?;
+                let plan = self.explain(&p, &sql, analyze, session, cancel).await?;
+                Ok(Output::Plan(plan))
             }
             Command::Export {
                 profile,
@@ -358,6 +369,68 @@ impl Client {
             *guard = Some(cancellable(cancel, Session::connect(profile, None)).await?);
         }
         Ok(())
+    }
+
+    async fn explain(
+        &self,
+        profile: &Profile,
+        sql: &str,
+        analyze: bool,
+        session: Option<String>,
+        cancel: &CancellationToken,
+    ) -> Result<Plan> {
+        let dialect = Dialect::from(profile.driver);
+        let statements = sql::split_statements(sql, dialect);
+        let statement = match statements.as_slice() {
+            [one] => &sql[one.clone()],
+            [] => return Err(CoreError::Invalid("there's no SQL to explain".into())),
+            _ => {
+                return Err(CoreError::Invalid(
+                    "explain one statement at a time (put the cursor in it, or select it)".into(),
+                ));
+            }
+        };
+        if analyze && !crate::db::looks_like_query(statement, dialect) {
+            // It changes data: run it in a transaction that's rolled back, on its own
+            // connection.
+            let mut s = cancellable(cancel, Session::connect(profile, None)).await?;
+            let begin = if profile.driver == Driver::Mysql {
+                "START TRANSACTION"
+            } else {
+                "BEGIN"
+            };
+            let result = async {
+                s.run(begin, 1).await?;
+                cancellable(cancel, s.explain(statement, true)).await
+            }
+            .await;
+            let _ = s.run("ROLLBACK", 1).await;
+            s.close().await;
+            return result;
+        }
+        let slot = self.slot(&session);
+        let mut guard = slot.lock().await;
+        self.connect(&mut guard, profile, cancel).await?;
+        let live = guard.as_mut().expect("connected above");
+        let mut run = Box::pin(live.explain(statement, analyze));
+        let outcome = tokio::select! {
+            r = &mut run => Some(r),
+            _ = cancel.cancelled() => None,
+        };
+        drop(run);
+        let result = match outcome {
+            Some(r) => r,
+            None => {
+                stop_and_settle(&mut guard).await;
+                Err(CoreError::Cancelled)
+            }
+        };
+        if session.is_none()
+            && let Some(s) = guard.take()
+        {
+            s.close().await;
+        }
+        result
     }
 
     /// Run a script, streaming the last statement's rows into a file. The other
