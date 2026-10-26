@@ -108,6 +108,14 @@ pub enum Command {
         profile: String,
         statements: Vec<String>,
     },
+    /// Trust an SSH server's host key (after checking its fingerprint), so tunnels
+    /// through it can connect. The key is in OpenSSH format, as the unknown-host
+    /// error gives it.
+    SshTrustHost {
+        host: String,
+        port: u16,
+        key: String,
+    },
     /// Close a session's connection.
     SessionClose {
         session: String,
@@ -165,6 +173,9 @@ pub enum Output {
     Query(QueryOutput),
     Catalog(Catalog),
     SessionClosed,
+    HostTrusted {
+        host: String,
+    },
     EditsApplied {
         statements: usize,
     },

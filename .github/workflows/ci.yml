@@ -72,8 +72,28 @@ jobs:
     env:
       DATADROP_TEST_POSTGRES_URL: postgres://postgres:ci-only@127.0.0.1:5432/shop
       DATADROP_TEST_MYSQL_URL: mysql://root:ci-only@127.0.0.1:3306/shop
+      # The SSH tunnel tests: an SSH server in front of the same PostgreSQL.
+      DATADROP_TEST_SSH_HOST: 127.0.0.1
+      DATADROP_TEST_SSH_PORT: "2222"
+      DATADROP_TEST_SSH_USER: dd
+      DATADROP_TEST_SSH_PASSWORD: ci-only-ssh
+      DATADROP_TEST_SSH_PASSPHRASE: ci-passphrase
+      DATADROP_TEST_SSH_DB_URL: postgres://postgres:ci-only@host.docker.internal:5432/shop
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Start an SSH server for the tunnel tests
+        run: |
+          dir="$RUNNER_TEMP/ssh-test"
+          mkdir -p "$dir"
+          ssh-keygen -q -t ed25519 -N "" -f "$dir/id_plain"
+          ssh-keygen -q -t ed25519 -N "$DATADROP_TEST_SSH_PASSPHRASE" -f "$dir/id_pass"
+          cat "$dir/id_plain.pub" "$dir/id_pass.pub" > "$dir/authorized_keys"
+          cp .github/ssh-test/Dockerfile "$dir/"
+          docker build -q -t ssh-test --build-arg PASSWORD="$DATADROP_TEST_SSH_PASSWORD" "$dir"
+          docker run -d --name ssh-test -p 127.0.0.1:2222:2222 \
+            --add-host=host.docker.internal:host-gateway ssh-test
+          echo "DATADROP_TEST_SSH_KEY=$dir/id_plain" >> "$GITHUB_ENV"
+          echo "DATADROP_TEST_SSH_KEY_PASSPHRASE_FILE=$dir/id_pass" >> "$GITHUB_ENV"
       - run: cargo test --workspace --all-features

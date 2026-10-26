@@ -7,13 +7,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::{Command, DEFAULT_MAX_ROWS, Output, QueryOutput, StatementError};
 use crate::complete::Catalog;
+use crate::db::Endpoint;
 use crate::db::{MetaPool, Session};
 use crate::error::{CoreError, Result};
 use crate::export::{ExportFormat, ExportWriter};
 use crate::history::{self, History, HistoryEntry};
 use crate::plan::Plan;
+use crate::profile::SshTunnel;
 use crate::profile::{Driver, Profile, ProfileStore};
 use crate::sql::{self, Dialect};
+use crate::tunnel::{self, Tunnel};
 
 /// Where DataDrop keeps its files: `$DATADROP_HOME`, or `~/.datadrop`.
 #[derive(Debug, Clone)]
@@ -47,16 +50,27 @@ impl ConfigDir {
     pub fn history(&self) -> PathBuf {
         self.root.join("history.jsonl")
     }
+
+    /// SSH host keys trusted in DataDrop.
+    pub fn known_hosts(&self) -> PathBuf {
+        self.root.join("known_hosts")
+    }
 }
 
 type SessionSlot = Arc<tokio::sync::Mutex<Option<Session>>>;
+
+/// A tunnel, with the SSH settings and target it was opened for.
+type OpenTunnel = (SshTunnel, (String, u16), Arc<Tunnel>);
 
 /// Runs [`Command`]s. Cheap to share: clone the `Arc` it lives in.
 pub struct Client {
     store: ProfileStore,
     history: History,
+    known_hosts: PathBuf,
+    /// Open SSH tunnels, per profile, with the settings they were opened with.
+    tunnels: tokio::sync::Mutex<HashMap<String, OpenTunnel>>,
     /// Schema-browsing pools, per profile (rebuilt when the profile changes).
-    pools: Mutex<HashMap<String, (Profile, MetaPool)>>,
+    pools: Mutex<HashMap<String, (Profile, Endpoint, MetaPool)>>,
     sessions: Mutex<HashMap<String, SessionSlot>>,
 }
 
@@ -65,6 +79,8 @@ impl Client {
         Self {
             store: ProfileStore::new(config.profiles()),
             history: History::new(config.history()),
+            known_hosts: config.known_hosts(),
+            tunnels: Default::default(),
             pools: Mutex::default(),
             sessions: Mutex::default(),
         }
@@ -122,7 +138,7 @@ impl Client {
             }
             Command::ConnectionTest { profile } => self.test(&profile, cancel).await,
             Command::Schemas { profile } => {
-                let pool = self.pool(&profile)?;
+                let pool = self.pool(&profile).await?;
                 Ok(Output::Schemas {
                     schemas: cancellable(cancel, pool.schemas()).await?,
                 })
@@ -130,7 +146,7 @@ impl Client {
             Command::Tables { profile, schema } => {
                 let p = self.store.get(&profile)?;
                 let schema = default_schema(&p, schema)?;
-                let pool = self.pool(&profile)?;
+                let pool = self.pool(&profile).await?;
                 let tables = cancellable(cancel, pool.tables(&schema)).await?;
                 Ok(Output::Tables { schema, tables })
             }
@@ -141,7 +157,7 @@ impl Client {
             } => {
                 let p = self.store.get(&profile)?;
                 let schema = default_schema(&p, schema)?;
-                let pool = self.pool(&profile)?;
+                let pool = self.pool(&profile).await?;
                 let columns = cancellable(cancel, pool.columns(&schema, &table)).await?;
                 Ok(Output::Columns {
                     schema,
@@ -151,7 +167,7 @@ impl Client {
             }
             Command::Catalog { profile } => {
                 let p = self.store.get(&profile)?;
-                let pool = self.pool(&profile)?;
+                let pool = self.pool(&profile).await?;
                 let schemas = cancellable(cancel, pool.schemas()).await?;
                 let tables = cancellable(cancel, pool.catalog()).await?;
                 Ok(Output::Catalog(Catalog {
@@ -232,6 +248,10 @@ impl Client {
             Command::HistoryClear { profile } => Ok(Output::HistoryCleared {
                 removed: self.history.clear(profile.as_deref())?,
             }),
+            Command::SshTrustHost { host, port, key } => {
+                tunnel::trust_host(&self.known_hosts, &host, port, &key)?;
+                Ok(Output::HostTrusted { host })
+            }
             Command::SessionClose { session } => {
                 let slot = self.sessions.lock().expect("sessions").remove(&session);
                 if let Some(slot) = slot
@@ -269,30 +289,104 @@ impl Client {
 
     async fn test(&self, p: &Profile, cancel: &CancellationToken) -> Result<Output> {
         p.validate()?;
-        let mut s = cancellable(cancel, Session::connect(p, None)).await?;
+        // A tunnel just for the test (the settings may not be saved).
+        let tunnel = match &p.ssh {
+            Some(ssh) => Some(
+                cancellable(
+                    cancel,
+                    Tunnel::open(
+                        ssh,
+                        p.server(),
+                        tunnel::known_hosts_files(self.known_hosts.clone()),
+                    ),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let via = tunnel.as_ref().map(|t| t.local.clone());
+        let mut s = match cancellable(cancel, Session::connect(p, via)).await {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(match tunnel.as_ref().and_then(|t| t.take_forward_error()) {
+                    Some(why) => CoreError::Ssh(why),
+                    None => e,
+                });
+            }
+        };
         let server_version = s.server_version().await?;
         s.close().await;
+        drop(tunnel);
         Ok(Output::Connected { server_version })
     }
 
-    fn pool(&self, name: &str) -> Result<MetaPool> {
+    async fn pool(&self, name: &str) -> Result<MetaPool> {
         let p = self.store.get(name)?;
+        let via = self.via(&p).await?;
         let mut pools = self.pools.lock().expect("pools");
-        if let Some((saved, pool)) = pools.get(name)
+        if let Some((saved, saved_via, pool)) = pools.get(name)
             && *saved == p
+            && *saved_via == via
         {
             return Ok(pool.clone());
         }
-        let pool = MetaPool::new(&p, None)?;
-        pools.insert(name.to_owned(), (p, pool.clone()));
+        let pool = MetaPool::new(&p, via.clone())?;
+        pools.insert(name.to_owned(), (p, via, pool.clone()));
         Ok(pool)
+    }
+
+    /// If connecting failed because the SSH server wouldn't forward the connection,
+    /// say so (the database driver only sees the connection drop).
+    async fn explain_tunnel_failure<T>(&self, profile: &Profile, r: Result<T>) -> Result<T> {
+        let Err(e) = r else { return r };
+        if profile.ssh.is_none() {
+            return Err(e);
+        }
+        let tunnels = self.tunnels.lock().await;
+        match tunnels
+            .get(&profile.name)
+            .and_then(|(_, _, t)| t.take_forward_error())
+        {
+            Some(why) => Err(CoreError::Ssh(why)),
+            None => Err(e),
+        }
+    }
+
+    /// The SSH tunnel's local end for a profile that uses one (opening it, or
+    /// opening it again if it dropped); `None` without SSH.
+    async fn via(&self, profile: &Profile) -> Result<Endpoint> {
+        let Some(ssh) = &profile.ssh else {
+            return Ok(None);
+        };
+        let target = profile.server();
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some((s, t, tunnel)) = tunnels.get(&profile.name)
+            && s == ssh
+            && *t == target
+            && tunnel.is_alive()
+        {
+            return Ok(Some(tunnel.local.clone()));
+        }
+        let tunnel = Tunnel::open(
+            ssh,
+            target.clone(),
+            tunnel::known_hosts_files(self.known_hosts.clone()),
+        )
+        .await?;
+        let local = tunnel.local.clone();
+        tunnels.insert(
+            profile.name.clone(),
+            (ssh.clone(), target, Arc::new(tunnel)),
+        );
+        Ok(Some(local))
     }
 
     async fn forget_pool(&self, name: &str) {
         let old = self.pools.lock().expect("pools").remove(name);
-        if let Some((_, pool)) = old {
+        if let Some((_, _, pool)) = old {
             pool.close().await;
         }
+        self.tunnels.lock().await.remove(name);
     }
 
     async fn query(
@@ -388,7 +482,9 @@ impl Client {
             }
         }
         if guard.is_none() {
-            *guard = Some(cancellable(cancel, Session::connect(profile, None)).await?);
+            let via = cancellable(cancel, self.via(profile)).await?;
+            let session = cancellable(cancel, Session::connect(profile, via)).await;
+            *guard = Some(self.explain_tunnel_failure(profile, session).await?);
         }
         Ok(())
     }
@@ -402,7 +498,8 @@ impl Client {
         if statements.is_empty() {
             return Ok(());
         }
-        let mut s = cancellable(cancel, Session::connect(profile, None)).await?;
+        let via = cancellable(cancel, self.via(profile)).await?;
+        let mut s = cancellable(cancel, Session::connect(profile, via)).await?;
         let begin = if profile.driver == Driver::Mysql {
             "START TRANSACTION"
         } else {
@@ -591,7 +688,7 @@ impl Client {
             .lock()
             .expect("pools")
             .drain()
-            .map(|(_, (_, p))| p)
+            .map(|(_, (_, _, p))| p)
             .collect();
         for p in pools {
             p.close().await;

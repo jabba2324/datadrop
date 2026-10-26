@@ -1,6 +1,6 @@
 //! Adding or editing a connection profile.
 
-use datadrop_core::{Command, Driver, Output, Profile, SslMode};
+use datadrop_core::{Command, CoreError, Driver, Output, Profile, SshAuth, SshTunnel, SslMode};
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
@@ -21,12 +21,66 @@ pub struct ProfileForm {
     pub ssl_mode: SslMode,
     pub ssl_root_cert: String,
     pub create_if_missing: bool,
+    pub use_ssh: bool,
+    pub ssh_host: String,
+    pub ssh_port: String,
+    pub ssh_user: String,
+    pub ssh_method: SshMethod,
+    pub ssh_password: String,
+    pub ssh_key: String,
+    pub ssh_passphrase: String,
     show_password: bool,
     test: Option<Task>,
     test_result: Option<Result<String, String>>,
+    /// The SSH server's key isn't known: offer to trust it.
+    pub untrusted: Option<TrustPrompt>,
+    trusting: Option<Task>,
     saving: Option<Task>,
     pub error: Option<String>,
     focused: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SshMethod {
+    Agent,
+    Password,
+    Key,
+}
+
+/// An SSH server whose key isn't known yet.
+#[derive(Clone, Debug)]
+pub struct TrustPrompt {
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+    pub key: String,
+}
+
+impl TrustPrompt {
+    pub fn from_error(e: &CoreError) -> Option<Self> {
+        match e {
+            CoreError::UnknownHostKey {
+                host,
+                port,
+                fingerprint,
+                key,
+            } => Some(Self {
+                host: host.clone(),
+                port: *port,
+                fingerprint: fingerprint.clone(),
+                key: key.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn command(&self) -> Command {
+        Command::SshTrustHost {
+            host: self.host.clone(),
+            port: self.port,
+            key: self.key.clone(),
+        }
+    }
 }
 
 pub enum FormDone {
@@ -62,9 +116,40 @@ impl ProfileForm {
                 .map(|c| c.display().to_string())
                 .unwrap_or_default(),
             create_if_missing: p.create_if_missing,
+            use_ssh: p.ssh.is_some(),
+            ssh_host: p.ssh.as_ref().map(|t| t.host.clone()).unwrap_or_default(),
+            ssh_port: p
+                .ssh
+                .as_ref()
+                .and_then(|t| t.port)
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            ssh_user: p.ssh.as_ref().map(|t| t.user.clone()).unwrap_or_default(),
+            ssh_method: match p.ssh.as_ref().map(|t| &t.auth) {
+                Some(SshAuth::Password { .. }) => SshMethod::Password,
+                Some(SshAuth::Key { .. }) => SshMethod::Key,
+                _ => SshMethod::Agent,
+            },
+            ssh_password: match p.ssh.as_ref().map(|t| &t.auth) {
+                Some(SshAuth::Password { password }) => password.clone(),
+                _ => String::new(),
+            },
+            ssh_key: match p.ssh.as_ref().map(|t| &t.auth) {
+                Some(SshAuth::Key { path, .. }) => path.display().to_string(),
+                _ => String::new(),
+            },
+            ssh_passphrase: match p.ssh.as_ref().map(|t| &t.auth) {
+                Some(SshAuth::Key {
+                    passphrase: Some(pp),
+                    ..
+                }) => pp.clone(),
+                _ => String::new(),
+            },
             show_password: false,
             test: None,
             test_result: None,
+            untrusted: None,
+            trusting: None,
             saving: None,
             error: None,
             focused: false,
@@ -109,6 +194,30 @@ impl ProfileForm {
             };
             p.database = self.database.trim().to_owned();
         }
+        if self.use_ssh {
+            p.ssh = Some(SshTunnel {
+                host: self.ssh_host.trim().to_owned(),
+                port: match self.ssh_port.trim() {
+                    "" => None,
+                    s => Some(
+                        s.parse::<u16>()
+                            .map_err(|_| format!("'{s}' isn't an SSH port number"))?,
+                    ),
+                },
+                user: self.ssh_user.trim().to_owned(),
+                auth: match self.ssh_method {
+                    SshMethod::Agent => SshAuth::Agent,
+                    SshMethod::Password => SshAuth::Password {
+                        password: self.ssh_password.clone(),
+                    },
+                    SshMethod::Key => SshAuth::Key {
+                        path: self.ssh_key.trim().into(),
+                        passphrase: (!self.ssh_passphrase.is_empty())
+                            .then(|| self.ssh_passphrase.clone()),
+                    },
+                },
+            });
+        }
         p.validate().map_err(|e| e.to_string())?;
         Ok(p)
     }
@@ -116,11 +225,26 @@ impl ProfileForm {
     /// The form as a modal. Returns once it's saved or cancelled.
     pub fn ui(&mut self, ctx: &egui::Context, backend: &Backend) -> Option<FormDone> {
         if let Some(r) = poll(&mut self.test) {
+            self.untrusted = r.as_ref().err().and_then(TrustPrompt::from_error);
             self.test_result = Some(match r {
                 Ok(Output::Connected { server_version }) => Ok(server_version),
                 Ok(_) => Ok("Connected".into()),
+                Err(e) if self.untrusted.is_some() => Err(e.to_string()),
                 Err(e) => Err(e.to_string()),
             });
+        }
+        if let Some(r) = poll(&mut self.trusting) {
+            match r {
+                // Trusted: test again.
+                Ok(_) => {
+                    self.untrusted = None;
+                    if let Ok(profile) = self.build() {
+                        self.test_result = None;
+                        self.test = Some(backend.run(Command::ConnectionTest { profile }));
+                    }
+                }
+                Err(e) => self.test_result = Some(Err(e.to_string())),
+            }
         }
         if let Some(r) = poll(&mut self.saving) {
             match r {
@@ -154,6 +278,26 @@ impl ProfileForm {
                             .color(ui.visuals().error_fg_color),
                     ),
                 };
+            }
+            if let Some(t) = self.untrusted.clone() {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{} Key fingerprint:", icon::FINGERPRINT));
+                    ui.monospace(&t.fingerprint);
+                });
+                if ui
+                    .add_enabled(
+                        self.trusting.is_none(),
+                        egui::Button::new(format!(
+                            "{} Trust this server and connect",
+                            icon::SEAL_CHECK
+                        )),
+                    )
+                    .on_hover_text("Only if the fingerprint matches the server's real key")
+                    .clicked()
+                {
+                    self.trusting = Some(backend.run(t.command()));
+                }
             }
             if let Some(e) = &self.error {
                 ui.add_space(6.0);
@@ -329,7 +473,78 @@ impl ProfileForm {
                     }
                 });
                 ui.end_row();
+                ui.label("SSH tunnel");
+                ui.checkbox(&mut self.use_ssh, "Connect through an SSH server");
+                ui.end_row();
+                if self.use_ssh {
+                    self.ssh_fields(ui);
+                }
             });
+    }
+
+    fn ssh_fields(&mut self, ui: &mut egui::Ui) {
+        let field =
+            |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, secret: bool| {
+                let l = ui.label(label);
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .password(secret)
+                        .desired_width(f32::INFINITY),
+                )
+                .labelled_by(l.id);
+                ui.end_row();
+            };
+        field(
+            ui,
+            "SSH host",
+            &mut self.ssh_host,
+            "bastion.example.com",
+            false,
+        );
+        field(ui, "SSH port", &mut self.ssh_port, "22", false);
+        field(ui, "SSH user", &mut self.ssh_user, "", false);
+        ui.label("Sign in with");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.ssh_method, SshMethod::Agent, "SSH agent");
+            ui.radio_value(&mut self.ssh_method, SshMethod::Key, "Key file");
+            ui.radio_value(&mut self.ssh_method, SshMethod::Password, "Password");
+        });
+        ui.end_row();
+        match self.ssh_method {
+            SshMethod::Agent => {}
+            SshMethod::Password => {
+                field(ui, "SSH password", &mut self.ssh_password, "", true);
+            }
+            SshMethod::Key => {
+                let l = ui.label("Key file");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ssh_key)
+                            .hint_text("~/.ssh/id_ed25519")
+                            .desired_width(ui.available_width() - 70.0),
+                    )
+                    .labelled_by(l.id);
+                    if ui.button("Browse…").clicked() {
+                        let mut d = rfd::FileDialog::new();
+                        if let Some(home) = std::env::home_dir() {
+                            d = d.set_directory(home.join(".ssh"));
+                        }
+                        if let Some(f) = d.pick_file() {
+                            self.ssh_key = f.display().to_string();
+                        }
+                    }
+                });
+                ui.end_row();
+                field(
+                    ui,
+                    "Passphrase",
+                    &mut self.ssh_passphrase,
+                    "if the key has one",
+                    true,
+                );
+            }
+        }
     }
 }
 
@@ -402,6 +617,29 @@ mod tests {
         let p = f.build().unwrap();
         assert_eq!(p.url.as_deref(), Some("mysql://h/db"));
         assert!(p.host.is_empty(), "host fields aren't saved with a URL");
+
+        // Through SSH, with a key.
+        let mut t = ProfileForm::new();
+        t.name = "tunnelled".into();
+        t.host = "10.0.0.5".into();
+        t.use_ssh = true;
+        t.ssh_host = "bastion".into();
+        t.ssh_user = "ops".into();
+        t.ssh_method = SshMethod::Key;
+        assert!(t.build().is_err(), "needs the key file");
+        t.ssh_key = "/home/me/.ssh/id_ed25519".into();
+        t.ssh_passphrase = "pp".into();
+        let p = t.build().unwrap();
+        let ssh = p.ssh.clone().unwrap();
+        assert_eq!(ssh.port(), 22);
+        assert_eq!(
+            ssh.auth,
+            SshAuth::Key {
+                path: "/home/me/.ssh/id_ed25519".into(),
+                passphrase: Some("pp".into())
+            }
+        );
+        assert_eq!(ProfileForm::edit(&p).build().unwrap(), p);
 
         // SQLite needs only the file.
         let mut lite = ProfileForm::new();

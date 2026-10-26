@@ -428,3 +428,56 @@ fn edits_rows_in_the_grid() {
         Editability::ReadOnly(_)
     ));
 }
+
+/// With an SSH server in front of PostgreSQL (see crates/core/tests/ssh.rs for the
+/// environment): an unknown host key brings up the trust prompt, and once trusted
+/// queries go through.
+#[test]
+fn trusts_an_ssh_server_then_runs() {
+    let (Ok(host), Ok(db)) = (
+        std::env::var("DATADROP_TEST_SSH_HOST"),
+        std::env::var("DATADROP_TEST_SSH_DB_URL"),
+    ) else {
+        eprintln!("DATADROP_TEST_SSH_HOST isn't set; skipping");
+        return;
+    };
+    let var = |k: &str| std::env::var(format!("DATADROP_TEST_SSH_{k}")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    save_profile(
+        dir.path(),
+        Profile {
+            name: "tunnelled".into(),
+            driver: Driver::Postgres,
+            url: Some(db),
+            ssl_mode: datadrop_core::SslMode::Disable,
+            ssh: Some(datadrop_core::SshTunnel {
+                host,
+                port: var("PORT").parse().ok(),
+                user: var("USER"),
+                auth: datadrop_core::SshAuth::Password {
+                    password: var("PASSWORD"),
+                },
+            }),
+            ..Profile::default()
+        },
+    );
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    let out = run_tab(&mut h, "select 'through the tunnel' as how");
+    assert!(out.error.is_some());
+    until(&mut h, "the trust prompt", |a| a.trust.is_some());
+    h.run_steps(2);
+    h.get_by_label("Trust this SSH server?");
+    h.get_by_label("Trust").click();
+    until(&mut h, "trusting", |a| a.trust.is_none());
+    for _ in 0..20 {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = run_tab(&mut h, "select 'through the tunnel' as how");
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(
+        out.results[0].rows[0][0].as_deref(),
+        Some("through the tunnel")
+    );
+}

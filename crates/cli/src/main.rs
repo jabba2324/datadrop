@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use datadrop_core::{
     Client, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, Profile, QueryOutput,
-    SslMode, StatementResult,
+    SshAuth, SshTunnel, SslMode, StatementResult,
 };
 
 mod render;
@@ -151,6 +151,14 @@ enum ProfileCmd {
     Remove { name: String },
     /// Connect and show the server version.
     Test { name: String },
+    /// Trust the SSH server a profile tunnels through (shows its key fingerprint
+    /// first, to check).
+    TrustHost {
+        name: String,
+        /// Don't ask; trust the key whatever it is.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Default)]
@@ -186,6 +194,21 @@ struct ProfileFields {
     /// A CA certificate (PEM) to trust.
     #[arg(long)]
     ssl_root_cert: Option<PathBuf>,
+    /// Connect through this SSH server (user@host or user@host:port).
+    #[arg(long)]
+    ssh: Option<String>,
+    /// SSH sign-in with this private key file (default: your SSH agent).
+    #[arg(long, requires = "ssh")]
+    ssh_key: Option<PathBuf>,
+    /// Ask for the SSH key's passphrase.
+    #[arg(long, requires = "ssh_key")]
+    ssh_ask_passphrase: bool,
+    /// SSH sign-in with a password (asked for).
+    #[arg(long, requires = "ssh", conflicts_with = "ssh_key")]
+    ssh_ask_password: bool,
+    /// Stop using an SSH tunnel.
+    #[arg(long, conflicts_with = "ssh")]
+    no_ssh: bool,
 }
 
 impl ProfileFields {
@@ -229,6 +252,44 @@ impl ProfileFields {
         if self.ssl_root_cert.is_some() {
             p.ssl_root_cert = self.ssl_root_cert;
         }
+        if let Some(target) = self.ssh {
+            let (user, host) = target
+                .split_once('@')
+                .context("give the SSH server as user@host or user@host:port")?;
+            let (host, port) = match host.rsplit_once(':') {
+                Some((h, port)) if !h.contains(':') || h.starts_with('[') => (
+                    h.trim_matches(['[', ']']).to_owned(),
+                    Some(port.parse::<u16>().context("the SSH port isn't a number")?),
+                ),
+                _ => (host.trim_matches(['[', ']']).to_owned(), None),
+            };
+            let auth = if let Some(path) = self.ssh_key {
+                let passphrase = if self.ssh_ask_passphrase {
+                    Some(rpassword::prompt_password("SSH key passphrase: ")?)
+                } else {
+                    None
+                };
+                SshAuth::Key {
+                    path: std::path::absolute(&path).unwrap_or(path),
+                    passphrase,
+                }
+            } else if self.ssh_ask_password {
+                SshAuth::Password {
+                    password: rpassword::prompt_password("SSH password: ")?,
+                }
+            } else {
+                SshAuth::Agent
+            };
+            p.ssh = Some(SshTunnel {
+                host,
+                port,
+                user: user.to_owned(),
+                auth,
+            });
+        }
+        if self.no_ssh {
+            p.ssh = None;
+        }
         if self.ask_password {
             p.password = Some(rpassword::prompt_password("Password: ")?);
         } else if self.password_stdin {
@@ -262,6 +323,9 @@ fn main() -> ExitCode {
                 println!("{}", serde_json::json!({ "error": err }));
             } else {
                 eprintln!("datadrop: {e:#}");
+                if let Some(CoreError::UnknownHostKey { .. }) = e.downcast_ref::<CoreError>() {
+                    eprintln!("To trust it: datadrop profile trust-host <profile>");
+                }
             }
             ExitCode::FAILURE
         }
@@ -273,6 +337,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let client = Client::new(&config);
     let json = cli.json;
     let (cmd, format) = match cli.command {
+        Cmd::Profile(ProfileCmd::TrustHost { name, yes }) => {
+            return trust_host(&client, &name, yes).await;
+        }
         Cmd::Profile(p) => (profile_command(&client, p)?, Format::Table),
         Cmd::Schemas { profile } => (Command::Schemas { profile }, Format::Table),
         Cmd::Catalog { profile } => (Command::Catalog { profile }, Format::Table),
@@ -384,6 +451,62 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     Ok(exit_code(&out))
 }
 
+/// Connect through a profile's SSH server; if its key isn't known yet, show the
+/// fingerprint and (once confirmed) trust it.
+async fn trust_host(client: &Client, name: &str, yes: bool) -> Result<ExitCode> {
+    let p = client.store().get(name)?;
+    if p.ssh.is_none() {
+        bail!("the profile '{name}' doesn't use an SSH tunnel");
+    }
+    match client
+        .execute(Command::ProfileTest {
+            name: name.to_owned(),
+        })
+        .await
+    {
+        Ok(_) => {
+            eprintln!("The SSH server is already trusted, and the connection works.");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(CoreError::UnknownHostKey {
+            host,
+            port,
+            fingerprint,
+            key,
+        }) => {
+            eprintln!(
+                "The SSH server {host}:{port} has the key fingerprint\n\n    {fingerprint}\n"
+            );
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    bail!("check the fingerprint, then run again with --yes to trust it");
+                }
+                eprint!("Is that the server's real key (check with its admin)? Trust it? [y/N] ");
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    eprintln!("Not trusted.");
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            client
+                .execute(Command::SshTrustHost { host, port, key })
+                .await?;
+            eprintln!("Trusted.");
+            let out = client
+                .execute(Command::ProfileTest {
+                    name: name.to_owned(),
+                })
+                .await?;
+            if let Output::Connected { server_version } = out {
+                println!("{server_version}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// SQL from the argument, a file, or standard input.
 fn read_sql(sql: Option<String>, file: Option<PathBuf>) -> Result<String> {
     Ok(match (sql, file) {
@@ -457,6 +580,7 @@ fn profile_command(client: &Client, cmd: ProfileCmd) -> Result<Command> {
         }
         ProfileCmd::Remove { name } => Command::ProfileRemove { name },
         ProfileCmd::Test { name } => Command::ProfileTest { name },
+        ProfileCmd::TrustHost { .. } => unreachable!("handled in run"),
     })
 }
 
@@ -561,6 +685,7 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
             )?;
         }
         Output::Plan(p) => render::plan(&mut stdout, p)?,
+        Output::HostTrusted { host } => eprintln!("Trusted the SSH server {host}."),
         Output::EditsApplied { statements } => {
             eprintln!("Saved: {statements} statement(s) committed.")
         }

@@ -133,6 +133,43 @@ impl std::str::FromStr for SslMode {
     }
 }
 
+/// Reach the database through an SSH server: DataDrop connects to it and forwards
+/// the database connection from there (like `ssh -L`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshTunnel {
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    pub user: String,
+    pub auth: SshAuth,
+}
+
+/// How to sign in to the SSH server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum SshAuth {
+    /// The keys in your SSH agent (ssh-agent, or Pageant / the OpenSSH agent on
+    /// Windows).
+    #[default]
+    Agent,
+    Password {
+        password: String,
+    },
+    /// A private key file, with its passphrase if it has one.
+    Key {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passphrase: Option<String>,
+    },
+}
+
+impl SshTunnel {
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(22)
+    }
+}
+
 /// How to reach one database.
 ///
 /// Either fill in the fields, or give a connection `url`. With a URL, its host, port
@@ -161,6 +198,9 @@ pub struct Profile {
     /// SQLite: create the database file if it doesn't exist.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub create_if_missing: bool,
+    /// Connect through an SSH server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshTunnel>,
 }
 
 /// What a listing shows: no password.
@@ -181,6 +221,29 @@ impl Profile {
         }
     }
 
+    /// Where the database server is, as the profile says (the URL's host and port,
+    /// or the fields), before any SSH tunnel.
+    pub fn server(&self) -> (String, u16) {
+        if let Some(u) = self.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
+            return (
+                u.host_str()
+                    .unwrap_or("localhost")
+                    .trim_matches(['[', ']'])
+                    .to_owned(),
+                u.port().unwrap_or(self.driver.default_port()),
+            );
+        }
+        let host = if self.host.is_empty() {
+            "localhost"
+        } else {
+            &self.host
+        };
+        (
+            host.to_owned(),
+            self.port.unwrap_or(self.driver.default_port()),
+        )
+    }
+
     /// `user@host:port/database` (the URL's, if there is one), never with a password;
     /// for SQLite, the file.
     pub fn target(&self) -> String {
@@ -199,7 +262,7 @@ impl Profile {
             let host = url.host_str().unwrap_or("localhost");
             let port = url.port().unwrap_or(self.driver.default_port());
             let db = url.path().trim_start_matches('/');
-            return join_target(&user, host, port, &decode(db));
+            return self.via_ssh(join_target(&user, host, port, &decode(db)));
         }
         let host = if self.host.is_empty() {
             "localhost"
@@ -207,7 +270,14 @@ impl Profile {
             &self.host
         };
         let port = self.port.unwrap_or(self.driver.default_port());
-        join_target(&self.user, host, port, &self.database)
+        self.via_ssh(join_target(&self.user, host, port, &self.database))
+    }
+
+    fn via_ssh(&self, target: String) -> String {
+        match &self.ssh {
+            Some(ssh) => format!("{target} via {}@{}", ssh.user, ssh.host),
+            None => target,
+        }
     }
 
     /// The same profile with the password (in the field and in any URL) replaced by
@@ -216,6 +286,16 @@ impl Profile {
         let mut p = self.clone();
         if p.password.as_deref().is_some_and(|pw| !pw.is_empty()) {
             p.password = Some(MASK.into());
+        }
+        if let Some(ssh) = &mut p.ssh {
+            match &mut ssh.auth {
+                SshAuth::Password { password } => *password = MASK.into(),
+                SshAuth::Key {
+                    passphrase: Some(pp),
+                    ..
+                } => *pp = MASK.into(),
+                _ => {}
+            }
         }
         p.url = p.url.as_deref().map(mask_url_password);
         p
@@ -228,6 +308,25 @@ impl Profile {
             return Err(CoreError::InvalidProfile(
                 "choose the SQLite database file".into(),
             ));
+        }
+        if let Some(ssh) = &self.ssh {
+            if self.driver.is_file() {
+                return Err(CoreError::InvalidProfile(
+                    "SQLite opens a local file, so it can't go through SSH".into(),
+                ));
+            }
+            if ssh.host.trim().is_empty() || ssh.user.trim().is_empty() {
+                return Err(CoreError::InvalidProfile(
+                    "the SSH tunnel needs a host and a user".into(),
+                ));
+            }
+            if let SshAuth::Key { path, .. } = &ssh.auth
+                && path.as_os_str().is_empty()
+            {
+                return Err(CoreError::InvalidProfile(
+                    "choose the SSH private key file".into(),
+                ));
+            }
         }
         if let Some(url) = &self.url {
             let driver = Driver::from_url(url).ok_or_else(|| {
@@ -547,6 +646,39 @@ mod tests {
         assert!(!m.url.as_deref().unwrap().contains("hunter2"));
         assert!(pg("x").masked().password.as_deref() == Some(MASK));
         assert_eq!(Profile::default().target(), "localhost:5432");
+    }
+
+    #[test]
+    fn ssh_tunnels() {
+        let mut p = pg("x");
+        p.ssh = Some(SshTunnel {
+            host: "bastion.example.com".into(),
+            port: None,
+            user: "ops".into(),
+            auth: SshAuth::Password {
+                password: "pw".into(),
+            },
+        });
+        p.validate().unwrap();
+        assert_eq!(
+            p.target(),
+            "alice@db.example.com:5432/shop via ops@bastion.example.com"
+        );
+        assert_eq!(p.server(), ("db.example.com".into(), 5432));
+        let m = p.masked();
+        assert_eq!(
+            m.ssh.unwrap().auth,
+            SshAuth::Password {
+                password: MASK.into()
+            }
+        );
+        // Saved and read back as it was.
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"method\":\"password\""), "{json}");
+        assert_eq!(serde_json::from_str::<Profile>(&json).unwrap(), p);
+        p.driver = Driver::Sqlite;
+        p.database = "x.db".into();
+        assert!(p.validate().is_err());
     }
 
     #[test]

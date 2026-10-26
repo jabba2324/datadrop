@@ -8,6 +8,7 @@ use egui::RichText;
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
+use crate::profile_form::TrustPrompt;
 
 enum Load<T> {
     Loading(Option<Task>),
@@ -17,6 +18,8 @@ enum Load<T> {
 
 #[derive(Default)]
 pub struct Browser {
+    /// An SSH server whose key isn't known came up while loading.
+    pub untrusted: Option<TrustPrompt>,
     schemas: HashMap<String, Load<Vec<String>>>,
     tables: HashMap<(String, String), Load<Vec<TableInfo>>>,
     columns: HashMap<(String, String, String), Load<Vec<ColumnInfo>>>,
@@ -38,6 +41,7 @@ pub enum BrowserAction {
 /// Collect results of finished loads into `Ready` / `Failed`.
 fn settle<K: Eq + std::hash::Hash, T>(
     map: &mut HashMap<K, Load<T>>,
+    untrusted: &mut Option<TrustPrompt>,
     take: impl Fn(Output) -> Option<T>,
 ) {
     for load in map.values_mut() {
@@ -50,7 +54,12 @@ fn settle<K: Eq + std::hash::Hash, T>(
                         None => Load::Failed("unexpected reply".into()),
                     }
                 }
-                Some(Err(e)) => *load = Load::Failed(e.to_string()),
+                Some(Err(e)) => {
+                    if let Some(t) = TrustPrompt::from_error(&e) {
+                        *untrusted = Some(t);
+                    }
+                    *load = Load::Failed(e.to_string());
+                }
             }
         }
     }
@@ -58,21 +67,28 @@ fn settle<K: Eq + std::hash::Hash, T>(
 
 impl Browser {
     pub fn poll(&mut self) {
-        settle(&mut self.schemas, |o| match o {
+        settle(&mut self.schemas, &mut self.untrusted, |o| match o {
             Output::Schemas { schemas } => Some(schemas),
             _ => None,
         });
-        settle(&mut self.tables, |o| match o {
+        settle(&mut self.tables, &mut self.untrusted, |o| match o {
             Output::Tables { tables, .. } => Some(tables),
             _ => None,
         });
-        settle(&mut self.columns, |o| match o {
+        settle(&mut self.columns, &mut self.untrusted, |o| match o {
             Output::Columns { columns, .. } => Some(columns),
             _ => None,
         });
     }
 
     /// Drop everything loaded for a profile, so it's read again when shown.
+    /// Drop everything loaded, for every profile.
+    pub fn forget_all(&mut self) {
+        self.schemas.clear();
+        self.tables.clear();
+        self.columns.clear();
+    }
+
     pub fn forget(&mut self, profile: &str) {
         self.schemas.remove(profile);
         self.tables.retain(|(p, _), _| p != profile);

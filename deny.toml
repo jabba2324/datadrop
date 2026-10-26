@@ -7,6 +7,12 @@ all-features = true
 # Fail on any RustSec vulnerability or unsound/yanked crate in the dependency tree.
 yanked = "deny"
 ignore = [
+    # rsa (Marvin): non-constant-time RSA private-key operations. Pulled in by russh
+    # for RSA SSH keys. SSH never decrypts with RSA, and DataDrop signs with the
+    # user's own RSA key once per tunnel connection, far too few samples for a timing
+    # attack over the network; Ed25519 keys don't use it at all. No fixed rsa
+    # release yet.
+    { id = "RUSTSEC-2023-0071", reason = "RSA only signs once per SSH connection; no decryption" },
     # zvariant, zvariant_derive and zbus_names: unmaintained as standalone crates since they merged into
     # zbus 6 (no vulnerability). Used by the GUI's screen-reader support (accesskit) and
     # Linux file dialogs (rfd -> ashpd) through zbus 5. Remove when those move to zbus 6.

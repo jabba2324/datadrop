@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 futures.workspace = true
+russh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

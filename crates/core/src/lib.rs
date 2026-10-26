@@ -16,6 +16,7 @@ pub mod history;
 pub mod plan;
 pub mod profile;
 pub mod sql;
+pub mod tunnel;
 
 pub use client::{Client, ConfigDir};
 pub use command::{Command, DEFAULT_MAX_ROWS, Output, QueryOutput, StatementError};
@@ -25,5 +26,5 @@ pub use error::{CoreError, Result};
 pub use export::ExportFormat;
 pub use history::HistoryEntry;
 pub use plan::{Plan, PlanNode};
-pub use profile::{Driver, Profile, ProfileStore, ProfileSummary, SslMode};
+pub use profile::{Driver, Profile, ProfileStore, ProfileSummary, SshAuth, SshTunnel, SslMode};
 pub use tokio_util::sync::CancellationToken;

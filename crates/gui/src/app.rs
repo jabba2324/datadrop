@@ -17,7 +17,7 @@ use crate::browser::{Browser, BrowserAction};
 use crate::editor::{self, Document, Find, ResultView};
 use crate::grid_edit::{Editability, Review};
 use crate::history_view::{HistoryAction, HistoryView};
-use crate::profile_form::{FormDone, ProfileForm};
+use crate::profile_form::{FormDone, ProfileForm, TrustPrompt};
 use crate::results::{self, ResultsAction};
 use crate::settings::{Settings, Theme};
 use crate::theme;
@@ -66,6 +66,9 @@ pub struct App {
     pub form: Option<ProfileForm>,
     pub confirm: Option<Confirm>,
     delete_task: Option<Task>,
+    /// An SSH server to trust (its key isn't known yet), and the task trusting it.
+    pub trust: Option<TrustPrompt>,
+    trusting: Option<Task>,
     pub toasts: egui_notify::Toasts,
     quitting: bool,
 }
@@ -128,6 +131,8 @@ impl App {
             form: None,
             confirm: None,
             delete_task: None,
+            trust: None,
+            trusting: None,
             toasts: egui_notify::Toasts::default(),
             quitting: false,
         };
@@ -489,6 +494,7 @@ impl App {
             };
         }
         let mut changed_schema = vec![];
+        let mut untrusted = None;
         for doc in &mut self.docs {
             let Some(r) = poll(&mut doc.running) else {
                 continue;
@@ -527,7 +533,12 @@ impl App {
                 Ok(_) => QueryOutput::default(),
                 Err(e) => QueryOutput {
                     results: vec![],
-                    cancelled: matches!(e, CoreError::Cancelled),
+                    cancelled: {
+                        if let Some(t) = TrustPrompt::from_error(&e) {
+                            untrusted = Some(t);
+                        }
+                        matches!(e, CoreError::Cancelled)
+                    },
                     error: Some(StatementError {
                         index: 0,
                         sql: String::new(),
@@ -540,6 +551,25 @@ impl App {
             self.schema_changed(&p);
         }
         self.browser.poll();
+        if let Some(t) = untrusted.or_else(|| self.browser.untrusted.take())
+            && self.trust.is_none()
+            && self.trusting.is_none()
+        {
+            self.trust = Some(t);
+        }
+        if let Some(r) = poll(&mut self.trusting) {
+            match r {
+                Ok(_) => {
+                    self.toasts
+                        .success("Trusted. Run the query again, or reopen the connection.");
+                    self.browser.forget_all();
+                    self.catalogs.clear();
+                }
+                Err(e) => {
+                    self.toasts.error(e.to_string());
+                }
+            }
+        }
         self.history.poll();
     }
 
@@ -1368,8 +1398,50 @@ impl App {
         doc.run_started = Some(Instant::now());
     }
 
+    fn trust_dialog(&mut self, ctx: &egui::Context) {
+        let Some(t) = self.trust.clone() else { return };
+        let mut choice = None;
+        egui::Modal::new(egui::Id::new("trust-ssh")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Trust this SSH server?");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "DataDrop hasn't connected to {}:{} before. Its key fingerprint is:",
+                t.host, t.port
+            ));
+            ui.add_space(4.0);
+            ui.monospace(&t.fingerprint);
+            ui.add_space(6.0);
+            ui.weak(
+                "Check it with the server's admin (or `ssh-keygen -lf` on the server) before \
+                 trusting it: a different fingerprint can mean someone is intercepting the \
+                 connection.",
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Trust").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        match choice {
+            Some(true) => {
+                self.trusting = Some(self.backend.run(t.command()));
+                self.trust = None;
+            }
+            Some(false) => self.trust = None,
+            None => {}
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.review_dialog(ctx);
+        if self.form.is_none() {
+            self.trust_dialog(ctx);
+        }
         if let Some(form) = &mut self.form
             && let Some(done) = form.ui(ctx, &self.backend)
         {
