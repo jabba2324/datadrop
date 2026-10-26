@@ -7,6 +7,7 @@ mod app;
 mod backend;
 mod browser;
 mod editor;
+mod history_view;
 mod profile_form;
 mod results;
 mod settings;

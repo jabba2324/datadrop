@@ -11,6 +11,7 @@ use egui_phosphor::regular as icon;
 use crate::backend::{Backend, Task, poll};
 use crate::browser::{Browser, BrowserAction};
 use crate::editor::{self, Document, Find};
+use crate::history_view::{HistoryAction, HistoryView};
 use crate::profile_form::{FormDone, ProfileForm};
 use crate::results::{self, ResultsAction};
 use crate::settings::{Settings, Theme};
@@ -20,6 +21,13 @@ pub enum ConfirmKind {
     CloseTab(u64),
     Quit,
     DeleteProfile(String),
+    ClearHistory,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LeftView {
+    Connections,
+    History,
 }
 
 pub struct Confirm {
@@ -39,6 +47,8 @@ pub struct App {
     next_id: u64,
     untitled_count: usize,
     pub browser: Browser,
+    pub left: LeftView,
+    pub history: HistoryView,
     pub find: Find,
     pub form: Option<ProfileForm>,
     pub confirm: Option<Confirm>,
@@ -91,6 +101,8 @@ impl App {
             next_id: 1,
             untitled_count: 0,
             browser: Browser::default(),
+            left: LeftView::Connections,
+            history: HistoryView::default(),
             find: Find::default(),
             form: None,
             confirm: None,
@@ -344,6 +356,7 @@ impl App {
                 continue;
             };
             doc.shown_result = usize::MAX; // the last result set
+            self.history.stale = true;
             doc.output = Some(match r {
                 Ok(Output::Query(q)) => {
                     let dialect = Dialect::Postgres;
@@ -374,6 +387,7 @@ impl App {
             self.browser.forget(&p);
         }
         self.browser.poll();
+        self.history.poll();
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -892,6 +906,41 @@ impl App {
         }
     }
 
+    fn history_action(&mut self, ctx: &egui::Context, action: HistoryAction) {
+        match action {
+            HistoryAction::OpenInTab(e) => {
+                let known = self.profiles.iter().any(|p| p.name == e.profile);
+                let i = self.new_tab(known.then_some(e.profile));
+                self.docs[i].text = e.sql;
+            }
+            HistoryAction::Insert(sql) => {
+                let doc = &mut self.docs[self.active];
+                let at = doc.cursor_range(ctx).map_or(doc.text.len(), |r| r.end);
+                // On its own line(s).
+                let mut text = sql;
+                if at > 0 && !doc.text[..at].ends_with('\n') {
+                    text.insert(0, '\n');
+                }
+                if !text.ends_with('\n') && at < doc.text.len() {
+                    text.push('\n');
+                }
+                doc.text.insert_str(at, &text);
+                let end = at + text.len();
+                doc.select = Some(end..end);
+                doc.request_focus = true;
+            }
+            HistoryAction::Clear => {
+                self.confirm = Some(Confirm {
+                    kind: ConfirmKind::ClearHistory,
+                    title: "Clear the query history?".into(),
+                    text: "Every query you've run, from the app and the command line, is \
+                           forgotten."
+                        .into(),
+                });
+            }
+        }
+    }
+
     fn run_whole(&mut self, i: usize) {
         let doc = &mut self.docs[i];
         let Some(profile) = doc.profile.clone() else {
@@ -958,6 +1007,17 @@ impl App {
                         choice = Some("cancel");
                     }
                 }
+                ConfirmKind::ClearHistory => {
+                    if ui
+                        .button(RichText::new("Clear").color(ui.visuals().error_fg_color))
+                        .clicked()
+                    {
+                        choice = Some("delete");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some("cancel");
+                    }
+                }
                 ConfirmKind::DeleteProfile(_) => {
                     if ui
                         .button(RichText::new("Delete").color(ui.visuals().error_fg_color))
@@ -989,6 +1049,11 @@ impl App {
             (ConfirmKind::Quit, "discard") => {
                 self.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            (ConfirmKind::ClearHistory, "delete") => {
+                self.backend.fire(Command::HistoryClear { profile: None });
+                self.history.entries.clear();
+                self.history.stale = true;
             }
             (ConfirmKind::DeleteProfile(name), "delete") => {
                 self.delete_task = Some(self.backend.run(Command::ProfileRemove { name }));
@@ -1024,8 +1089,22 @@ impl eframe::App for App {
             .default_size(250.0)
             .min_size(160.0)
             .show(ui, |ui| {
-                if let Some(a) = self.browser.ui(ui, &self.profiles, &self.backend) {
-                    self.browser_action(a);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.left, LeftView::Connections, "Connections");
+                    ui.selectable_value(&mut self.left, LeftView::History, "History");
+                });
+                match self.left {
+                    LeftView::Connections => {
+                        if let Some(a) = self.browser.ui(ui, &self.profiles, &self.backend) {
+                            self.browser_action(a);
+                        }
+                    }
+                    LeftView::History => {
+                        if let Some(a) = self.history.ui(ui, &self.backend) {
+                            self.history_action(&ctx, a);
+                        }
+                    }
                 }
             });
         egui::CentralPanel::default_margins().show(ui, |ui| {

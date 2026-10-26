@@ -88,7 +88,11 @@ impl Browser {
         let mut action = None;
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.strong("Connections");
+            ui.weak(match profiles.len() {
+                0 => String::new(),
+                1 => "1 connection".into(),
+                n => format!("{n} connections"),
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button(icon::PLUS)

@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::command::{Command, DEFAULT_MAX_ROWS, Output, QueryOutput, StatementError};
 use crate::db::{MetaPool, Session};
 use crate::error::{CoreError, Result};
+use crate::history::{self, History, HistoryEntry};
 use crate::profile::{Driver, Profile, ProfileStore};
 use crate::sql::{self, Dialect};
 
@@ -39,6 +40,10 @@ impl ConfigDir {
     pub fn profiles(&self) -> PathBuf {
         self.root.join("profiles")
     }
+
+    pub fn history(&self) -> PathBuf {
+        self.root.join("history.jsonl")
+    }
 }
 
 type SessionSlot = Arc<tokio::sync::Mutex<Option<Session>>>;
@@ -46,6 +51,7 @@ type SessionSlot = Arc<tokio::sync::Mutex<Option<Session>>>;
 /// Runs [`Command`]s. Cheap to share: clone the `Arc` it lives in.
 pub struct Client {
     store: ProfileStore,
+    history: History,
     /// Schema-browsing pools, per profile (rebuilt when the profile changes).
     pools: Mutex<HashMap<String, (Profile, MetaPool)>>,
     sessions: Mutex<HashMap<String, SessionSlot>>,
@@ -55,6 +61,7 @@ impl Client {
     pub fn new(config: &ConfigDir) -> Self {
         Self {
             store: ProfileStore::new(config.profiles()),
+            history: History::new(config.history()),
             pools: Mutex::default(),
             sessions: Mutex::default(),
         }
@@ -155,8 +162,23 @@ impl Client {
                         cancel,
                     )
                     .await?;
+                self.remember(&p.name, &sql, &out);
                 Ok(Output::Query(out))
             }
+            Command::HistoryList {
+                profile,
+                search,
+                limit,
+            } => Ok(Output::History {
+                entries: self.history.list(
+                    profile.as_deref(),
+                    search.as_deref(),
+                    limit.unwrap_or(200),
+                )?,
+            }),
+            Command::HistoryClear { profile } => Ok(Output::HistoryCleared {
+                removed: self.history.clear(profile.as_deref())?,
+            }),
             Command::SessionClose { session } => {
                 let slot = self.sessions.lock().expect("sessions").remove(&session);
                 if let Some(slot) = slot
@@ -166,6 +188,29 @@ impl Client {
                 }
                 Ok(Output::SessionClosed)
             }
+        }
+    }
+
+    /// Add a query that ran to the history (a failure to record it is only logged).
+    fn remember(&self, profile: &str, sql: &str, out: &QueryOutput) {
+        let last = out.results.last();
+        let entry = HistoryEntry {
+            at: history::now(),
+            profile: profile.to_owned(),
+            sql: sql.trim().to_owned(),
+            statements: out.results.len() + usize::from(out.error.is_some()),
+            elapsed_ms: out.results.iter().map(|r| r.elapsed_ms).sum(),
+            rows: last.map(|r| {
+                if r.returns_rows {
+                    r.rows.len() as u64
+                } else {
+                    r.rows_affected
+                }
+            }),
+            error: out.error.as_ref().map(|e| e.message.clone()),
+        };
+        if let Err(e) = self.history.add(&entry) {
+            tracing::warn!("couldn't record the query in the history: {e}");
         }
     }
 

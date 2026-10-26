@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::db::{ColumnInfo, StatementResult, TableInfo};
+use crate::history::HistoryEntry;
 use crate::profile::{Profile, ProfileSummary};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +74,22 @@ pub enum Command {
     SessionClose {
         session: String,
     },
+    /// Queries run before, newest first.
+    HistoryList {
+        #[serde(default)]
+        profile: Option<String>,
+        /// Only queries containing this text (ignoring case).
+        #[serde(default)]
+        search: Option<String>,
+        /// At most this many (default 200).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Forget the history: all of it, or one profile's.
+    HistoryClear {
+        #[serde(default)]
+        profile: Option<String>,
+    },
 }
 
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
@@ -109,6 +126,12 @@ pub enum Output {
     },
     Query(QueryOutput),
     SessionClosed,
+    History {
+        entries: Vec<HistoryEntry>,
+    },
+    HistoryCleared {
+        removed: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

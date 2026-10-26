@@ -211,3 +211,59 @@ fn runs_queries_against_postgres() {
     }
     panic!("the public schema never showed");
 }
+
+fn sqlite_profile(dir: &std::path::Path) {
+    save_profile(
+        dir,
+        Profile {
+            name: "local".into(),
+            driver: Driver::Sqlite,
+            database: dir.join("local.db").display().to_string(),
+            create_if_missing: true,
+            ..Profile::default()
+        },
+    );
+}
+
+/// Run the whole first tab and wait for its output.
+fn run_tab(h: &mut Harness<'static, App>, sql: &str) -> datadrop_core::QueryOutput {
+    h.state_mut().docs[0].text = sql.into();
+    let ctx = h.ctx.clone();
+    h.state_mut().run(&ctx, true);
+    until(h, "the query", |a| {
+        a.docs[0].output.is_some() && a.docs[0].running.is_none()
+    });
+    h.state().docs[0].output.clone().unwrap()
+}
+
+#[test]
+fn history_records_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    let out = run_tab(
+        &mut h,
+        "create table fruit (name text); insert into fruit values ('lemon')",
+    );
+    assert!(out.error.is_none(), "{:?}", out.error);
+
+    h.get_by_label("History").click();
+    until(&mut h, "the history", |a| !a.history.entries.is_empty());
+    h.run_steps(2);
+    let entry = h.state().history.entries[0].clone();
+    assert_eq!(entry.profile, "local");
+    assert!(entry.sql.starts_with("create table fruit"));
+    assert_eq!(entry.statements, 2);
+
+    // Its menu opens it in a new tab, on the same connection.
+    h.get_by_label_contains("create table fruit")
+        .click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("Open in a new tab").click();
+    h.run_steps(3);
+    let a = h.state();
+    assert_eq!(a.docs.len(), 2);
+    assert_eq!(a.docs[1].text, entry.sql);
+    assert_eq!(a.docs[1].profile.as_deref(), Some("local"));
+}

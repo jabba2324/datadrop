@@ -62,8 +62,33 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
+    /// Queries run before, from the app and the command line.
+    #[command(subcommand)]
+    History(HistoryCmd),
     /// Run a command given as JSON (see the docs for the shape), printing JSON.
     Exec { command: String },
+}
+
+#[derive(Subcommand)]
+enum HistoryCmd {
+    /// List queries, newest first.
+    List {
+        #[arg(long, short)]
+        profile: Option<String>,
+        /// Only queries containing this text (ignoring case).
+        #[arg(long, short)]
+        search: Option<String>,
+        #[arg(long, short = 'n', default_value_t = 50)]
+        limit: usize,
+        /// Print each query in full.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Forget the history (all of it, or one profile's).
+    Clear {
+        #[arg(long, short)]
+        profile: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -276,6 +301,22 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 format,
             )
         }
+        Cmd::History(HistoryCmd::List {
+            profile,
+            search,
+            limit,
+            full,
+        }) => (
+            Command::HistoryList {
+                profile,
+                search,
+                limit: Some(limit),
+            },
+            if full { Format::Tsv } else { Format::Table },
+        ),
+        Cmd::History(HistoryCmd::Clear { profile }) => {
+            (Command::HistoryClear { profile }, Format::Table)
+        }
         Cmd::Exec { command } => {
             let cmd: Command =
                 serde_json::from_str(&command).context("parsing the JSON command")?;
@@ -418,6 +459,54 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
         }
         Output::Query(q) => print_query(&mut stdout, q, format)?,
         Output::SessionClosed => {}
+        Output::History { entries } => {
+            let now = datadrop_core::history::now();
+            if matches!(format, Format::Tsv) {
+                // --full: every query as it was run.
+                for e in entries.iter().rev() {
+                    writeln!(
+                        stdout,
+                        "-- {} on {} ({} ms){}\n{}\n",
+                        datadrop_core::history::ago(e.at, now),
+                        e.profile,
+                        e.elapsed_ms,
+                        e.error
+                            .as_deref()
+                            .map(|m| format!(", failed: {m}"))
+                            .unwrap_or_default(),
+                        e.sql
+                    )?;
+                }
+                return Ok(());
+            }
+            let rows: Vec<Vec<Option<String>>> = entries
+                .iter()
+                .map(|e| {
+                    vec![
+                        Some(datadrop_core::history::ago(e.at, now)),
+                        Some(e.profile.clone()),
+                        Some(format!("{} ms", e.elapsed_ms)),
+                        Some(match (&e.error, e.rows) {
+                            (Some(_), _) => "failed".into(),
+                            (None, Some(n)) => n.to_string(),
+                            (None, None) => String::new(),
+                        }),
+                        Some(render::one_line(&e.sql, 80)),
+                    ]
+                })
+                .collect();
+            render::table(
+                &mut stdout,
+                &["WHEN", "PROFILE", "TIME", "ROWS", "SQL"],
+                &rows,
+            )?;
+        }
+        Output::HistoryCleared { removed } => {
+            eprintln!(
+                "Removed {removed} entr{}.",
+                if *removed == 1 { "y" } else { "ies" }
+            )
+        }
     }
     Ok(())
 }
