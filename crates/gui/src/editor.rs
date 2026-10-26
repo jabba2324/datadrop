@@ -30,6 +30,8 @@ pub struct Document {
     /// Which result set is shown when a script returned several.
     pub shown_result: usize,
     pub running: Option<Task>,
+    /// Exporting a result to a file.
+    pub exporting: Option<Task>,
     pub run_started: Option<Instant>,
     /// Select this byte range in the editor on the next frame (find, say).
     pub select: Option<Range<usize>>,
@@ -53,6 +55,7 @@ impl Document {
             output: None,
             shown_result: 0,
             running: None,
+            exporting: None,
             run_started: None,
             select: None,
             scroll_to: None,

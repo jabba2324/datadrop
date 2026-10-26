@@ -13,6 +13,8 @@ const CELL_CHARS: usize = 120;
 pub enum ResultsAction {
     None,
     Stop,
+    /// Export this result (an index into the output's results).
+    Export(usize),
 }
 
 pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
@@ -76,11 +78,32 @@ pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
             }
         });
     }
+    let mut action = ResultsAction::None;
     if let Some(&i) = sets.get(doc.shown_result) {
+        ui.horizontal(|ui| {
+            let exporting = doc.exporting.is_some();
+            if exporting {
+                ui.spinner();
+                ui.weak("Exporting…");
+            } else if ui
+                .small_button(format!("{} Export…", icon::EXPORT))
+                .on_hover_text("Save this result as CSV, TSV or JSON")
+                .clicked()
+            {
+                action = ResultsAction::Export(i);
+            }
+            if ui
+                .small_button(format!("{} Copy all", icon::COPY))
+                .on_hover_text("Copy the rows shown, with headers, as tab-separated text")
+                .clicked()
+            {
+                ui.ctx().copy_text(tsv_all(&out.results[i]));
+            }
+        });
         ui.separator();
         table(ui, &out.results[i], doc.id);
     }
-    ResultsAction::None
+    action
 }
 
 fn shortcut(key: &str) -> String {

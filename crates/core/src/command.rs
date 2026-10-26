@@ -2,9 +2,12 @@
 //! and run them with [`crate::Client::execute`]; `datadrop exec '<json>'` takes one
 //! as JSON directly.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::db::{ColumnInfo, StatementResult, TableInfo};
+use crate::export::ExportFormat;
 use crate::history::HistoryEntry;
 use crate::profile::{Profile, ProfileSummary};
 
@@ -70,6 +73,17 @@ pub enum Command {
         #[serde(default)]
         max_rows: Option<usize>,
     },
+    /// Run SQL and write the last statement's rows to a file, however many there are
+    /// (no row limit). The format comes from the file's extension unless given.
+    Export {
+        profile: String,
+        sql: String,
+        path: PathBuf,
+        #[serde(default)]
+        format: Option<ExportFormat>,
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// Close a session's connection.
     SessionClose {
         session: String,
@@ -126,6 +140,10 @@ pub enum Output {
     },
     Query(QueryOutput),
     SessionClosed,
+    Exported {
+        path: String,
+        rows: u64,
+    },
     History {
         entries: Vec<HistoryEntry>,
     },

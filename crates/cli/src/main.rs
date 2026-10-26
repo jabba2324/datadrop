@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use datadrop_core::{
-    Client, Command, ConfigDir, CoreError, Driver, Output, Profile, QueryOutput, SslMode,
-    StatementResult,
+    Client, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, Profile, QueryOutput,
+    SslMode, StatementResult,
 };
 
 mod render;
@@ -61,6 +61,10 @@ enum Cmd {
         max_rows: usize,
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
+        /// Write the last statement's rows to this file instead (all of them: no row
+        /// limit). The format comes from the extension (.csv, .tsv, .json) or --format.
+        #[arg(long, short)]
+        output: Option<PathBuf>,
     },
     /// Queries run before, from the app and the command line.
     #[command(subcommand)]
@@ -276,6 +280,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             file,
             max_rows,
             format,
+            output,
         } => {
             let sql = match (sql, file) {
                 (Some(s), _) => s,
@@ -290,16 +295,35 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     s
                 }
             };
-            let format = if json { Format::Json } else { format };
-            (
-                Command::Query {
-                    profile,
-                    sql,
-                    session: None,
-                    max_rows: Some(max_rows),
-                },
-                format,
-            )
+            if let Some(path) = output {
+                let format = match format {
+                    Format::Csv => Some(ExportFormat::Csv),
+                    Format::Tsv => Some(ExportFormat::Tsv),
+                    Format::Json => Some(ExportFormat::Json),
+                    Format::Table => None,
+                };
+                (
+                    Command::Export {
+                        profile,
+                        sql,
+                        path,
+                        format,
+                        session: None,
+                    },
+                    Format::Table,
+                )
+            } else {
+                let format = if json { Format::Json } else { format };
+                (
+                    Command::Query {
+                        profile,
+                        sql,
+                        session: None,
+                        max_rows: Some(max_rows),
+                    },
+                    format,
+                )
+            }
         }
         Cmd::History(HistoryCmd::List {
             profile,
@@ -501,6 +525,12 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
                 &rows,
             )?;
         }
+        Output::Exported { path, rows } => {
+            eprintln!(
+                "Wrote {rows} row{} to {path}.",
+                if *rows == 1 { "" } else { "s" }
+            )
+        }
         Output::HistoryCleared { removed } => {
             eprintln!(
                 "Removed {removed} entr{}.",
@@ -560,8 +590,12 @@ fn print_result(out: &mut impl Write, r: &StatementResult, format: Format) -> Re
             };
             eprintln!("{} row(s){more} ({} ms)", r.rows.len(), r.elapsed_ms);
         }
-        Format::Csv => render::delimited(out, &headers, &r.rows, b',')?,
-        Format::Tsv => render::delimited(out, &headers, &r.rows, b'\t')?,
+        Format::Csv => {
+            datadrop_core::export::write_all(out, ExportFormat::Csv, &headers, &r.rows)?;
+        }
+        Format::Tsv => {
+            datadrop_core::export::write_all(out, ExportFormat::Tsv, &headers, &r.rows)?;
+        }
         Format::Json => {}
     }
     Ok(())

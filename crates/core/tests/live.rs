@@ -551,3 +551,89 @@ both!(cancels_on_the_server, |driver, schema| async move {
     };
     ok(run(&db.client, "test", long, Some("tab")).await);
 });
+
+both!(exports_stream_to_files, |driver, schema| async move {
+    let Some(db) = setup(driver, schema).await else {
+        return;
+    };
+    let p = prefix(&db, schema);
+    let dir = tempfile::tempdir().unwrap();
+    let export = |sql: String, file: &str| {
+        let path = dir.path().join(file);
+        let client = &db.client;
+        async move {
+            client
+                .execute(Command::Export {
+                    profile: "test".into(),
+                    sql,
+                    path: path.clone(),
+                    format: None,
+                    session: None,
+                })
+                .await
+                .map(|o| (o, path))
+        }
+    };
+    // A script: the table is made first, then the last statement is exported, all
+    // of it (no row limit).
+    let script = match driver {
+        Driver::Postgres => format!(
+            "CREATE TABLE {p}nums AS SELECT g AS n, 'row ' || g AS label FROM generate_series(1, 2500) g; \
+             SELECT n, label FROM {p}nums ORDER BY n"
+        ),
+        Driver::Mysql => "CREATE TABLE nums AS WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2500) \
+             SELECT /*+ SET_VAR(cte_max_recursion_depth = 5000) */ n, CONCAT('row ', n) AS label FROM c; \
+             SELECT n, label FROM nums ORDER BY n"
+            .to_owned(),
+        Driver::Sqlite => "CREATE TABLE nums AS WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2500) \
+             SELECT n, 'row ' || n AS label FROM c; \
+             SELECT n, label FROM nums ORDER BY n"
+            .to_owned(),
+    };
+    let (out, path) = export(script, "nums.csv").await.unwrap();
+    assert!(
+        matches!(out, Output::Exported { rows: 2500, .. }),
+        "{out:?}"
+    );
+    let csv = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(csv.lines().count(), 2501);
+    assert_eq!(
+        csv.lines().take(2).collect::<Vec<_>>(),
+        ["n,label", "1,row 1"]
+    );
+
+    let (_, path) = export(
+        format!("SELECT n, label FROM {p}nums WHERE n > 2498"),
+        "tail.json",
+    )
+    .await
+    .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([{"n": "2499", "label": "row 2499"}, {"n": "2500", "label": "row 2500"}])
+    );
+
+    // No rows: just the header.
+    let (out, path) = export(
+        format!("SELECT n, label FROM {p}nums WHERE n < 0"),
+        "none.csv",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(out, Output::Exported { rows: 0, .. }));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "n,label\n");
+
+    // Nothing to export, and no file left behind.
+    let err = export(format!("DELETE FROM {p}nums WHERE n < 0"), "nothing.csv")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("doesn't return rows"), "{err}");
+    assert!(!dir.path().join("nothing.csv").exists());
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        3,
+        "no temporary files left"
+    );
+});

@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use datadrop_core::export;
 use datadrop_core::sql::{self, Dialect};
 use datadrop_core::{
-    Command, ConfigDir, CoreError, Driver, Output, ProfileSummary, QueryOutput, StatementError,
+    Command, ConfigDir, CoreError, Driver, ExportFormat, Output, ProfileSummary, QueryOutput,
+    StatementError,
 };
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
@@ -349,6 +351,20 @@ impl App {
                 }
             }
             self.refresh_profiles();
+        }
+        for doc in &mut self.docs {
+            match poll(&mut doc.exporting) {
+                Some(Ok(Output::Exported { path, rows })) => {
+                    self.toasts.success(format!(
+                        "Saved {rows} rows to {}",
+                        file_name(std::path::Path::new(&path))
+                    ));
+                }
+                Some(Err(e)) => {
+                    self.toasts.error(format!("Export failed: {e}"));
+                }
+                _ => {}
+            }
         }
         let mut changed_schema = vec![];
         for doc in &mut self.docs {
@@ -906,6 +922,63 @@ impl App {
         }
     }
 
+    /// Save a result to a file. If it was cut short by the row limit (and is a query),
+    /// the statement runs again with every row streamed into the file.
+    fn export_result(&mut self, doc: usize, result: usize) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .add_filter("Tab-separated", &["tsv"])
+            .add_filter("JSON", &["json"])
+            .set_file_name("result.csv")
+            .save_file()
+        else {
+            return;
+        };
+        self.export_result_to(doc, result, path);
+    }
+
+    pub fn export_result_to(&mut self, doc: usize, result: usize, path: std::path::PathBuf) {
+        let Some(out) = &self.docs[doc].output else {
+            return;
+        };
+        let Some(r) = out.results.get(result).cloned() else {
+            return;
+        };
+        let format = ExportFormat::from_path(&path).unwrap_or(ExportFormat::Csv);
+        let dialect = self.dialect_of(self.docs[doc].profile.as_deref());
+        let is_query = matches!(
+            sql::first_keyword(&r.sql, dialect).as_deref(),
+            Some("SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW")
+        );
+        if r.truncated
+            && is_query
+            && let Some(profile) = self.docs[doc].profile.clone()
+        {
+            let d = &mut self.docs[doc];
+            d.exporting = Some(self.backend.run(Command::Export {
+                profile,
+                sql: r.sql,
+                path,
+                format: Some(format),
+                session: Some(d.session()),
+            }));
+            return;
+        }
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        let written = std::fs::File::create(&path)
+            .and_then(|f| export::write_all(std::io::BufWriter::new(f), format, &names, &r.rows));
+        match written {
+            Ok(n) => {
+                self.toasts
+                    .success(format!("Saved {n} rows to {}", file_name(&path)));
+            }
+            Err(e) => {
+                self.toasts
+                    .error(format!("Couldn't save {}: {e}", path.display()));
+            }
+        }
+    }
+
     fn history_action(&mut self, ctx: &egui::Context, action: HistoryAction) {
         match action {
             HistoryAction::OpenInTab(e) => {
@@ -1076,6 +1149,12 @@ impl App {
     }
 }
 
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1119,10 +1198,14 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     // Keep the pane's size whatever it shows.
                     ui.set_min_size(ui.available_size());
-                    if let ResultsAction::Stop = results::results_ui(ui, &mut self.docs[i])
-                        && let Some(t) = &self.docs[i].running
-                    {
-                        t.cancel();
+                    match results::results_ui(ui, &mut self.docs[i]) {
+                        ResultsAction::Stop => {
+                            if let Some(t) = &self.docs[i].running {
+                                t.cancel();
+                            }
+                        }
+                        ResultsAction::Export(r) => self.export_result(i, r),
+                        ResultsAction::None => {}
                     }
                 });
             let dialect = self.dialect_of(self.docs[i].profile.as_deref());

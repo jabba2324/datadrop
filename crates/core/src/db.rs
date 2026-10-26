@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{CoreError, Result};
+use crate::export::ExportWriter;
 use crate::profile::{Driver, Profile, SslMode};
 use crate::sql::{self, Dialect};
 
@@ -286,6 +287,45 @@ macro_rules! run_text {
     }};
 }
 
+/// Stream a statement's rows into an export. Returns whether it was a result set.
+macro_rules! export_text {
+    ($conn:expr, $sql:expr, $w:expr, $dialect:expr) => {{
+        let conn = $conn;
+        let w = $w;
+        let io = |e: std::io::Error| CoreError::io("writing the export", e);
+        let mut header = false;
+        {
+            let mut stream = sqlx::raw_sql(AssertSqlSafe($sql.to_owned())).fetch_many(&mut *conn);
+            while let Some(item) = stream.try_next().await? {
+                if let Either::Right(row) = item {
+                    if !header {
+                        let names: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
+                        w.columns(&names).map_err(io)?;
+                        header = true;
+                    }
+                    let mut values = Vec::with_capacity(row.len());
+                    for i in 0..row.len() {
+                        values.push(text_value(&row, i)?);
+                    }
+                    w.row(&values).map_err(io)?;
+                }
+            }
+        }
+        if !header && looks_like_query($sql, $dialect) {
+            if let Ok(st) = conn
+                .prepare(AssertSqlSafe($sql.to_owned()).into_sql_str())
+                .await
+                && !st.columns().is_empty()
+            {
+                let names: Vec<&str> = st.columns().iter().map(|c| c.name()).collect();
+                w.columns(&names).map_err(io)?;
+                header = true;
+            }
+        }
+        header
+    }};
+}
+
 fn looks_like_query(sql: &str, dialect: Dialect) -> bool {
     matches!(
         sql::first_keyword(sql, dialect).as_deref(),
@@ -376,6 +416,20 @@ impl Session {
             truncated,
             rows_affected: affected,
             elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Run one statement, writing all its rows to `w`. Returns whether it returned a
+    /// result set.
+    pub async fn export<W: std::io::Write + Send>(
+        &mut self,
+        sql: &str,
+        w: &mut ExportWriter<W>,
+    ) -> Result<bool> {
+        Ok(match &mut self.conn {
+            Conn::Pg(c) => export_text!(c, sql, w, Dialect::Postgres),
+            Conn::My(c) => export_text!(c, sql, w, Dialect::Mysql),
+            Conn::Lite(c) => export_text!(c, sql, w, Dialect::Sqlite),
         })
     }
 

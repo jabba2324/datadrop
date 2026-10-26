@@ -267,3 +267,37 @@ fn history_records_and_reopens() {
     assert_eq!(a.docs[1].text, entry.sql);
     assert_eq!(a.docs[1].profile.as_deref(), Some("local"));
 }
+
+#[test]
+fn exports_results() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    h.state_mut().settings.max_rows = 10;
+    let out = run_tab(
+        &mut h,
+        "with recursive c(n) as (select 1 union all select n + 1 from c where n < 50) \
+         select n, n * n as square from c",
+    );
+    assert!(out.results[0].truncated);
+    h.run_steps(2);
+    h.get_by_label_contains("Export…");
+
+    // Cut short by the row limit: the query runs again and every row is saved.
+    let all = dir.path().join("all.csv");
+    h.state_mut().export_result_to(0, 0, all.clone());
+    until(&mut h, "the export", |a| a.docs[0].exporting.is_none());
+    let csv = std::fs::read_to_string(&all).unwrap();
+    assert_eq!(csv.lines().count(), 51);
+    assert_eq!(csv.lines().nth(50), Some("50,2500"));
+
+    // A complete result is saved from what's on screen.
+    let out = run_tab(&mut h, "select 'a' as x union all select null");
+    assert!(!out.results[0].truncated);
+    let json = dir.path().join("small.json");
+    h.state_mut().export_result_to(0, 0, json.clone());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(json).unwrap()).unwrap();
+    assert_eq!(v, serde_json::json!([{"x": "a"}, {"x": null}]));
+}

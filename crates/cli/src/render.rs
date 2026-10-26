@@ -1,4 +1,4 @@
-//! Plain-text output: aligned tables, CSV and TSV.
+//! Plain-text output: aligned tables (CSV, TSV and JSON come from `datadrop_core::export`).
 
 use std::io::{self, Write};
 
@@ -72,36 +72,6 @@ pub fn table(
     Ok(())
 }
 
-/// CSV (RFC 4180 quoting) or TSV. NULL is an empty field.
-pub fn delimited(
-    out: &mut impl Write,
-    headers: &[&str],
-    rows: &[Vec<Option<String>>],
-    sep: u8,
-) -> io::Result<()> {
-    let field = |s: &str| -> String {
-        let special = s
-            .bytes()
-            .any(|b| b == sep || b == b'"' || b == b'\n' || b == b'\r');
-        if special {
-            format!("\"{}\"", s.replace('"', "\"\""))
-        } else {
-            s.to_owned()
-        }
-    };
-    let sep = sep as char;
-    let head: Vec<String> = headers.iter().map(|h| field(h)).collect();
-    writeln!(out, "{}", head.join(&sep.to_string()))?;
-    for r in rows {
-        let line: Vec<String> = r
-            .iter()
-            .map(|v| v.as_deref().map(field).unwrap_or_default())
-            .collect();
-        writeln!(out, "{}", line.join(&sep.to_string()))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,22 +92,6 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "id  name\n--  ----\n1   café\n22  NULL\n"
-        );
-    }
-
-    #[test]
-    fn csv_quoting() {
-        let mut out = vec![];
-        delimited(
-            &mut out,
-            &["a", "b"],
-            &[vec![s("x,y"), s("say \"hi\"")], vec![None, s("2")]],
-            b',',
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "a,b\n\"x,y\",\"say \"\"hi\"\"\"\n,2\n"
         );
     }
 
