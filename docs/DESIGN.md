@@ -48,6 +48,54 @@ Passwords are plain text for now. Moving them to the OS keychain is on the list 
 The schema browser uses a small per-profile connection pool, separate from the tab
 sessions, so it never waits behind a long query.
 
+SQLite has no server to cancel from: each session installs a progress handler that
+SQLite calls every 10,000 steps, which stops the statement once Stop sets a flag.
+
+## SSH tunnels
+
+`crates/core/src/tunnel.rs`, on russh (with ring). A tunnel connects to the SSH
+server, signs in (agent, key file or password), and forwards a random local port on
+127.0.0.1 to the database as the SSH server sees it (`direct-tcpip`, like `ssh -L`).
+Sessions and the browsing pool connect to that port. Tunnels are kept per profile and
+reopened when they drop or the profile's SSH settings change.
+
+Host keys are checked against `~/.ssh/known_hosts` and DataDrop's own
+`known_hosts`. An unknown key is an error carrying its fingerprint and key, so the
+front-end can ask and then `SshTrustHost`; a changed key is refused outright.
+
+## Autocompletion
+
+`crates/core/src/complete.rs`. The `Catalog` command reads every table and column in
+one query (cached per profile in the app, reloaded after DDL). Completion looks at the
+text around the cursor: after `FROM`/`JOIN`/`UPDATE`/`INTO` it offers tables; after
+`name.` the columns of that table or alias (or the tables of that schema); otherwise
+the columns of the tables the statement names, then keywords. Names that need quotes
+get them.
+
+## Editing results
+
+`crates/core/src/edit.rs`. A result is editable when it comes from a plain `SELECT`
+of one table (no joins, grouping, `DISTINCT`, set operations or subqueries) and the
+table's primary key columns are in it. Edits become `UPDATE`/`DELETE` statements keyed
+on the primary key and `INSERT`s, with values as quoted literals the database converts
+to the column type. `ApplyEdits` runs them in one transaction on its own connection,
+and rolls back unless each `UPDATE` and `DELETE` changes exactly one row (MySQL reports
+an `UPDATE` to the same values as changing none, which is allowed).
+
+## Query plans
+
+`crates/core/src/plan.rs` turns PostgreSQL's `EXPLAIN (FORMAT JSON)`, MySQL's
+`EXPLAIN FORMAT=TREE` / `EXPLAIN ANALYZE` and SQLite's `EXPLAIN QUERY PLAN` into one
+tree. With analyze, a statement that changes data runs inside a transaction that's
+rolled back, on its own connection (so the tab's own transaction isn't touched).
+
+## History and export
+
+Every `Query` is appended to `history.jsonl` (one JSON object per line; the file is
+trimmed to the newest 5,000 when it reaches 10,000). `Export` streams the last
+statement's rows straight into a file through `ExportWriter`, so exports aren't held
+in memory or limited by the row limit.
+
 ## Desktop app
 
 egui 0.36 with eframe (glow). The editor is an egui `TextEdit` with a custom layouter
@@ -57,15 +105,29 @@ stays cheap. Results use `egui_extras::TableBuilder`, which only lays out visibl
 egui-phosphor (icons) and egui-notify (toasts) each target one egui version, so the
 egui crates move together, when those do (Dependabot is set up to hold them back).
 
+## SQL Server
+
+Not supported yet. The candidates for a driver, as of late 2026:
+
+- **`mssql-tds`** (crate; repo `microsoft/mssql-rs`, MIT): Microsoft's own TDS
+  implementation in Rust, the core of their new Python, Node and ODBC drivers. It
+  streams rows, exposes column metadata, can cancel a running statement (TDS
+  attention), and supports Azure AD and integrated (Kerberos/SSPI) sign-in. It's
+  pre-1.0 (0.3) and moving fast, uses `native-tls` (OpenSSL on Linux, so release
+  builds would depend on the system's libssl), and enables integrated auth by
+  default (turn off default features). The best long-term bet.
+- **`tiberius`**: the established TDS crate (0.12/0.13, widely used, rustls or
+  native-tls). Maintenance has slowed and it can't cancel a running query.
+- **`mssql`**: a new (2026) fork of tiberius focused on maintenance; too young to judge.
+
+Fitting it in means a fourth driver beside sqlx: values come typed rather than as
+text, so they need formatting for display (dates, decimals, GUIDs, binary), and the
+schema queries and plan parsing (`SET SHOWPLAN_XML`) need T-SQL versions. A `Driver`
+behind a Cargo feature would keep the OpenSSL dependency optional.
+
 ## Next
 
 - Passwords in the OS keychain (macOS Keychain, Windows Credential Manager, Secret
   Service), with plain-text files as a fallback.
-- SSH tunnels.
-- Editing table data in the grid (with generated `UPDATE`s shown before running).
-- Export results to CSV / JSON files from the app.
-- Autocompletion of table and column names.
-- Query history.
-- `EXPLAIN` view.
-- More databases: SQLite next (sqlx supports it).
 - macOS `.app` bundle with notarisation; Windows installer; Linux packages.
+- SQL Server (see above).

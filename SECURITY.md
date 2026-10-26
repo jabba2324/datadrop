@@ -8,12 +8,20 @@ before the details are made public.
 
 Worth knowing about DataDrop's design:
 
-- Connection profiles, **including passwords, are stored as plain text** in
-  `~/.datadrop/profiles`, readable only by your user account. Anyone (or anything) that
+- Connection profiles, **including database and SSH passwords and key passphrases,
+  are stored as plain text** in `~/.datadrop/profiles`, readable only by your user
+  account. Anyone (or anything) that
   can read your files can read them. See [Where things are kept](README.md#where-things-are-kept).
 - Connections use TLS when the server offers it (`prefer`), without checking the
   certificate. Use `verify-full` (with a CA certificate if the server's isn't publicly
   trusted) to be protected from someone intercepting the connection.
+- SSH tunnels only connect to servers whose host key is known (in
+  `~/.ssh/known_hosts`, or trusted in DataDrop after you've checked its fingerprint),
+  and refuse a server whose key has changed. While a tunnel is open, its local end
+  listens on 127.0.0.1, so other programs on the same computer could connect through
+  it, as with `ssh -L`.
+- The query history (`~/.datadrop/history.jsonl`) keeps the SQL you've run, which may
+  include values you typed into queries. Clear it with `datadrop history clear`.
 - DataDrop runs the SQL you give it as written; it has no read-only mode. Use a database
   user with only the permissions you need.
 
