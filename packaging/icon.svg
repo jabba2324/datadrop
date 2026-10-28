@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f6fd6"/>
+      <stop offset="1" stop-color="#1b3f8f"/>
+    </linearGradient>
+    <linearGradient id="drop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d6e6ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#bg)"/>
+  <!-- A database cylinder... -->
+  <g fill="none" stroke="#9fc1ff" stroke-width="34" opacity="0.55">
+    <ellipse cx="512" cy="330" rx="250" ry="78"/>
+    <path d="M262 330 v360 a250 78 0 0 0 500 0 v-360"/>
+    <path d="M262 510 a250 78 0 0 0 500 0"/>
+  </g>
+  <!-- ...and the drop in front of it. -->
+  <path d="M512 248 C 512 248 330 470 330 600 a182 182 0 0 0 364 0 C 694 470 512 248 512 248 Z"
+        fill="url(#drop)"/>
+  <path d="M430 610 a90 90 0 0 0 70 92" fill="none" stroke="#2f6fd6" stroke-width="26"
+        stroke-linecap="round" opacity="0.7"/>
+</svg>

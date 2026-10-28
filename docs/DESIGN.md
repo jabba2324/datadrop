@@ -193,6 +193,21 @@ parameters, and a table's DDL is its `create_table_query`. ClickHouse has no
 transactions to speak of, so imports and migrations run statement by statement there,
 and results aren't edited in the grid (rows change with `ALTER TABLE … UPDATE`).
 
-## Next
+## DuckDB
 
-- macOS `.app` bundle with notarisation; Windows installer; Linux packages.
+Embedded (`crates/core/src/duck.rs`, the `duckdb` feature, off by default because it
+compiles DuckDB's C++: the release builds turn it on). DuckDB's API is synchronous, so
+its work runs on blocking threads. A database file is opened once per process and
+sessions use clones of that connection (two opens of one file would conflict). Query
+results are cast to text by DuckDB: `SELECT COLUMNS(*)::VARCHAR FROM (query)`. Stop
+interrupts the connection. The dialect is PostgreSQL's (close enough for highlighting,
+quoting and `ALTER`); plans come from `EXPLAIN (FORMAT JSON)` and, analyzed, DuckDB's
+profile; the schema model from `duckdb_tables()`, `duckdb_constraints()` and friends.
+
+## Packaging
+
+`packaging/`: the icon (SVG, and PNG/ICO made from it), `macos/package.sh` (the `.app`
+and `.dmg`, signed with a Developer ID and notarised when the `APPLE_*` secrets are
+set, ad hoc otherwise), `windows/datadrop.iss` (Inno Setup: per-user or all-users,
+Start menu, optional PATH entry, "Open with" for `.sql`) and `linux/package.sh` (`.deb`
+and `.rpm` from the same files, with a desktop entry). The release workflow runs them.

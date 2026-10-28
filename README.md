@@ -1,7 +1,7 @@
 # DataDrop
 
 A fast, open-source SQL client for **PostgreSQL**, **MySQL**, **SQLite**, **SQL
-Server** and **ClickHouse**: a desktop
+Server**, **ClickHouse** and **DuckDB**: a desktop
 app with a schema browser, a highlighted SQL editor with autocompletion and a results
 grid you can edit, plus a command line that can do everything the app can.
 
@@ -64,19 +64,25 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
 
 ## Install
 
-Download a build for your system from the
-[releases page](https://github.com/jabba2324/datadrop/releases): `datadrop-gui` is the
-desktop app, `datadrop` the command line.
+Download from the [releases page](https://github.com/jabba2324/datadrop/releases):
 
-Each release has a `SHA256SUMS` file signed with [minisign](https://jedisct1.github.io/minisign/)
-(when signing is set up for that release):
+- **Windows**: `DataDrop-…-setup.exe` installs the app (with a Start menu entry, and
+  optionally the `datadrop` command on your PATH), for you or for everyone.
+- **macOS** (Apple Silicon): `DataDrop-….dmg`; drag DataDrop to Applications. Until
+  releases are notarised, open it the first time with right-click → Open.
+- **Linux**: `datadrop_…_amd64.deb` / `_arm64.deb` (Debian, Ubuntu) or
+  `datadrop-….x86_64.rpm` / `.aarch64.rpm` (Fedora, RHEL, openSUSE), with a desktop
+  entry; or the plain binaries in the `.tar.gz`.
+
+The archives (`datadrop-gui-…` is the desktop app, `datadrop-…` the command line) are
+there for every platform too. Each release has a `SHA256SUMS` file signed with
+[minisign](https://jedisct1.github.io/minisign/) (when signing is set up for that
+release):
 
 ```sh
 minisign -Vm SHA256SUMS -p minisign.pub
 sha256sum -c --ignore-missing SHA256SUMS
 ```
-
-On macOS the app isn't notarised yet; the first time, right-click it and choose Open.
 
 ## Command line
 
@@ -88,6 +94,7 @@ datadrop profile add local --driver mysql --host 127.0.0.1 --user root --databas
 datadrop profile add notes --driver sqlite --database ./notes.db --create-if-missing
 datadrop profile add erp --url sqlserver://sa@erp.example.com:1433/sales --ask-password
 datadrop profile add logs --url clickhouse://default@ch.example.com:8443/logs --ssl-mode require
+datadrop profile add lake --driver duckdb --database ./lake.duckdb --create-if-missing
 datadrop profile list
 datadrop profile test shop
 
@@ -178,7 +185,8 @@ browsing.
 You need Rust (stable). On Linux, the desktop app also needs the usual X11/Wayland
 development headers (`libxkbcommon`, `libwayland`, `libgl`), and SQL Server support
 builds OpenSSL from source (it needs `perl` and `make`); leave it out with
-`cargo build --no-default-features`.
+`cargo build --no-default-features`. DuckDB is compiled in with `--features duckdb`
+(the release builds have it; it's a long C++ build).
 
 ```sh
 cargo build --release

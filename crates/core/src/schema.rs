@@ -233,9 +233,8 @@ pub fn table_ddl(schema: &str, t: &TableModel, dialect: Dialect) -> String {
         if let Some(d) = &t.definition {
             out.push_str(&statement(d.trim_end().trim_end_matches(';'), dialect));
         }
-    } else if matches!(dialect, Dialect::Sqlite | Dialect::ClickHouse)
-        && let Some(d) = &t.definition
-    {
+    } else if let Some(d) = &t.definition {
+        // The database's own CREATE TABLE (SQLite, ClickHouse, DuckDB).
         out.push_str(d.trim_end().trim_end_matches(';'));
         out.push_str(";\n");
     } else {
@@ -554,6 +553,7 @@ pub async fn load(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
         Driver::Sqlite => load_sqlite(pool, schema).await,
         Driver::SqlServer => load_sqlserver(pool, schema).await,
         Driver::ClickHouse => load_clickhouse(pool, schema).await,
+        Driver::DuckDb => load_duckdb(pool, schema).await,
     }
 }
 
@@ -1482,6 +1482,193 @@ async fn load_sqlite(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
         tables: tables.list,
         routines: vec![],
         sequences: vec![],
+    })
+}
+
+/// `[a, b]` (a DuckDB list cast to text) as its items.
+fn duck_list(s: &str) -> Vec<String> {
+    let inner = s.trim().trim_start_matches('[').trim_end_matches(']');
+    inner
+        .split(", ")
+        .map(|x| x.trim().trim_matches('"').to_owned())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+async fn load_duckdb(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
+    let d = Dialect::Postgres;
+    let mut list = vec![];
+    for r in pool
+        .text_rows(
+            "SELECT table_name, sql, comment FROM duckdb_tables() \
+             WHERE database_name = current_database() AND schema_name = ? ORDER BY 1",
+            &[schema],
+        )
+        .await?
+    {
+        let mut t = new_table(col(&r, 0), TableKind::Table);
+        t.definition = opt(&r, 1);
+        t.comment = opt(&r, 2);
+        list.push(t);
+    }
+    for r in pool
+        .text_rows(
+            "SELECT view_name, sql, comment FROM duckdb_views() \
+             WHERE database_name = current_database() AND schema_name = ? AND NOT internal \
+             ORDER BY 1",
+            &[schema],
+        )
+        .await?
+    {
+        let mut t = new_table(col(&r, 0), TableKind::View);
+        t.definition = opt(&r, 1);
+        t.comment = opt(&r, 2);
+        list.push(t);
+    }
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut tables = Tables::new(list);
+    for r in pool
+        .text_rows(
+            "SELECT table_name, column_name, data_type, is_nullable, column_default, comment \
+             FROM duckdb_columns() WHERE database_name = current_database() \
+             AND schema_name = ? ORDER BY table_name, column_index",
+            &[schema],
+        )
+        .await?
+    {
+        let Some(t) = tables.get(&col(&r, 0)) else {
+            continue;
+        };
+        t.columns.push(ColumnModel {
+            name: col(&r, 1),
+            data_type: col(&r, 2),
+            nullable: col(&r, 3) == "true",
+            default: opt(&r, 4),
+            identity: None,
+            generated: None,
+            comment: opt(&r, 5),
+        });
+    }
+    for r in pool
+        .text_rows(
+            "SELECT table_name, constraint_type, constraint_name, expression, \
+             constraint_column_names, referenced_table, referenced_column_names \
+             FROM duckdb_constraints() WHERE database_name = current_database() \
+             AND schema_name = ? AND constraint_type <> 'NOT NULL' \
+             ORDER BY table_name, constraint_index",
+            &[schema],
+        )
+        .await?
+    {
+        let Some(t) = tables.get(&col(&r, 0)) else {
+            continue;
+        };
+        let columns = duck_list(&col(&r, 4));
+        let kind = match col(&r, 1).as_str() {
+            "PRIMARY KEY" => ConstraintKind::PrimaryKey,
+            "UNIQUE" => ConstraintKind::Unique,
+            "FOREIGN KEY" => ConstraintKind::ForeignKey,
+            _ => ConstraintKind::Check,
+        };
+        let mut c = Constraint {
+            name: col(&r, 2),
+            kind,
+            definition: match kind {
+                ConstraintKind::PrimaryKey => format!("PRIMARY KEY ({})", column_list(&columns, d)),
+                ConstraintKind::Unique => format!("UNIQUE ({})", column_list(&columns, d)),
+                ConstraintKind::Check => format!("CHECK ({})", col(&r, 3)),
+                ConstraintKind::ForeignKey => String::new(),
+            },
+            columns,
+            references: (kind == ConstraintKind::ForeignKey).then(|| Reference {
+                schema: schema.to_owned(),
+                table: col(&r, 5),
+                columns: duck_list(&col(&r, 6)),
+                on_update: "NO ACTION".into(),
+                on_delete: "NO ACTION".into(),
+            }),
+        };
+        if kind == ConstraintKind::ForeignKey {
+            c.definition = fk_definition(&c, schema, d);
+        }
+        if kind == ConstraintKind::PrimaryKey {
+            t.constraints.insert(0, c);
+        } else {
+            t.constraints.push(c);
+        }
+    }
+    for r in pool
+        .text_rows(
+            "SELECT table_name, index_name, is_unique, sql, expressions FROM duckdb_indexes() \
+             WHERE database_name = current_database() AND schema_name = ? \
+             AND sql IS NOT NULL ORDER BY 1, 2",
+            &[schema],
+        )
+        .await?
+    {
+        let Some(t) = tables.get(&col(&r, 0)) else {
+            continue;
+        };
+        t.indexes.push(Index {
+            name: col(&r, 1),
+            columns: duck_list(&col(&r, 4)),
+            unique: col(&r, 2) == "true",
+            definition: col(&r, 3).trim().trim_end_matches(';').to_owned(),
+            inline: None,
+        });
+    }
+    let sequences = pool
+        .text_rows(
+            "SELECT sequence_name, start_value, increment_by, min_value, max_value, cycle \
+             FROM duckdb_sequences() WHERE database_name = current_database() \
+             AND schema_name = ? ORDER BY 1",
+            &[schema],
+        )
+        .await?
+        .iter()
+        .map(|r| Sequence {
+            name: col(r, 0),
+            definition: format!(
+                "CREATE SEQUENCE {} START WITH {} INCREMENT BY {} MINVALUE {} MAXVALUE {}{}",
+                qualified(schema, &col(r, 0), d),
+                col(r, 1),
+                col(r, 2),
+                col(r, 3),
+                col(r, 4),
+                if col(r, 5) == "true" { " CYCLE" } else { "" }
+            ),
+        })
+        .collect();
+    let routines = pool
+        .text_rows(
+            "SELECT function_name, parameters, macro_definition FROM duckdb_functions() \
+             WHERE database_name = current_database() AND schema_name = ? \
+             AND function_type IN ('macro', 'table_macro') AND NOT internal ORDER BY 1",
+            &[schema],
+        )
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let args = duck_list(&col(r, 1)).join(", ");
+            Routine {
+                name: col(r, 0),
+                kind: RoutineKind::Function,
+                definition: Some(format!(
+                    "CREATE MACRO {}({args}) AS {}",
+                    qualified(schema, &col(r, 0), d),
+                    col(r, 2)
+                )),
+                arguments: args,
+                returns: None,
+            }
+        })
+        .collect();
+    Ok(SchemaModel {
+        schema: schema.to_owned(),
+        tables: tables.list,
+        routines,
+        sequences,
     })
 }
 

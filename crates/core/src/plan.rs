@@ -241,6 +241,104 @@ pub fn parse_sqlite(rows: &[(i64, i64, String)]) -> Result<Plan> {
     })
 }
 
+/// DuckDB's `EXPLAIN (FORMAT JSON)` (`name`, `extra_info`, `children`) or `EXPLAIN
+/// ANALYZE (FORMAT JSON)` (its profile: `operator_name`, `operator_timing` in seconds,
+/// `operator_cardinality`).
+pub fn parse_duckdb(json: &str, analyzed: bool) -> Result<Plan> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| bad(&format!("not JSON: {e}")))?;
+    fn node(v: &serde_json::Value) -> PlanNode {
+        let label = v["operator_name"]
+            .as_str()
+            .or(v["name"].as_str())
+            .or(v["type"].as_str())
+            .unwrap_or("?")
+            .trim()
+            .to_owned();
+        let mut n = PlanNode {
+            label,
+            ..PlanNode::default()
+        };
+        if let Some(extra) = v["extra_info"].as_object() {
+            for (k, val) in extra {
+                let text = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(a) => a
+                        .iter()
+                        .map(|x| {
+                            x.as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| x.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    other => other.to_string(),
+                };
+                if k == "Estimated Cardinality" {
+                    n.estimated_rows = text.trim_start_matches('~').parse().ok();
+                } else {
+                    n.details.push((k.clone(), text));
+                }
+            }
+        }
+        // Names differ between DuckDB versions.
+        n.actual_rows = v["operator_cardinality"]
+            .as_f64()
+            .or(v["rows_returned"].as_f64())
+            .or(v["intermediate_rows"].as_f64());
+        n.actual_ms = v["operator_timing"]
+            .as_f64()
+            .or(v["timing"].as_f64())
+            .map(|s| s * 1000.0);
+        n.children = v["children"]
+            .as_array()
+            .map(|c| c.iter().map(node).collect())
+            .unwrap_or_default();
+        n
+    }
+    let (roots, execution_ms) = match &v {
+        serde_json::Value::Array(a) => (a.iter().map(node).collect(), None),
+        // A profile: the query at the top, its operators under it.
+        serde_json::Value::Object(o) => (
+            o.get("children")
+                .or(o.get("operator"))
+                .and_then(|c| c.as_array())
+                .map(|c| c.iter().map(node).collect())
+                .unwrap_or_default(),
+            o.get("latency")
+                .and_then(|l| l.as_f64())
+                .map(|s| s * 1000.0),
+        ),
+        _ => (vec![], None),
+    };
+    // Operator timings are each step's own; the plan view wants them including the
+    // steps under them.
+    fn total(n: &mut PlanNode) -> Option<f64> {
+        let below: f64 = n.children.iter_mut().filter_map(total).sum();
+        n.actual_ms = n.actual_ms.map(|own| own + below);
+        n.actual_ms
+    }
+    let mut roots: Vec<PlanNode> = roots;
+    if analyzed {
+        for r in &mut roots {
+            total(r);
+        }
+    }
+    if roots.is_empty() {
+        return Err(bad(&format!(
+            "no steps in {}",
+            json.chars().take(200).collect::<String>()
+        )));
+    }
+    Ok(Plan {
+        roots,
+        analyzed,
+        execution_ms,
+        raw: json.to_owned(),
+        ..Plan::default()
+    })
+}
+
 /// ClickHouse's `EXPLAIN`: steps as a tree drawn with `└──` / `├──`, each with its
 /// details on `│` lines under it (older versions: just the steps, indented).
 pub fn parse_indented(lines: &[String]) -> Result<Plan> {
@@ -499,6 +597,30 @@ pub fn parse_sqlserver(r: &crate::db::StatementResult, analyzed: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duckdb_json() {
+        let plain = r#"[{"name": "PROJECTION", "children": [{"name": "SEQ_SCAN ", "children": [],
+            "extra_info": {"Table": "t", "Projections": ["a", "b"], "Estimated Cardinality": "3"}}],
+            "extra_info": {"Projections": "a"}}]"#;
+        let p = parse_duckdb(plain, false).unwrap();
+        let scan = &p.roots[0].children[0];
+        assert_eq!(scan.label, "SEQ_SCAN");
+        assert_eq!(scan.estimated_rows, Some(3.0));
+        assert!(
+            scan.details
+                .contains(&("Projections".to_owned(), "a, b".to_owned()))
+        );
+        let profile = r#"{"latency": 0.002, "children": [{"operator_name": "PROJECTION",
+            "operator_timing": 0.0001, "operator_cardinality": 3, "extra_info": {},
+            "children": [{"operator_name": "TABLE_SCAN", "operator_timing": 0.0005,
+            "operator_cardinality": 3, "extra_info": {}, "children": []}]}]}"#;
+        let p = parse_duckdb(profile, true).unwrap();
+        assert_eq!(p.execution_ms, Some(2.0));
+        assert_eq!(p.roots[0].actual_rows, Some(3.0));
+        let own = p.roots[0].own_ms().unwrap();
+        assert!((own - 0.1).abs() < 1e-9, "{own}");
+    }
 
     #[test]
     fn clickhouse_trees() {

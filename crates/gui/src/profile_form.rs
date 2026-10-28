@@ -420,6 +420,7 @@ impl ProfileForm {
                         Driver::Mysql | Driver::Sqlite => "mysql://user@host:3306/database",
                         Driver::SqlServer => "sqlserver://user@host:1433/database",
                         Driver::ClickHouse => "clickhouse://user@host:8123/database",
+                        Driver::DuckDb => "duckdb:/path/to/file.duckdb",
                     };
                     wide(ui, "URL", &mut self.url, hint);
                     // Pick the driver from the URL as it's typed.
@@ -617,11 +618,20 @@ impl ProfileForm {
             )
             .labelled_by(l.id);
             if ui.button("Browse…").clicked() {
-                let dialog = rfd::FileDialog::new()
-                    .add_filter("SQLite databases", &["db", "sqlite", "sqlite3", "db3"])
-                    .add_filter("All files", &["*"]);
+                let dialog = if self.driver == Driver::DuckDb {
+                    rfd::FileDialog::new().add_filter("DuckDB databases", &["duckdb", "ddb", "db"])
+                } else {
+                    rfd::FileDialog::new()
+                        .add_filter("SQLite databases", &["db", "sqlite", "sqlite3", "db3"])
+                }
+                .add_filter("All files", &["*"]);
                 let picked = if self.create_if_missing {
-                    dialog.set_file_name("database.db").save_file()
+                    let name = if self.driver == Driver::DuckDb {
+                        "database.duckdb"
+                    } else {
+                        "database.db"
+                    };
+                    dialog.set_file_name(name).save_file()
                 } else {
                     dialog.pick_file()
                 };

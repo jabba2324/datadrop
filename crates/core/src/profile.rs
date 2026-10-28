@@ -24,22 +24,25 @@ pub enum Driver {
     SqlServer,
     #[serde(rename = "clickhouse")]
     ClickHouse,
+    #[serde(rename = "duckdb")]
+    DuckDb,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 5] = [
+    pub const ALL: [Driver; 6] = [
         Driver::Postgres,
         Driver::Mysql,
         Driver::Sqlite,
         Driver::SqlServer,
         Driver::ClickHouse,
+        Driver::DuckDb,
     ];
 
     pub fn default_port(self) -> u16 {
         match self {
             Self::Postgres => 5432,
             Self::Mysql => 3306,
-            Self::Sqlite => 0,
+            Self::Sqlite | Self::DuckDb => 0,
             Self::SqlServer => 1433,
             // The HTTP interface (8443 with TLS).
             Self::ClickHouse => 8123,
@@ -53,12 +56,13 @@ impl Driver {
             Self::Sqlite => "SQLite",
             Self::SqlServer => "SQL Server",
             Self::ClickHouse => "ClickHouse",
+            Self::DuckDb => "DuckDB",
         }
     }
 
     /// A database file rather than a server.
     pub fn is_file(self) -> bool {
-        self == Self::Sqlite
+        matches!(self, Self::Sqlite | Self::DuckDb)
     }
 
     /// The driver a connection URL is for, from its scheme.
@@ -75,6 +79,7 @@ impl Driver {
             _ => None,
         }
         .or_else(|| url.starts_with("sqlite:").then_some(Self::Sqlite))
+        .or_else(|| url.starts_with("duckdb:").then_some(Self::DuckDb))
     }
 }
 
@@ -87,8 +92,10 @@ impl std::str::FromStr for Driver {
             "sqlite" | "sqlite3" => Ok(Self::Sqlite),
             "sqlserver" | "mssql" => Ok(Self::SqlServer),
             "clickhouse" | "ch" => Ok(Self::ClickHouse),
+            "duckdb" | "duck" => Ok(Self::DuckDb),
             _ => Err(format!(
-                "unknown driver '{s}' (use postgres, mysql, sqlite, sqlserver or clickhouse)"
+                "unknown driver '{s}' (use postgres, mysql, sqlite, sqlserver, clickhouse or \
+                 duckdb)"
             )),
         }
     }
@@ -102,6 +109,7 @@ impl std::fmt::Display for Driver {
             Self::Sqlite => "sqlite",
             Self::SqlServer => "sqlserver",
             Self::ClickHouse => "clickhouse",
+            Self::DuckDb => "duckdb",
         })
     }
 }
@@ -338,7 +346,7 @@ impl Profile {
     pub fn default_schema(&self) -> Option<String> {
         match self.driver {
             Driver::Postgres => Some("public".into()),
-            Driver::Sqlite => Some("main".into()),
+            Driver::Sqlite | Driver::DuckDb => Some("main".into()),
             Driver::SqlServer => Some("dbo".into()),
             Driver::ClickHouse => {
                 let db = match self.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {

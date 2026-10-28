@@ -45,7 +45,9 @@ async fn setup(driver: Driver, schema: &str) -> Option<Db> {
         Driver::Postgres => "DATADROP_TEST_POSTGRES_URL",
         Driver::Mysql => "DATADROP_TEST_MYSQL_URL",
         Driver::Sqlite => unreachable!(),
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     };
     let Ok(url) = std::env::var(var) else {
         eprintln!("{var} isn't set; skipping");
@@ -64,7 +66,9 @@ async fn setup(driver: Driver, schema: &str) -> Option<Db> {
         }
         Driver::Mysql => format!("DROP DATABASE IF EXISTS {schema}; CREATE DATABASE {schema}"),
         Driver::Sqlite => unreachable!(),
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     };
     ok(run(&client, "admin", &reset, None).await);
 
@@ -128,7 +132,9 @@ fn prefix(db: &Db, schema: &str) -> String {
     match db.driver {
         Driver::Postgres => format!("{schema}."),
         Driver::Mysql | Driver::Sqlite => String::new(),
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     }
 }
 
@@ -182,7 +188,9 @@ both!(connects, |driver, schema| async move {
         Driver::Postgres => "PostgreSQL",
         Driver::Mysql => "MySQL",
         Driver::Sqlite => "SQLite",
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     };
     assert!(server_version.contains(expect), "{server_version}");
     if driver == Driver::Sqlite {
@@ -243,7 +251,7 @@ both!(values_as_text, |driver, schema| async move {
                                   (2, NULL, NULL, NULL, NULL, NULL, NULL);
              SELECT * FROM t ORDER BY id"
             .to_owned(),
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => unreachable!("they have test files of their own"),
     };
     let q = ok(run(&db.client, "test", &script, None).await);
     assert_eq!(q.results.len(), 3);
@@ -304,7 +312,9 @@ both!(values_as_text, |driver, schema| async move {
                 ]
             );
         }
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     }
     assert!(row(1)[1..].iter().all(Option::is_none), "NULLs stay NULL");
 });
@@ -394,7 +404,9 @@ both!(row_limit_and_empty_results, |driver, schema| async move {
             SELECT n FROM c"
                 .to_owned()
         }
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     };
     let out = db
         .client
@@ -519,7 +531,9 @@ both!(cancels_on_the_server, |driver, schema| async move {
             "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) \
                            SELECT count(*) FROM c"
         }
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     };
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
@@ -559,7 +573,9 @@ both!(cancels_on_the_server, |driver, schema| async move {
             "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 300000) \
                            SELECT count(*) FROM c"
         }
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
+            unreachable!("they have test files of their own")
+        }
     };
     ok(run(&db.client, "test", long, Some("tab")).await);
 });
@@ -601,7 +617,7 @@ both!(exports_stream_to_files, |driver, schema| async move {
              SELECT n, 'row ' || n AS label FROM c; \
              SELECT n, label FROM nums ORDER BY n"
             .to_owned(),
-        Driver::SqlServer | Driver::ClickHouse => unreachable!("they have test files of their own"),
+        Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => unreachable!("they have test files of their own"),
     };
     let (out, path) = export(script, "nums.csv").await.unwrap();
     assert!(
@@ -866,7 +882,7 @@ both!(
                  CREATE TRIGGER orders_touch AFTER UPDATE ON orders BEGIN \
                    UPDATE orders SET placed = CURRENT_TIMESTAMP WHERE id = NEW.id; END"
                 .to_owned(),
-            Driver::SqlServer | Driver::ClickHouse => {
+            Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
                 unreachable!("they have test files of their own")
             }
         };
@@ -950,7 +966,7 @@ both!(
                 );
             }
             Driver::Sqlite => {}
-            Driver::SqlServer | Driver::ClickHouse => {
+            Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
                 unreachable!("they have test files of their own")
             }
         }
@@ -1018,7 +1034,7 @@ both!(
                 save(&db.client, copy).await;
                 "copy"
             }
-            Driver::SqlServer | Driver::ClickHouse => {
+            Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
                 unreachable!("they have test files of their own")
             }
         };
@@ -1254,7 +1270,7 @@ both!(
             Driver::Postgres => "bigint".into(),
             Driver::Mysql => "bigint".into(),
             Driver::Sqlite => "BIGINT".into(),
-            Driver::SqlServer | Driver::ClickHouse => {
+            Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {
                 unreachable!("they have test files of their own")
             }
         };

@@ -10,6 +10,10 @@ publish.workspace = true
 name = "datadrop-gui"
 path = "src/main.rs"
 
+[features]
+# DuckDB, compiled in (slow to build; release builds have it).
+duckdb = ["datadrop-core/duckdb"]
+
 [dependencies]
 datadrop-core.workspace = true
 # egui-phosphor and egui-notify each target one egui version: move the egui family

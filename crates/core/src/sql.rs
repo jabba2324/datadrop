@@ -26,6 +26,8 @@ impl From<Driver> for Dialect {
             Driver::Sqlite => Self::Sqlite,
             Driver::SqlServer => Self::SqlServer,
             Driver::ClickHouse => Self::ClickHouse,
+            // Close enough to PostgreSQL's (quoting, $$ strings, ::casts, ALTER).
+            Driver::DuckDb => Self::Postgres,
         }
     }
 }

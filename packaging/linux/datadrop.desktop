@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=DataDrop
+GenericName=SQL client
+Comment=Query and browse PostgreSQL, MySQL, SQLite, SQL Server, ClickHouse and DuckDB databases
+Exec=datadrop-gui %F
+Icon=datadrop
+Terminal=false
+Categories=Development;Database;
+MimeType=application/sql;text/x-sql;
+Keywords=SQL;database;postgres;mysql;sqlite;

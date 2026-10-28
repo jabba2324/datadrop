@@ -44,7 +44,7 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME} doesn't match workspace version ${version}" >&2; exit 1; }
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p datadrop-cli -p datadrop-gui
+        run: cargo build --release --locked --target ${{ matrix.target }} -p datadrop-cli -p datadrop-gui --features duckdb
 
       - name: Package
         shell: bash
@@ -64,6 +64,42 @@ jobs:
             fi
           done
           ls -l dist
+
+      # Installers: .deb and .rpm, a .dmg with DataDrop.app, a setup .exe.
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"; [[ "${GITHUB_REF}" == refs/tags/* ]] || version="v0.0.0-dev"
+          sudo apt-get install -y -qq rpm >/dev/null
+          packaging/linux/package.sh "$version" ${{ matrix.target }} dist
+
+      - name: macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          version="${GITHUB_REF_NAME}"; [[ "${GITHUB_REF}" == refs/tags/* ]] || version="v0.0.0-dev"
+          packaging/macos/package.sh "$version" ${{ matrix.target }} dist
+
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { 'v0.0.0-dev' }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc "/DAppVersion=$($version.TrimStart('v'))" `
+            "/DSourceDir=$PWD\target\${{ matrix.target }}\release" `
+            "/DOutputDir=$PWD\dist" packaging\windows\datadrop.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
 
       - uses: actions/upload-artifact@v7
         with:

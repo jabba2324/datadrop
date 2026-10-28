@@ -232,6 +232,8 @@ enum Conn {
     #[cfg(feature = "sqlserver")]
     Ms(Box<crate::mssql::MsConn>),
     Ch(Box<crate::clickhouse::ChConn>),
+    #[cfg(feature = "duckdb")]
+    Duck(Box<crate::duck::DuckConn>),
 }
 
 /// How to stop a running statement.
@@ -249,6 +251,9 @@ enum Stopper {
         crate::clickhouse::ChServer,
         Arc<std::sync::Mutex<Option<String>>>,
     ),
+    /// DuckDB interrupts the connection's query from any thread.
+    #[cfg(feature = "duckdb")]
+    Interrupt(Arc<duckdb::InterruptHandle>),
 }
 
 macro_rules! run_text {
@@ -429,6 +434,14 @@ impl Session {
                 let stop = Stopper::Kill(c.server.clone(), c.running.clone());
                 (Conn::Ch(Box::new(c)), stop)
             }
+            #[cfg(feature = "duckdb")]
+            Driver::DuckDb => {
+                let c = crate::duck::DuckConn::connect(profile).await?;
+                let stop = Stopper::Interrupt(c.interrupt.clone());
+                (Conn::Duck(Box::new(c)), stop)
+            }
+            #[cfg(not(feature = "duckdb"))]
+            Driver::DuckDb => return Err(no_duckdb()),
         };
         Ok(Session {
             conn,
@@ -461,6 +474,8 @@ impl Session {
             Conn::My(c) => run_text!(c, sql, max_rows, Dialect::Mysql),
             Conn::Lite(c) => run_text!(c, sql, max_rows, Dialect::Sqlite),
             Conn::Ch(c) => return c.run(sql, max_rows).await,
+            #[cfg(feature = "duckdb")]
+            Conn::Duck(c) => return c.run(sql, max_rows).await,
             #[cfg(feature = "sqlserver")]
             Conn::Ms(c) => {
                 // The batch's last result set (or, without one, its row counts).
@@ -552,6 +567,14 @@ impl Session {
                     .collect();
                 plan::parse_sqlite(&rows)
             }
+            Driver::DuckDb => {
+                #[cfg(feature = "duckdb")]
+                if let Conn::Duck(c) = &mut self.conn {
+                    let json = c.plan_json(sql, analyze).await?;
+                    return plan::parse_duckdb(&json, analyze);
+                }
+                Err(CoreError::Invalid("not a DuckDB connection".into()))
+            }
             Driver::ClickHouse => {
                 if analyze {
                     return Err(CoreError::Invalid(
@@ -604,6 +627,8 @@ impl Session {
             #[cfg(feature = "sqlserver")]
             Conn::Ms(c) => c.export(sql, w).await?,
             Conn::Ch(c) => c.export(sql, w).await?,
+            #[cfg(feature = "duckdb")]
+            Conn::Duck(c) => c.export(sql, w).await?,
         })
     }
 
@@ -612,6 +637,8 @@ impl Session {
             Conn::Pg(c) => scalar!(c, "SELECT version()").await,
             Conn::My(c) => scalar!(c, "SELECT CONCAT('MySQL ', VERSION())").await,
             Conn::Lite(c) => scalar!(c, "SELECT 'SQLite ' || sqlite_version()").await,
+            #[cfg(feature = "duckdb")]
+            Conn::Duck(c) => c.server_version().await,
             Conn::Ch(c) => {
                 let r = c.run("SELECT concat('ClickHouse ', version())", 1).await?;
                 Ok(r.rows
@@ -645,6 +672,11 @@ impl Session {
             #[cfg(feature = "sqlserver")]
             Stopper::Tds(slot) => {
                 crate::mssql::cancel(slot);
+                Ok(())
+            }
+            #[cfg(feature = "duckdb")]
+            Stopper::Interrupt(h) => {
+                h.interrupt();
                 Ok(())
             }
             Stopper::Kill(server, running) => {
@@ -688,6 +720,8 @@ impl Session {
                 Ok(())
             }
             Conn::Ch(_) => Ok(()),
+            #[cfg(feature = "duckdb")]
+            Conn::Duck(_) => Ok(()),
         };
     }
 }
@@ -715,7 +749,7 @@ async fn cancel_on_server(profile: &Profile, via: &Endpoint, server_id: u64) -> 
                 .await?;
             let _ = c.close().await;
         }
-        Driver::Sqlite | Driver::SqlServer | Driver::ClickHouse => {}
+        Driver::Sqlite | Driver::SqlServer | Driver::ClickHouse | Driver::DuckDb => {}
     }
     Ok(())
 }
@@ -723,6 +757,11 @@ async fn cancel_on_server(profile: &Profile, via: &Endpoint, server_id: u64) -> 
 #[cfg(not(feature = "sqlserver"))]
 fn no_sql_server() -> CoreError {
     CoreError::Invalid("this DataDrop was built without SQL Server support".into())
+}
+
+#[cfg(not(feature = "duckdb"))]
+fn no_duckdb() -> CoreError {
+    CoreError::Invalid("this DataDrop was built without DuckDB support".into())
 }
 
 #[cfg(feature = "sqlserver")]
@@ -744,6 +783,9 @@ pub enum MetaPool {
     Ms(Arc<MsMeta>),
     /// ClickHouse's HTTP interface needs no connection kept open.
     Ch(crate::clickhouse::ChServer),
+    /// DuckDB: a connection for each query, from the process's open database.
+    #[cfg(feature = "duckdb")]
+    Duck(Box<Profile>),
 }
 
 #[cfg(feature = "sqlserver")]
@@ -816,6 +858,10 @@ impl MetaPool {
             #[cfg(not(feature = "sqlserver"))]
             Driver::SqlServer => return Err(no_sql_server()),
             Driver::ClickHouse => MetaPool::Ch(crate::clickhouse::ChServer::new(profile, &via)?),
+            #[cfg(feature = "duckdb")]
+            Driver::DuckDb => MetaPool::Duck(Box::new(profile.clone())),
+            #[cfg(not(feature = "duckdb"))]
+            Driver::DuckDb => return Err(no_duckdb()),
         })
     }
 
@@ -840,6 +886,8 @@ impl MetaPool {
             MetaPool::Lite(p) => rows!(p),
             // Parameters are {p1:String}, {p2:String}...
             MetaPool::Ch(server) => crate::clickhouse::text_rows(server, sql, binds).await?,
+            #[cfg(feature = "duckdb")]
+            MetaPool::Duck(p) => crate::duck::text_rows(p, sql, binds).await?,
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(m) => {
                 // Parameters are @p1, @p2... written in as literals.
@@ -876,6 +924,8 @@ impl MetaPool {
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(_) => Driver::SqlServer,
             MetaPool::Ch(_) => Driver::ClickHouse,
+            #[cfg(feature = "duckdb")]
+            MetaPool::Duck(_) => Driver::DuckDb,
         }
     }
 
@@ -908,6 +958,18 @@ impl MetaPool {
             .iter()
             .filter_map(|r| text_col(r, 0))
             .collect(),
+            #[cfg(feature = "duckdb")]
+            MetaPool::Duck(_) => self
+                .text_rows(
+                    "SELECT schema_name FROM information_schema.schemata \
+                     WHERE catalog_name = current_database() \
+                     AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .filter_map(|r| r.into_iter().next().flatten())
+                .collect(),
             MetaPool::Ch(_) => self
                 .text_rows(
                     "SELECT name FROM system.databases WHERE name NOT IN \
@@ -978,6 +1040,20 @@ impl MetaPool {
                     .map(|r| (text_col(r, 0), text_col(r, 1)))
                     .collect()
             }
+            #[cfg(feature = "duckdb")]
+            MetaPool::Duck(_) => self
+                .text_rows(
+                    "SELECT table_name, table_type FROM information_schema.tables \
+                     WHERE table_catalog = current_database() AND table_schema = ? ORDER BY 1",
+                    &[schema],
+                )
+                .await?
+                .into_iter()
+                .map(|r| {
+                    let [a, b] = arr(r);
+                    (a, b)
+                })
+                .collect(),
             MetaPool::Ch(_) => self
                 .text_rows(
                     "SELECT name, engine FROM system.tables WHERE database = {p1:String} \
@@ -1067,6 +1143,24 @@ impl MetaPool {
             .iter()
             .map(|r| std::array::from_fn(|i| text_col(r, i)))
             .collect(),
+            #[cfg(feature = "duckdb")]
+            MetaPool::Duck(_) => self
+                .text_rows(
+                    "SELECT c.column_name, c.data_type, \
+                     CASE WHEN c.is_nullable THEN 'YES' ELSE 'NO' END, c.column_default, \
+                     CASE WHEN EXISTS (SELECT 1 FROM duckdb_constraints() k \
+                       WHERE k.database_name = c.database_name AND k.schema_name = c.schema_name \
+                       AND k.table_name = c.table_name AND k.constraint_type = 'PRIMARY KEY' \
+                       AND list_contains(k.constraint_column_names, c.column_name)) \
+                     THEN 'YES' ELSE 'NO' END \
+                     FROM duckdb_columns() c WHERE c.database_name = current_database() \
+                     AND c.schema_name = ? AND c.table_name = ? ORDER BY c.column_index",
+                    &[schema, table],
+                )
+                .await?
+                .into_iter()
+                .map(arr)
+                .collect(),
             MetaPool::Ch(_) => self
                 .text_rows(
                     "SELECT name, type, if(startsWith(type, 'Nullable('), 'YES', 'NO'), \
@@ -1155,6 +1249,22 @@ impl MetaPool {
             .iter()
             .map(|r| std::array::from_fn(|i| text_col(r, i)))
             .collect(),
+            #[cfg(feature = "duckdb")]
+            MetaPool::Duck(_) => self
+                .text_rows(
+                    "SELECT c.table_schema, c.table_name, t.table_type, c.column_name \
+                     FROM information_schema.columns c JOIN information_schema.tables t \
+                     ON t.table_catalog = c.table_catalog AND t.table_schema = c.table_schema \
+                     AND t.table_name = c.table_name \
+                     WHERE c.table_catalog = current_database() \
+                     AND c.table_schema NOT IN ('information_schema', 'pg_catalog') \
+                     ORDER BY 1, 2, c.ordinal_position LIMIT 100000",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(arr)
+                .collect(),
             MetaPool::Ch(_) => self
                 .text_rows(
                     "SELECT c.database, c.table, t.engine, c.name FROM system.columns c \
@@ -1230,6 +1340,8 @@ impl MetaPool {
                 }
             }
             MetaPool::Ch(_) => {}
+            #[cfg(feature = "duckdb")]
+            MetaPool::Duck(_) => {}
         }
     }
 }

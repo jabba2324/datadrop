@@ -38,6 +38,8 @@ allow = [
     # The fonts egui embeds (epaint_default_fonts): free to bundle with software.
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # Public domain (tiny-keccak, under DuckDB's Arrow).
+    "CC0-1.0",
 ]
 confidence-threshold = 0.9
 

@@ -50,6 +50,15 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "DataDrop",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(&cc.egui_ctx, config)))),
+        Box::new(move |cc| {
+            let mut app = app::App::new(&cc.egui_ctx, config);
+            // Files given on the command line (or by the desktop's "Open with").
+            for path in std::env::args_os().skip(1).map(std::path::PathBuf::from) {
+                if path.is_file() {
+                    app.open_path(&path);
+                }
+            }
+            Ok(Box::new(app))
+        }),
     )
 }

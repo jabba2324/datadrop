@@ -12,6 +12,8 @@ pub mod complete;
 pub mod db;
 pub mod diagram;
 pub mod diff;
+#[cfg(feature = "duckdb")]
+pub mod duck;
 pub mod edit;
 pub mod error;
 pub mod export;
