@@ -231,6 +231,7 @@ enum Conn {
     Lite(SqliteConnection),
     #[cfg(feature = "sqlserver")]
     Ms(Box<crate::mssql::MsConn>),
+    Ch(Box<crate::clickhouse::ChConn>),
 }
 
 /// How to stop a running statement.
@@ -243,6 +244,11 @@ enum Stopper {
     /// SQL Server's attention signal, sent on the session's own connection.
     #[cfg(feature = "sqlserver")]
     Tds(crate::mssql::CancelSlot),
+    /// ClickHouse: KILL QUERY for the running query's id.
+    Kill(
+        crate::clickhouse::ChServer,
+        Arc<std::sync::Mutex<Option<String>>>,
+    ),
 }
 
 macro_rules! run_text {
@@ -418,6 +424,11 @@ impl Session {
             }
             #[cfg(not(feature = "sqlserver"))]
             Driver::SqlServer => return Err(no_sql_server()),
+            Driver::ClickHouse => {
+                let c = crate::clickhouse::ChConn::connect(profile, &via).await?;
+                let stop = Stopper::Kill(c.server.clone(), c.running.clone());
+                (Conn::Ch(Box::new(c)), stop)
+            }
         };
         Ok(Session {
             conn,
@@ -449,6 +460,7 @@ impl Session {
             Conn::Pg(c) => run_text!(c, sql, max_rows, Dialect::Postgres),
             Conn::My(c) => run_text!(c, sql, max_rows, Dialect::Mysql),
             Conn::Lite(c) => run_text!(c, sql, max_rows, Dialect::Sqlite),
+            Conn::Ch(c) => return c.run(sql, max_rows).await,
             #[cfg(feature = "sqlserver")]
             Conn::Ms(c) => {
                 // The batch's last result set (or, without one, its row counts).
@@ -540,6 +552,22 @@ impl Session {
                     .collect();
                 plan::parse_sqlite(&rows)
             }
+            Driver::ClickHouse => {
+                if analyze {
+                    return Err(CoreError::Invalid(
+                        "ClickHouse doesn't time each step of a query; use Explain without \
+                         analyze"
+                            .into(),
+                    ));
+                }
+                let r = self.run(&format!("EXPLAIN {sql}"), 100_000).await?;
+                let lines: Vec<String> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| row.into_iter().next().flatten().unwrap_or_default())
+                    .collect();
+                plan::parse_indented(&lines)
+            }
             Driver::SqlServer => {
                 // SHOWPLAN_ALL describes the plan (without running it); STATISTICS
                 // PROFILE runs the statement and adds the plan with actual rows.
@@ -575,6 +603,7 @@ impl Session {
             Conn::Lite(c) => export_text!(c, sql, w, Dialect::Sqlite),
             #[cfg(feature = "sqlserver")]
             Conn::Ms(c) => c.export(sql, w).await?,
+            Conn::Ch(c) => c.export(sql, w).await?,
         })
     }
 
@@ -583,6 +612,14 @@ impl Session {
             Conn::Pg(c) => scalar!(c, "SELECT version()").await,
             Conn::My(c) => scalar!(c, "SELECT CONCAT('MySQL ', VERSION())").await,
             Conn::Lite(c) => scalar!(c, "SELECT 'SQLite ' || sqlite_version()").await,
+            Conn::Ch(c) => {
+                let r = c.run("SELECT concat('ClickHouse ', version())", 1).await?;
+                Ok(r.rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.into_iter().next().flatten())
+                    .unwrap_or_default())
+            }
             #[cfg(feature = "sqlserver")]
             Conn::Ms(c) => {
                 let r = c.run_batch("SELECT @@VERSION", 1).await?;
@@ -609,6 +646,13 @@ impl Session {
             Stopper::Tds(slot) => {
                 crate::mssql::cancel(slot);
                 Ok(())
+            }
+            Stopper::Kill(server, running) => {
+                let id = running.lock().expect("running").clone();
+                match id {
+                    Some(id) => crate::clickhouse::kill(server, &id).await,
+                    None => Ok(()),
+                }
             }
         }
     }
@@ -643,6 +687,7 @@ impl Session {
                 c.close().await;
                 Ok(())
             }
+            Conn::Ch(_) => Ok(()),
         };
     }
 }
@@ -670,7 +715,7 @@ async fn cancel_on_server(profile: &Profile, via: &Endpoint, server_id: u64) -> 
                 .await?;
             let _ = c.close().await;
         }
-        Driver::Sqlite | Driver::SqlServer => {}
+        Driver::Sqlite | Driver::SqlServer | Driver::ClickHouse => {}
     }
     Ok(())
 }
@@ -697,6 +742,8 @@ pub enum MetaPool {
     /// One shared connection, opened when first needed.
     #[cfg(feature = "sqlserver")]
     Ms(Arc<MsMeta>),
+    /// ClickHouse's HTTP interface needs no connection kept open.
+    Ch(crate::clickhouse::ChServer),
 }
 
 #[cfg(feature = "sqlserver")]
@@ -768,6 +815,7 @@ impl MetaPool {
             })),
             #[cfg(not(feature = "sqlserver"))]
             Driver::SqlServer => return Err(no_sql_server()),
+            Driver::ClickHouse => MetaPool::Ch(crate::clickhouse::ChServer::new(profile, &via)?),
         })
     }
 
@@ -790,6 +838,8 @@ impl MetaPool {
             MetaPool::Pg(p) => rows!(p),
             MetaPool::My(p) => rows!(p),
             MetaPool::Lite(p) => rows!(p),
+            // Parameters are {p1:String}, {p2:String}...
+            MetaPool::Ch(server) => crate::clickhouse::text_rows(server, sql, binds).await?,
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(m) => {
                 // Parameters are @p1, @p2... written in as literals.
@@ -825,6 +875,7 @@ impl MetaPool {
             MetaPool::Lite(_) => Driver::Sqlite,
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(_) => Driver::SqlServer,
+            MetaPool::Ch(_) => Driver::ClickHouse,
         }
     }
 
@@ -857,6 +908,16 @@ impl MetaPool {
             .iter()
             .filter_map(|r| text_col(r, 0))
             .collect(),
+            MetaPool::Ch(_) => self
+                .text_rows(
+                    "SELECT name FROM system.databases WHERE name NOT IN \
+                     ('system', 'INFORMATION_SCHEMA', 'information_schema') ORDER BY name",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .filter_map(|r| r.into_iter().next().flatten())
+                .collect(),
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(_) => self
                 .text_rows(
@@ -873,7 +934,8 @@ impl MetaPool {
 
     pub async fn tables(&self, schema: &str) -> Result<Vec<TableInfo>> {
         let kind = |k: Option<String>| match k.as_deref() {
-            Some("v" | "V" | "VIEW" | "SYSTEM VIEW" | "view") => TableKind::View,
+            Some("v" | "V" | "VIEW" | "SYSTEM VIEW" | "view" | "View") => TableKind::View,
+            Some("MaterializedView") => TableKind::MaterializedView,
             Some("m") => TableKind::MaterializedView,
             Some("f") => TableKind::ForeignTable,
             _ => TableKind::Table,
@@ -916,6 +978,19 @@ impl MetaPool {
                     .map(|r| (text_col(r, 0), text_col(r, 1)))
                     .collect()
             }
+            MetaPool::Ch(_) => self
+                .text_rows(
+                    "SELECT name, engine FROM system.tables WHERE database = {p1:String} \
+                     AND NOT startsWith(name, '.inner') ORDER BY name",
+                    &[schema],
+                )
+                .await?
+                .into_iter()
+                .map(|r| {
+                    let [a, b] = arr(r);
+                    (a, b)
+                })
+                .collect(),
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(_) => self
                 .text_rows(
@@ -992,6 +1067,18 @@ impl MetaPool {
             .iter()
             .map(|r| std::array::from_fn(|i| text_col(r, i)))
             .collect(),
+            MetaPool::Ch(_) => self
+                .text_rows(
+                    "SELECT name, type, if(startsWith(type, 'Nullable('), 'YES', 'NO'), \
+                     nullIf(default_expression, ''), if(is_in_primary_key, 'YES', 'NO') \
+                     FROM system.columns WHERE database = {p1:String} AND table = {p2:String} \
+                     ORDER BY position",
+                    &[schema, table],
+                )
+                .await?
+                .into_iter()
+                .map(arr)
+                .collect(),
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(_) => self
                 .text_rows(
@@ -1068,6 +1155,19 @@ impl MetaPool {
             .iter()
             .map(|r| std::array::from_fn(|i| text_col(r, i)))
             .collect(),
+            MetaPool::Ch(_) => self
+                .text_rows(
+                    "SELECT c.database, c.table, t.engine, c.name FROM system.columns c \
+                     JOIN system.tables t ON t.database = c.database AND t.name = c.table \
+                     WHERE c.database NOT IN ('system', 'INFORMATION_SCHEMA', \
+                     'information_schema') ORDER BY c.database, c.table, c.position \
+                     LIMIT 100000",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(arr)
+                .collect(),
             #[cfg(feature = "sqlserver")]
             MetaPool::Ms(_) => self
                 .text_rows(
@@ -1094,7 +1194,15 @@ impl MetaPool {
             if !same {
                 let view = matches!(
                     kind.as_deref(),
-                    Some("v" | "m" | "V" | "VIEW" | "SYSTEM VIEW" | "view")
+                    Some(
+                        "v" | "m"
+                            | "V"
+                            | "VIEW"
+                            | "SYSTEM VIEW"
+                            | "view"
+                            | "View"
+                            | "MaterializedView"
+                    )
                 );
                 out.push(CatalogTable {
                     schema,
@@ -1121,6 +1229,7 @@ impl MetaPool {
                     c.close().await;
                 }
             }
+            MetaPool::Ch(_) => {}
         }
     }
 }

@@ -60,10 +60,19 @@ pub struct TableEdit {
 
 /// `CREATE [UNIQUE] INDEX name ON table (columns)`, for an index made in the editor.
 pub fn index_definition(schema: &str, table: &str, i: &Index, d: Dialect) -> String {
-    let index = if d == Dialect::Postgres || d == Dialect::Mysql {
-        quote_ident(&i.name, d)
-    } else {
+    // ClickHouse has data-skipping indexes, added to the table.
+    if d == Dialect::ClickHouse {
+        return format!(
+            "ALTER TABLE {} ADD INDEX {} ({}) TYPE minmax GRANULARITY 1",
+            qualified(schema, table, d),
+            quote_ident(&i.name, d),
+            column_list(&i.columns, d)
+        );
+    }
+    let index = if d == Dialect::Sqlite {
         qualified(schema, &i.name, d)
+    } else {
+        quote_ident(&i.name, d)
     };
     format!(
         "CREATE {}INDEX {index} ON {} ({})",
@@ -316,7 +325,7 @@ fn alter_column(m: &mut Migration, table: &str, b: &ColumnModel, c: &ColumnModel
         return;
     }
     match d {
-        Dialect::Mysql => {
+        Dialect::Mysql | Dialect::ClickHouse => {
             // MODIFY says the whole column again.
             m.push(format!(
                 "ALTER TABLE {table} MODIFY COLUMN {}",

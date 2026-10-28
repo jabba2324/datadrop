@@ -25,6 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+ureq.workspace = true
 url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

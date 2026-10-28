@@ -249,12 +249,18 @@ impl Client {
                 };
                 let statements =
                     import::insert_statements(&schema, &table, &targets, &rows, p.driver.into())?;
+                let partial = p.driver == Driver::ClickHouse;
                 self.in_transaction(&p, &statements, cancel, |i, e| {
                     let first = i * import::BATCH + 1;
                     let last = ((i + 1) * import::BATCH).min(rows.len());
-                    CoreError::Database(format!(
-                        "rows {first}–{last} failed, so nothing was imported: {e}"
-                    ))
+                    CoreError::Database(if partial {
+                        format!(
+                            "rows {first}–{last} failed (the {} before them were imported): {e}",
+                            first - 1
+                        )
+                    } else {
+                        format!("rows {first}–{last} failed, so nothing was imported: {e}")
+                    })
                 })
                 .await?;
                 Ok(Output::Imported {
@@ -799,13 +805,14 @@ impl Client {
         m: &crate::diff::Migration,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let mysql = profile.driver == Driver::Mysql;
+        // MySQL commits DDL statement by statement; ClickHouse has no transactions.
+        let mysql = matches!(profile.driver, Driver::Mysql | Driver::ClickHouse);
         let r = self
             .in_transaction(profile, &m.statements, cancel, |i, e| {
                 let st = m.statements[i].lines().next().unwrap_or_default();
                 CoreError::Database(if mysql {
                     format!(
-                        "statement {} ({st}) failed; MySQL had already made the {i} before it: {e}",
+                        "statement {} ({st}) failed; the {i} before it were already made: {e}",
                         i + 1
                     )
                 } else {
@@ -833,8 +840,14 @@ impl Client {
     ) -> Result<()> {
         let via = cancellable(cancel, self.via(profile)).await?;
         let mut s = cancellable(cancel, Session::connect(profile, via)).await?;
+        // ClickHouse has no transactions to speak of: the statements just run.
+        let atomic = profile.driver != Driver::ClickHouse;
         let begin = sql::begin(profile.driver.into());
-        let mut result = cancellable(cancel, s.run(begin, 0)).await.map(|_| ());
+        let mut result = if atomic {
+            cancellable(cancel, s.run(begin, 0)).await.map(|_| ())
+        } else {
+            Ok(())
+        };
         for (i, st) in statements.iter().enumerate() {
             if result.is_err() {
                 break;
@@ -846,9 +859,11 @@ impl Client {
             };
         }
         match &result {
+            Ok(()) if !atomic => {}
             Ok(()) => result = s.run("COMMIT", 0).await.map(|_| ()),
             // Mid-statement: dropping the connection rolls the transaction back.
             Err(CoreError::Cancelled) => return result,
+            Err(_) if !atomic => {}
             Err(_) => {
                 let _ = s.run("ROLLBACK", 0).await;
             }

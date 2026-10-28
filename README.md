@@ -1,7 +1,7 @@
 # DataDrop
 
-A fast, open-source SQL client for **PostgreSQL**, **MySQL**, **SQLite** and **SQL
-Server**: a desktop
+A fast, open-source SQL client for **PostgreSQL**, **MySQL**, **SQLite**, **SQL
+Server** and **ClickHouse**: a desktop
 app with a schema browser, a highlighted SQL editor with autocompletion and a results
 grid you can edit, plus a command line that can do everything the app can.
 
@@ -87,6 +87,7 @@ datadrop profile add shop --url postgres://alice@db.example.com/shop --ask-passw
 datadrop profile add local --driver mysql --host 127.0.0.1 --user root --database app --ask-password
 datadrop profile add notes --driver sqlite --database ./notes.db --create-if-missing
 datadrop profile add erp --url sqlserver://sa@erp.example.com:1433/sales --ask-password
+datadrop profile add logs --url clickhouse://default@ch.example.com:8443/logs --ssl-mode require
 datadrop profile list
 datadrop profile test shop
 

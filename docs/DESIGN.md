@@ -181,6 +181,18 @@ running), which are rows with `NodeId` and `Parent`. The schema model is read fr
 table changes use `sp_rename`, `ALTER COLUMN` (type and nullability together) and named
 default constraints. The browsing "pool" is one shared connection.
 
+## ClickHouse
+
+Over its HTTP interface (`crates/core/src/clickhouse.rs`, with `ureq`), port 8123 (8443
+with TLS). Every query asks for `TabSeparatedWithNamesAndTypes`, so values arrive as
+ClickHouse's own text, like the text protocols the other drivers use. A tab's session
+is a ClickHouse `session_id`; each query has its own `query_id`, which Stop kills
+(`KILL QUERY`). Rows past the row limit aren't read: the connection is dropped.
+Metadata comes from `system.tables` / `system.columns` with `{p1:String}` query
+parameters, and a table's DDL is its `create_table_query`. ClickHouse has no
+transactions to speak of, so imports and migrations run statement by statement there,
+and results aren't edited in the grid (rows change with `ALTER TABLE … UPDATE`).
+
 ## Next
 
 - macOS `.app` bundle with notarisation; Windows installer; Linux packages.

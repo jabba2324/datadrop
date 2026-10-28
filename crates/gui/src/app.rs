@@ -1530,6 +1530,13 @@ impl App {
             Some(f) if f.wrapped == r.sql && !f.base.is_empty() => &f.base,
             _ => &r.sql,
         };
+        if dialect == Dialect::ClickHouse {
+            d.grid.editability = Editability::ReadOnly(
+                "ClickHouse changes rows with ALTER TABLE … UPDATE / DELETE, not one by one."
+                    .into(),
+            );
+            return;
+        }
         d.grid.editability = match edit::source_table(sql, dialect) {
             None => Editability::ReadOnly(
                 "Only results from a single table can be edited (no joins, grouping, DISTINCT \

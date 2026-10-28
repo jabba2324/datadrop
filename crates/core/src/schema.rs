@@ -233,7 +233,7 @@ pub fn table_ddl(schema: &str, t: &TableModel, dialect: Dialect) -> String {
         if let Some(d) = &t.definition {
             out.push_str(&statement(d.trim_end().trim_end_matches(';'), dialect));
         }
-    } else if dialect == Dialect::Sqlite
+    } else if matches!(dialect, Dialect::Sqlite | Dialect::ClickHouse)
         && let Some(d) = &t.definition
     {
         out.push_str(d.trim_end().trim_end_matches(';'));
@@ -312,6 +312,33 @@ fn statement(sql: &str, dialect: Dialect) -> String {
 }
 
 pub fn create_table(schema: &str, t: &TableModel, dialect: Dialect) -> String {
+    if dialect == Dialect::ClickHouse {
+        let mut lines: Vec<String> = t
+            .columns
+            .iter()
+            .map(|c| format!("    {}", column_sql(c, dialect)))
+            .collect();
+        for c in t
+            .constraints
+            .iter()
+            .filter(|c| c.kind == ConstraintKind::Check)
+        {
+            lines.push(format!(
+                "    CONSTRAINT {} {}",
+                quote_ident(&c.name, dialect),
+                c.definition
+            ));
+        }
+        let order = t
+            .primary_key()
+            .map(|k| format!("({})", column_list(&k.columns, dialect)))
+            .unwrap_or_else(|| "tuple()".into());
+        return format!(
+            "CREATE TABLE {} (\n{}\n)\nENGINE = MergeTree\nORDER BY {order};\n",
+            qualified(schema, &t.name, dialect),
+            lines.join(",\n")
+        );
+    }
     let mut lines: Vec<String> = t
         .columns
         .iter()
@@ -526,6 +553,7 @@ pub async fn load(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
         Driver::Mysql => load_mysql(pool, schema).await,
         Driver::Sqlite => load_sqlite(pool, schema).await,
         Driver::SqlServer => load_sqlserver(pool, schema).await,
+        Driver::ClickHouse => load_clickhouse(pool, schema).await,
     }
 }
 
@@ -1449,6 +1477,107 @@ async fn load_sqlite(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
         }
     }
 
+    Ok(SchemaModel {
+        schema: schema.to_owned(),
+        tables: tables.list,
+        routines: vec![],
+        sequences: vec![],
+    })
+}
+
+async fn load_clickhouse(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
+    let d = Dialect::ClickHouse;
+    let rows = pool
+        .text_rows(
+            "SELECT name, engine, create_table_query, comment, primary_key FROM system.tables \
+             WHERE database = {p1:String} AND NOT startsWith(name, '.inner') ORDER BY name",
+            &[schema],
+        )
+        .await?;
+    let mut tables = Tables::new(
+        rows.iter()
+            .map(|r| {
+                let kind = match col(r, 1).as_str() {
+                    "View" => TableKind::View,
+                    "MaterializedView" => TableKind::MaterializedView,
+                    _ => TableKind::Table,
+                };
+                let mut t = new_table(col(r, 0), kind);
+                t.definition = opt(r, 2);
+                t.comment = opt(r, 3);
+                // The sorting key stands in for a primary key.
+                let key: Vec<String> = col(r, 4)
+                    .split(',')
+                    .map(|k| k.trim().to_owned())
+                    .filter(|k| !k.is_empty())
+                    .collect();
+                if !key.is_empty() {
+                    t.constraints.push(Constraint {
+                        name: "PRIMARY".into(),
+                        kind: ConstraintKind::PrimaryKey,
+                        definition: format!("PRIMARY KEY ({})", key.join(", ")),
+                        columns: key,
+                        references: None,
+                    });
+                }
+                t
+            })
+            .collect(),
+    );
+    for r in pool
+        .text_rows(
+            "SELECT table, name, type, default_kind, default_expression, comment \
+             FROM system.columns WHERE database = {p1:String} ORDER BY table, position",
+            &[schema],
+        )
+        .await?
+    {
+        let Some(t) = tables.get(&col(&r, 0)) else {
+            continue;
+        };
+        let ty = col(&r, 2);
+        let expr = opt(&r, 4);
+        let kind = col(&r, 3);
+        t.columns.push(ColumnModel {
+            name: col(&r, 1),
+            nullable: ty.starts_with("Nullable("),
+            data_type: ty,
+            default: expr.clone().filter(|_| kind == "DEFAULT"),
+            identity: None,
+            generated: expr
+                .filter(|_| matches!(kind.as_str(), "MATERIALIZED" | "ALIAS" | "EPHEMERAL"))
+                .map(|e| format!("{kind} {e}")),
+            comment: opt(&r, 5),
+        });
+    }
+    for r in pool
+        .text_rows(
+            "SELECT table, name, expr, type_full, granularity FROM system.data_skipping_indices \
+             WHERE database = {p1:String} ORDER BY table, name",
+            &[schema],
+        )
+        .await
+        .unwrap_or_default()
+    {
+        let table = col(&r, 0);
+        let Some(t) = tables.get(&table) else {
+            continue;
+        };
+        t.indexes.push(Index {
+            name: col(&r, 1),
+            columns: vec![col(&r, 2)],
+            unique: false,
+            // Part of the table's own CREATE, which the DDL uses.
+            definition: String::new(),
+            inline: Some(format!(
+                "INDEX {} {} TYPE {} GRANULARITY {}",
+                quote_ident(&col(&r, 1), d),
+                col(&r, 2),
+                col(&r, 3),
+                col(&r, 4)
+            )),
+        });
+    }
     Ok(SchemaModel {
         schema: schema.to_owned(),
         tables: tables.list,

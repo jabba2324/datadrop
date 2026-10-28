@@ -15,6 +15,7 @@ pub enum Dialect {
     Sqlite,
     /// T-SQL.
     SqlServer,
+    ClickHouse,
 }
 
 impl From<Driver> for Dialect {
@@ -24,6 +25,7 @@ impl From<Driver> for Dialect {
             Driver::Mysql => Self::Mysql,
             Driver::Sqlite => Self::Sqlite,
             Driver::SqlServer => Self::SqlServer,
+            Driver::ClickHouse => Self::ClickHouse,
         }
     }
 }
@@ -115,7 +117,7 @@ impl Lexer<'_> {
                     self.push(TokenKind::Comment, start);
                 }
                 b'\'' => {
-                    let backslash = self.dialect == Dialect::Mysql;
+                    let backslash = matches!(self.dialect, Dialect::Mysql | Dialect::ClickHouse);
                     self.quoted(b'\'', backslash);
                     self.push(TokenKind::String, start);
                 }
@@ -209,12 +211,14 @@ impl Lexer<'_> {
                     self.i += 1;
                     self.push(TokenKind::Parameter, start);
                 }
-                // :name, for running with values asked for (not PostgreSQL's ::type).
+                // :name, for running with values asked for (not PostgreSQL's ::type,
+                // nor ClickHouse's {name:Type}).
                 b':' if self.s[self.i + 1..]
                     .chars()
                     .next()
                     .is_some_and(is_ident_start)
-                    && (self.i == 0 || self.b[self.i - 1] != b':') =>
+                    && (self.i == 0 || self.b[self.i - 1] != b':')
+                    && !self.prev_is_ident_char() =>
                 {
                     self.i += 1;
                     while self.i < self.b.len() && is_ident_char(self.char_here()) {
@@ -256,7 +260,7 @@ impl Lexer<'_> {
     /// MySQL needs whitespace (or the end) after `--` for it to be a comment.
     fn line_comment_dash_ok(&self) -> bool {
         match self.dialect {
-            Dialect::Postgres | Dialect::Sqlite | Dialect::SqlServer => true,
+            Dialect::Postgres | Dialect::Sqlite | Dialect::SqlServer | Dialect::ClickHouse => true,
             Dialect::Mysql => match self.s.get(self.i + 2..) {
                 Some(rest) => rest.chars().next().is_none_or(|c| c.is_whitespace()),
                 None => true,
@@ -829,12 +833,11 @@ pub fn first_keyword(sql: &str, dialect: Dialect) -> Option<String> {
         .map(|t| sql[t.range].to_ascii_uppercase())
 }
 
-/// Quote an identifier for the dialect: `"a""b"` or `` `a``b` ``.
 /// The statement that begins a transaction.
 pub fn begin(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Mysql => "START TRANSACTION",
-        Dialect::SqlServer => "BEGIN TRANSACTION",
+        Dialect::SqlServer | Dialect::ClickHouse => "BEGIN TRANSACTION",
         Dialect::Postgres | Dialect::Sqlite => "BEGIN",
     }
 }
@@ -901,10 +904,11 @@ pub fn filtered(
     s
 }
 
+/// Quote an identifier for the dialect: `"a""b"`, `` `a``b` `` or `[a]]b]`.
 pub fn quote_ident(name: &str, dialect: Dialect) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
-        Dialect::Mysql => format!("`{}`", name.replace('`', "``")),
+        Dialect::Mysql | Dialect::ClickHouse => format!("`{}`", name.replace('`', "``")),
         Dialect::SqlServer => format!("[{}]", name.replace(']', "]]")),
     }
 }

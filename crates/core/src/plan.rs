@@ -241,6 +241,75 @@ pub fn parse_sqlite(rows: &[(i64, i64, String)]) -> Result<Plan> {
     })
 }
 
+/// ClickHouse's `EXPLAIN`: steps as a tree drawn with `└──` / `├──`, each with its
+/// details on `│` lines under it (older versions: just the steps, indented).
+pub fn parse_indented(lines: &[String]) -> Result<Plan> {
+    let drawn = lines.iter().any(|l| l.contains('└') || l.contains('├'));
+    let mut roots: Vec<PlanNode> = vec![];
+    // Open steps: (the column their label starts at, the step).
+    let mut stack: Vec<(usize, PlanNode)> = vec![];
+    fn close(stack: &mut Vec<(usize, PlanNode)>, roots: &mut Vec<PlanNode>, to: usize) {
+        while stack.last().is_some_and(|(d, _)| *d >= to) {
+            let (_, node) = stack.pop().expect("checked");
+            match stack.last_mut() {
+                Some((_, parent)) => parent.children.push(node),
+                None => roots.push(node),
+            }
+        }
+    }
+    let open = |stack: &mut Vec<(usize, PlanNode)>, roots: &mut Vec<PlanNode>, col, label: &str| {
+        close(stack, roots, col);
+        stack.push((
+            col,
+            PlanNode {
+                label: label.trim().to_owned(),
+                ..PlanNode::default()
+            },
+        ));
+    };
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let Some(first) = chars.iter().position(|c| !c.is_whitespace()) else {
+            continue;
+        };
+        let text: String = chars[first..].iter().collect();
+        if !drawn {
+            open(&mut stack, &mut roots, first, &text);
+            continue;
+        }
+        if text.starts_with('└') || text.starts_with('├') {
+            let label = text.trim_start_matches(['└', '├', '─']);
+            open(&mut stack, &mut roots, first + 3, label);
+            continue;
+        }
+        let detail = text.trim_start_matches(['│', ' ']).trim();
+        match stack.last_mut() {
+            // A line at the left before any step: a step, unless it's a detail
+            // (`Output: ...`) of the whole query.
+            None if first == 0 && !detail.contains(": ") => {
+                open(&mut stack, &mut roots, 0, detail);
+            }
+            None => {}
+            Some((col, _)) if first == 0 && *col == 0 && !text.starts_with('│') => {
+                open(&mut stack, &mut roots, 0, detail);
+            }
+            Some((_, n)) => {
+                let (k, v) = detail.split_once(": ").unwrap_or((detail, ""));
+                n.details.push((k.to_owned(), v.to_owned()));
+            }
+        }
+    }
+    close(&mut stack, &mut roots, 0);
+    if roots.is_empty() {
+        return Err(bad("no steps"));
+    }
+    Ok(Plan {
+        roots,
+        raw: lines.join("\n"),
+        ..Plan::default()
+    })
+}
+
 /// A duration as CockroachDB writes it (`982µs`, `1.2ms`, `3s`), in milliseconds.
 fn crdb_ms(s: &str) -> Option<f64> {
     let s = s.trim();
@@ -430,6 +499,31 @@ pub fn parse_sqlserver(r: &crate::db::StatementResult, analyzed: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clickhouse_trees() {
+        let text = "Output: number MOD 3, count()\n\nSorting (Sorting for ORDER BY)\n\
+                    │  Sort description: number MOD 3 ASC\n└──Aggregating\n   │  Keys: number MOD 3\n   \
+                    └──Filter (WHERE)\n      │  Filter column: number > 2\n      \
+                    └──ReadFromSystemNumbers\n            Output: number";
+        let lines: Vec<String> = text.lines().map(Into::into).collect();
+        let p = parse_indented(&lines).unwrap();
+        assert_eq!(p.roots.len(), 1);
+        let sort = &p.roots[0];
+        assert_eq!(sort.label, "Sorting (Sorting for ORDER BY)");
+        assert_eq!(sort.details[0].0, "Sort description");
+        let agg = &sort.children[0];
+        assert_eq!(agg.label, "Aggregating");
+        let read = &agg.children[0].children[0];
+        assert_eq!(read.label, "ReadFromSystemNumbers");
+        assert_eq!(read.details, [("Output".to_owned(), "number".to_owned())]);
+        // Older ClickHouse: indentation only.
+        let old: Vec<String> = ["Expression", "  Aggregating", "    ReadFromStorage"]
+            .map(Into::into)
+            .to_vec();
+        let p = parse_indented(&old).unwrap();
+        assert_eq!(p.roots[0].children[0].children[0].label, "ReadFromStorage");
+    }
 
     #[test]
     fn cockroach_text() {

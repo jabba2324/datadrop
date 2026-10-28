@@ -22,14 +22,17 @@ pub enum Driver {
     Sqlite,
     #[serde(rename = "sqlserver")]
     SqlServer,
+    #[serde(rename = "clickhouse")]
+    ClickHouse,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 4] = [
+    pub const ALL: [Driver; 5] = [
         Driver::Postgres,
         Driver::Mysql,
         Driver::Sqlite,
         Driver::SqlServer,
+        Driver::ClickHouse,
     ];
 
     pub fn default_port(self) -> u16 {
@@ -38,6 +41,8 @@ impl Driver {
             Self::Mysql => 3306,
             Self::Sqlite => 0,
             Self::SqlServer => 1433,
+            // The HTTP interface (8443 with TLS).
+            Self::ClickHouse => 8123,
         }
     }
 
@@ -47,6 +52,7 @@ impl Driver {
             Self::Mysql => "MySQL",
             Self::Sqlite => "SQLite",
             Self::SqlServer => "SQL Server",
+            Self::ClickHouse => "ClickHouse",
         }
     }
 
@@ -65,6 +71,7 @@ impl Driver {
             "postgres" | "postgresql" => Some(Self::Postgres),
             "mysql" | "mariadb" => Some(Self::Mysql),
             "sqlserver" | "mssql" => Some(Self::SqlServer),
+            "clickhouse" | "ch" => Some(Self::ClickHouse),
             _ => None,
         }
         .or_else(|| url.starts_with("sqlite:").then_some(Self::Sqlite))
@@ -79,8 +86,9 @@ impl std::str::FromStr for Driver {
             "mysql" | "mariadb" => Ok(Self::Mysql),
             "sqlite" | "sqlite3" => Ok(Self::Sqlite),
             "sqlserver" | "mssql" => Ok(Self::SqlServer),
+            "clickhouse" | "ch" => Ok(Self::ClickHouse),
             _ => Err(format!(
-                "unknown driver '{s}' (use postgres, mysql, sqlite or sqlserver)"
+                "unknown driver '{s}' (use postgres, mysql, sqlite, sqlserver or clickhouse)"
             )),
         }
     }
@@ -93,6 +101,7 @@ impl std::fmt::Display for Driver {
             Self::Mysql => "mysql",
             Self::Sqlite => "sqlite",
             Self::SqlServer => "sqlserver",
+            Self::ClickHouse => "clickhouse",
         })
     }
 }
@@ -331,6 +340,13 @@ impl Profile {
             Driver::Postgres => Some("public".into()),
             Driver::Sqlite => Some("main".into()),
             Driver::SqlServer => Some("dbo".into()),
+            Driver::ClickHouse => {
+                let db = match self.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
+                    Some(u) => decode(u.path().trim_start_matches('/')),
+                    None => self.database.clone(),
+                };
+                Some(if db.is_empty() { "default".into() } else { db })
+            }
             Driver::Mysql => {
                 let db = match self.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
                     Some(u) => decode(u.path().trim_start_matches('/')),

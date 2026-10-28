@@ -109,8 +109,8 @@ pub fn literal(value: Option<&str>, dialect: Dialect) -> String {
         Some(v) if dialect == Dialect::SqlServer => format!("N'{}'", v.replace('\'', "''")),
         Some(v) => {
             let mut s = v.replace('\'', "''");
-            if dialect == Dialect::Mysql {
-                // MySQL also treats backslashes as escapes in strings.
+            if matches!(dialect, Dialect::Mysql | Dialect::ClickHouse) {
+                // MySQL and ClickHouse also treat backslashes as escapes in strings.
                 s = s.replace('\\', "\\\\");
             }
             format!("'{s}'")

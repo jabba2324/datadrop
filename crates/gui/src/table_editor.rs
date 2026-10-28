@@ -155,6 +155,22 @@ fn common_types(d: Dialect) -> &'static [&'static str] {
             "uniqueidentifier",
             "varbinary(max)",
         ],
+        Dialect::ClickHouse => &[
+            "UInt64",
+            "Int64",
+            "Int32",
+            "Float64",
+            "Decimal(10, 2)",
+            "Bool",
+            "String",
+            "Nullable(String)",
+            "LowCardinality(String)",
+            "Date",
+            "DateTime",
+            "DateTime64(3)",
+            "UUID",
+            "Array(String)",
+        ],
     }
 }
 
@@ -191,6 +207,7 @@ impl TableEditor {
                         Dialect::Mysql => "bigint",
                         Dialect::Sqlite => "INTEGER",
                         Dialect::SqlServer => "bigint",
+                        Dialect::ClickHouse => "UInt64",
                     }
                     .into(),
                     primary_key: true,

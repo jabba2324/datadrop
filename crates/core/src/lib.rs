@@ -5,6 +5,7 @@
 //! PostgreSQL and MySQL, and the SQL lexer used for highlighting and for splitting
 //! scripts into statements.
 
+pub mod clickhouse;
 pub mod client;
 pub mod command;
 pub mod complete;
