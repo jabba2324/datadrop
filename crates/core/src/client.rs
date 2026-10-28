@@ -663,9 +663,6 @@ impl Client {
             drop(run);
             let result = match outcome {
                 Some(Err(CoreError::Cancelled)) | None => {
-                    if interrupt_missing(&guard) {
-                        stop_and_settle(&mut guard).await;
-                    }
                     stop_and_settle(&mut guard).await;
                     out.cancelled = true;
                     out.error = Some(StatementError {
@@ -1029,12 +1026,6 @@ impl Client {
 
 /// After cancelling a statement: ask the database to stop it, then let it finish
 /// failing so the session is usable again (or drop the session if that fails).
-/// Whether the session needs stopping from outside (it has no way to be told on its
-/// own connection, as SQL Server does).
-fn interrupt_missing(guard: &Option<Session>) -> bool {
-    guard.as_ref().is_some_and(|s| s.interrupter().is_none())
-}
-
 async fn stop_and_settle(guard: &mut Option<Session>) {
     let Some(live) = guard.as_mut() else { return };
     let cancelled = live.cancel_running().await;
