@@ -20,16 +20,24 @@ pub enum Driver {
     Postgres,
     Mysql,
     Sqlite,
+    #[serde(rename = "sqlserver")]
+    SqlServer,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 3] = [Driver::Postgres, Driver::Mysql, Driver::Sqlite];
+    pub const ALL: [Driver; 4] = [
+        Driver::Postgres,
+        Driver::Mysql,
+        Driver::Sqlite,
+        Driver::SqlServer,
+    ];
 
     pub fn default_port(self) -> u16 {
         match self {
             Self::Postgres => 5432,
             Self::Mysql => 3306,
             Self::Sqlite => 0,
+            Self::SqlServer => 1433,
         }
     }
 
@@ -38,6 +46,7 @@ impl Driver {
             Self::Postgres => "PostgreSQL",
             Self::Mysql => "MySQL",
             Self::Sqlite => "SQLite",
+            Self::SqlServer => "SQL Server",
         }
     }
 
@@ -55,6 +64,7 @@ impl Driver {
         match scheme.as_str() {
             "postgres" | "postgresql" => Some(Self::Postgres),
             "mysql" | "mariadb" => Some(Self::Mysql),
+            "sqlserver" | "mssql" => Some(Self::SqlServer),
             _ => None,
         }
         .or_else(|| url.starts_with("sqlite:").then_some(Self::Sqlite))
@@ -68,8 +78,9 @@ impl std::str::FromStr for Driver {
             "postgres" | "postgresql" | "pg" => Ok(Self::Postgres),
             "mysql" | "mariadb" => Ok(Self::Mysql),
             "sqlite" | "sqlite3" => Ok(Self::Sqlite),
+            "sqlserver" | "mssql" => Ok(Self::SqlServer),
             _ => Err(format!(
-                "unknown driver '{s}' (use postgres, mysql or sqlite)"
+                "unknown driver '{s}' (use postgres, mysql, sqlite or sqlserver)"
             )),
         }
     }
@@ -81,6 +92,7 @@ impl std::fmt::Display for Driver {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
             Self::Sqlite => "sqlite",
+            Self::SqlServer => "sqlserver",
         })
     }
 }
@@ -318,6 +330,7 @@ impl Profile {
         match self.driver {
             Driver::Postgres => Some("public".into()),
             Driver::Sqlite => Some("main".into()),
+            Driver::SqlServer => Some("dbo".into()),
             Driver::Mysql => {
                 let db = match self.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
                     Some(u) => decode(u.path().trim_start_matches('/')),

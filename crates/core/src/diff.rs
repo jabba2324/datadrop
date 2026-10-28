@@ -109,6 +109,15 @@ fn split_ddl(ddl: &str) -> Vec<String> {
         if line.starts_with("DELIMITER") {
             continue;
         }
+        // SQL Server's batch separator ends the statement before it.
+        if line.trim().eq_ignore_ascii_case("GO") {
+            let s = cur.trim().trim_end_matches(';').to_owned();
+            if !s.is_empty() {
+                out.push(s);
+            }
+            cur.clear();
+            continue;
+        }
         cur.push_str(line);
         cur.push('\n');
         let t = line.trim_end();
@@ -142,6 +151,11 @@ fn alter_table(
     if old.name != new.name {
         m.push(match d {
             Dialect::Mysql => format!("RENAME TABLE {name} TO {}", qualified(schema, &new.name, d)),
+            Dialect::SqlServer => format!(
+                "EXEC sp_rename {}, {}",
+                literal(Some(&name), d),
+                literal(Some(&new.name), d)
+            ),
             _ => format!("ALTER TABLE {name} RENAME TO {}", quote_ident(&new.name, d)),
         });
         name = qualified(schema, &new.name, d);
@@ -197,15 +211,26 @@ fn alter_table(
     // Columns.
     for (o, n) in renamed {
         if old.column(o).is_some() && new.column(n).is_some() && o != n {
-            m.push(format!(
-                "ALTER TABLE {name} RENAME COLUMN {} TO {}",
-                quote_ident(o, d),
-                quote_ident(n, d)
-            ));
+            m.push(if d == Dialect::SqlServer {
+                format!(
+                    "EXEC sp_rename {}, {}, N'COLUMN'",
+                    literal(Some(&format!("{name}.{}", quote_ident(o, d))), d),
+                    literal(Some(n), d)
+                )
+            } else {
+                format!(
+                    "ALTER TABLE {name} RENAME COLUMN {} TO {}",
+                    quote_ident(o, d),
+                    quote_ident(n, d)
+                )
+            });
         }
     }
     for c in &old.columns {
         if !kept.contains(&c.name) {
+            if d == Dialect::SqlServer && c.default.is_some() {
+                m.push(drop_default(&name, &c.name));
+            }
             m.push(format!(
                 "ALTER TABLE {name} DROP COLUMN {}",
                 quote_ident(&c.name, d)
@@ -216,7 +241,11 @@ fn alter_table(
         let before = old.column(&was(&c.name));
         match before {
             None => {
-                let mut add = format!("ALTER TABLE {name} ADD COLUMN {}", column_sql(c, d));
+                let mut add = if d == Dialect::SqlServer {
+                    format!("ALTER TABLE {name} ADD {}", column_sql(c, d))
+                } else {
+                    format!("ALTER TABLE {name} ADD COLUMN {}", column_sql(c, d))
+                };
                 if d == Dialect::Mysql {
                     add.push_str(&match pos {
                         0 => " FIRST".to_owned(),
@@ -353,8 +382,73 @@ fn alter_column(m: &mut Migration, table: &str, b: &ColumnModel, c: &ColumnModel
                 ));
             }
         }
+        Dialect::SqlServer => {
+            if b.generated != c.generated {
+                m.push(format!("ALTER TABLE {table} DROP COLUMN {col}"));
+                m.push(format!("ALTER TABLE {table} ADD {}", column_sql(c, d)));
+                m.note(format!(
+                    "{} is dropped and added again to change how it's computed",
+                    c.name
+                ));
+                return;
+            }
+            if b.identity != c.identity {
+                m.note(format!(
+                    "SQL Server can't add or remove IDENTITY on {}: recreate the column for that",
+                    c.name
+                ));
+            }
+            if b.data_type != c.data_type || b.nullable != c.nullable {
+                m.push(format!(
+                    "ALTER TABLE {table} ALTER COLUMN {col} {} {}NULL",
+                    c.data_type,
+                    if c.nullable { "" } else { "NOT " }
+                ));
+                if b.data_type != c.data_type {
+                    m.note(format!(
+                        "changing {}'s type converts its values; it fails if they don't convert",
+                        c.name
+                    ));
+                }
+            }
+            if b.default != c.default {
+                if b.default.is_some() {
+                    m.push(drop_default(table, &c.name));
+                }
+                if let Some(v) = &c.default {
+                    let bare = table.rsplit('.').next().unwrap_or(table);
+                    let constraint = format!("DF_{}_{}", bare.trim_matches(['[', ']']), c.name);
+                    m.push(format!(
+                        "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT {v} FOR {col}",
+                        quote_ident(&constraint, d)
+                    ));
+                }
+            }
+            if b.comment != c.comment {
+                m.note(format!(
+                    "column descriptions (like {}'s) are changed with sp_updateextendedproperty",
+                    c.name
+                ));
+            }
+        }
         Dialect::Sqlite => unreachable!("SQLite changes columns by rebuilding the table"),
     }
+}
+
+/// SQL Server keeps a column's default as a constraint with a generated name: find it
+/// and drop it.
+fn drop_default(table: &str, column: &str) -> String {
+    let d = Dialect::SqlServer;
+    format!(
+        "DECLARE @df sysname = (SELECT dc.name FROM sys.default_constraints dc \
+         JOIN sys.columns c ON c.object_id = dc.parent_object_id \
+         AND c.column_id = dc.parent_column_id \
+         WHERE dc.parent_object_id = OBJECT_ID({}) AND c.name = {}); \
+         IF @df IS NOT NULL EXEC (N'ALTER TABLE {} DROP CONSTRAINT ' + QUOTENAME(@df))",
+        literal(Some(table), d),
+        literal(Some(column), d),
+        table.replace('\'', "''")
+    )
 }
 
 /// Whether SQLite needs the table rebuilt: it can only rename, add and drop columns
@@ -529,7 +623,9 @@ fn add_constraint(table: &str, c: &Constraint, d: Dialect) -> String {
 
 fn drop_index(schema: &str, table: &str, index: &str, d: Dialect) -> String {
     match d {
-        Dialect::Mysql => format!("DROP INDEX {} ON {table}", quote_ident(index, d)),
+        Dialect::Mysql | Dialect::SqlServer => {
+            format!("DROP INDEX {} ON {table}", quote_ident(index, d))
+        }
         _ => format!("DROP INDEX {}", qualified(schema, index, d)),
     }
 }

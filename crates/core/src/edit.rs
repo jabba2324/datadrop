@@ -105,6 +105,8 @@ impl Edits {
 pub fn literal(value: Option<&str>, dialect: Dialect) -> String {
     match value {
         None => "NULL".into(),
+        // N'...', so text outside the database's code page survives.
+        Some(v) if dialect == Dialect::SqlServer => format!("N'{}'", v.replace('\'', "''")),
         Some(v) => {
             let mut s = v.replace('\'', "''");
             if dialect == Dialect::Mysql {

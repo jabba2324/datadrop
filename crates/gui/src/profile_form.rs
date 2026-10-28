@@ -418,6 +418,7 @@ impl ProfileForm {
                     let hint = match self.driver {
                         Driver::Postgres => "postgres://user@host:5432/database",
                         Driver::Mysql | Driver::Sqlite => "mysql://user@host:3306/database",
+                        Driver::SqlServer => "sqlserver://user@host:1433/database",
                     };
                     wide(ui, "URL", &mut self.url, hint);
                     // Pick the driver from the URL as it's typed.

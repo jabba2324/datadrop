@@ -164,7 +164,7 @@ enum Cmd {
     /// keywords in capitals. Nothing is run.
     Format {
         file: Option<PathBuf>,
-        /// The SQL dialect: postgres, mysql or sqlite.
+        /// The SQL dialect: postgres, mysql, sqlite or sqlserver.
         #[arg(long, default_value = "postgres")]
         driver: Driver,
         /// Rewrite the file instead of printing.
@@ -312,7 +312,7 @@ enum ProfileCmd {
 
 #[derive(Args, Default)]
 struct ProfileFields {
-    /// postgres, mysql or sqlite (default: from --url, else postgres).
+    /// postgres, mysql, sqlite or sqlserver (default: from --url, else postgres).
     #[arg(long)]
     driver: Option<Driver>,
     /// A connection URL, e.g. postgres://user@host:5432/db or sqlite:data.db. Its

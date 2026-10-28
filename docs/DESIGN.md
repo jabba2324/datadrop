@@ -164,25 +164,23 @@ egui crates move together, when those do (Dependabot is set up to hold them back
 
 ## SQL Server
 
-Not supported yet. The candidates for a driver, as of late 2026:
+Through Microsoft's `mssql-tds` (behind the `sqlserver` feature, on by default; on
+Linux it uses OpenSSL, built from source with `openssl/vendored` so binaries don't need
+the system's). `crates/core/src/mssql.rs` connects (`sqlserver://user@host:1433/db`
+URLs, or the fields; SSL modes map onto its encryption settings, and a CA certificate
+is the server's own certificate, matched exactly), runs batches and writes its typed
+values as SQL Server's tools show them (dates, `datetimeoffset` at its offset, money,
+`uniqueidentifier`, binary as `0x…`).
 
-- **`mssql-tds`** (crate; repo `microsoft/mssql-rs`, MIT): Microsoft's own TDS
-  implementation in Rust, the core of their new Python, Node and ODBC drivers. It
-  streams rows, exposes column metadata, can cancel a running statement (TDS
-  attention), and supports Azure AD and integrated (Kerberos/SSPI) sign-in. It's
-  pre-1.0 (0.3) and moving fast, uses `native-tls` (OpenSSL on Linux, so release
-  builds would depend on the system's libssl), and enables integrated auth by
-  default (turn off default features). The best long-term bet.
-- **`tiberius`**: the established TDS crate (0.12/0.13, widely used, rustls or
-  native-tls). Maintenance has slowed and it can't cancel a running query.
-- **`mssql`**: a new (2026) fork of tiberius focused on maintenance; too young to judge.
-
-Fitting it in means a fourth driver beside sqlx: values come typed rather than as
-text, so they need formatting for display (dates, decimals, GUIDs, binary), and the
-schema queries and plan parsing (`SET SHOWPLAN_XML`) need T-SQL versions. A `Driver`
-behind a Cargo feature would keep the OpenSSL dependency optional.
+Scripts run batch by batch, split at `GO` lines (`sql::batches`), so variables live
+through a batch and every result set it returns is shown; the statement under the
+cursor is still found by `;`. Stop sends the attention signal on the session's own
+connection. Plans come from `SHOWPLAN_ALL` (estimated) or `STATISTICS PROFILE` (after
+running), which are rows with `NodeId` and `Parent`. The schema model is read from the
+`sys` catalog views; DDL puts views, routines and triggers in batches of their own;
+table changes use `sp_rename`, `ALTER COLUMN` (type and nullability together) and named
+default constraints. The browsing "pool" is one shared connection.
 
 ## Next
 
 - macOS `.app` bundle with notarisation; Windows installer; Linux packages.
-- SQL Server (see above).

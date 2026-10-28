@@ -139,6 +139,22 @@ fn common_types(d: Dialect) -> &'static [&'static str] {
             "blob",
         ],
         Dialect::Sqlite => &["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"],
+        Dialect::SqlServer => &[
+            "int",
+            "bigint",
+            "smallint",
+            "decimal(10,2)",
+            "float",
+            "bit",
+            "nvarchar(255)",
+            "nvarchar(max)",
+            "varchar(255)",
+            "date",
+            "datetime2",
+            "datetimeoffset",
+            "uniqueidentifier",
+            "varbinary(max)",
+        ],
     }
 }
 
@@ -174,6 +190,7 @@ impl TableEditor {
                         Dialect::Postgres => "bigint",
                         Dialect::Mysql => "bigint",
                         Dialect::Sqlite => "INTEGER",
+                        Dialect::SqlServer => "bigint",
                     }
                     .into(),
                     primary_key: true,
@@ -326,6 +343,7 @@ impl TableEditor {
                 _ => Constraint {
                     name: old_pk.map(|k| k.name.clone()).unwrap_or_else(|| match d {
                         Dialect::Mysql => "PRIMARY".into(),
+                        Dialect::SqlServer => format!("PK_{name}"),
                         _ => format!("{name}_pkey"),
                     }),
                     kind: ConstraintKind::PrimaryKey,

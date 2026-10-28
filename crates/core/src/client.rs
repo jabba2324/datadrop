@@ -610,7 +610,8 @@ impl Client {
         cancel: &CancellationToken,
     ) -> Result<QueryOutput> {
         let dialect = Dialect::from(profile.driver);
-        let statements = sql::split_statements(sql, dialect);
+        // Statement by statement (SQL Server: batch by batch).
+        let statements = sql::batches(sql, dialect);
         if statements.is_empty() {
             return Err(CoreError::Invalid("there's no SQL to run".into()));
         }
@@ -632,27 +633,33 @@ impl Client {
             let first = sql::first_keyword(&sql[statements[0].clone()], dialect);
             let begins = matches!(first.as_deref(), Some("BEGIN" | "START"));
             if !live.in_transaction && !begins {
-                let begin = match dialect {
-                    Dialect::Mysql => "START TRANSACTION",
-                    _ => "BEGIN",
-                };
-                cancellable(cancel, live.run(begin, 0)).await?;
+                cancellable(cancel, live.run(sql::begin(dialect), 0)).await?;
                 live.in_transaction = true;
             }
         }
         for (index, range) in statements.into_iter().enumerate() {
             let text = &sql[range];
             let live = guard.as_mut().expect("connected above");
+            let interrupt = live.interrupter();
             // Boxed so it can be dropped (ending its borrow of the session) on cancel.
-            let mut run = Box::pin(live.run(text, max_rows));
-            let outcome = tokio::select! {
+            let mut run = Box::pin(live.run_batch(text, max_rows));
+            let mut outcome = tokio::select! {
                 r = &mut run => Some(r),
                 _ = cancel.cancelled() => None,
             };
+            // SQL Server is told on the same connection, and the request ends.
+            if outcome.is_none()
+                && let Some(stop) = interrupt
+            {
+                stop();
+                outcome = Some(run.as_mut().await);
+            }
             drop(run);
             let result = match outcome {
-                Some(r) => r,
-                None => {
+                Some(Err(CoreError::Cancelled)) | None => {
+                    if interrupt_missing(&guard) {
+                        stop_and_settle(&mut guard).await;
+                    }
                     stop_and_settle(&mut guard).await;
                     out.cancelled = true;
                     out.error = Some(StatementError {
@@ -662,13 +669,16 @@ impl Client {
                     });
                     break;
                 }
+                Some(r) => r,
             };
             match result {
-                Ok(r) => {
+                Ok(results) => {
                     let live = guard.as_mut().expect("connected above");
-                    live.in_transaction =
-                        sql::transaction_after(live.in_transaction, text, dialect);
-                    out.results.push(r);
+                    for st in sql::split_statements(text, dialect) {
+                        live.in_transaction =
+                            sql::transaction_after(live.in_transaction, &text[st], dialect);
+                    }
+                    out.results.extend(results);
                 }
                 Err(e) => {
                     if is_connection_lost(&e) {
@@ -747,11 +757,7 @@ impl Client {
         }
         let via = cancellable(cancel, self.via(profile)).await?;
         let mut s = cancellable(cancel, Session::connect(profile, via)).await?;
-        let begin = if profile.driver == Driver::Mysql {
-            "START TRANSACTION"
-        } else {
-            "BEGIN"
-        };
+        let begin = sql::begin(profile.driver.into());
         let result = async {
             s.run(begin, 1).await?;
             for (i, st) in statements.iter().enumerate() {
@@ -827,11 +833,7 @@ impl Client {
     ) -> Result<()> {
         let via = cancellable(cancel, self.via(profile)).await?;
         let mut s = cancellable(cancel, Session::connect(profile, via)).await?;
-        let begin = if profile.driver == Driver::Mysql {
-            "START TRANSACTION"
-        } else {
-            "BEGIN"
-        };
+        let begin = sql::begin(profile.driver.into());
         let mut result = cancellable(cancel, s.run(begin, 0)).await.map(|_| ());
         for (i, st) in statements.iter().enumerate() {
             if result.is_err() {
@@ -878,11 +880,7 @@ impl Client {
             // It changes data: run it in a transaction that's rolled back, on its own
             // connection.
             let mut s = cancellable(cancel, Session::connect(profile, None)).await?;
-            let begin = if profile.driver == Driver::Mysql {
-                "START TRANSACTION"
-            } else {
-                "BEGIN"
-            };
+            let begin = sql::begin(profile.driver.into());
             let result = async {
                 s.run(begin, 1).await?;
                 cancellable(cancel, s.explain(statement, true)).await
@@ -1016,6 +1014,12 @@ impl Client {
 
 /// After cancelling a statement: ask the database to stop it, then let it finish
 /// failing so the session is usable again (or drop the session if that fails).
+/// Whether the session needs stopping from outside (it has no way to be told on its
+/// own connection, as SQL Server does).
+fn interrupt_missing(guard: &Option<Session>) -> bool {
+    guard.as_ref().is_some_and(|s| s.interrupter().is_none())
+}
+
 async fn stop_and_settle(guard: &mut Option<Session>) {
     let Some(live) = guard.as_mut() else { return };
     let cancelled = live.cancel_running().await;

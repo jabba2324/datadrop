@@ -1,5 +1,5 @@
 //! A small SQL lexer: enough to highlight SQL, split a script into statements and
-//! find the statement under the cursor, for PostgreSQL and MySQL.
+//! find the statement under the cursor, for PostgreSQL, MySQL, SQLite and SQL Server.
 //!
 //! It never fails: anything unrecognised becomes an operator token, and an
 //! unterminated string or comment runs to the end of the text.
@@ -13,6 +13,8 @@ pub enum Dialect {
     Postgres,
     Mysql,
     Sqlite,
+    /// T-SQL.
+    SqlServer,
 }
 
 impl From<Driver> for Dialect {
@@ -21,6 +23,7 @@ impl From<Driver> for Dialect {
             Driver::Postgres => Self::Postgres,
             Driver::Mysql => Self::Mysql,
             Driver::Sqlite => Self::Sqlite,
+            Driver::SqlServer => Self::SqlServer,
         }
     }
 }
@@ -131,13 +134,37 @@ impl Lexer<'_> {
                     self.quoted(b'`', false);
                     self.push(TokenKind::QuotedIdentifier, start);
                 }
-                b'[' if self.dialect == Dialect::Sqlite => {
-                    // [name], as in SQL Server; no escapes inside.
-                    match self.s[self.i..].find(']') {
-                        Some(end) => self.i += end + 1,
-                        None => self.i = self.b.len(),
-                    }
+                b'[' if matches!(self.dialect, Dialect::Sqlite | Dialect::SqlServer) => {
+                    // [name]; SQL Server doubles a ] inside.
+                    self.quoted(b']', false);
                     self.push(TokenKind::QuotedIdentifier, start);
+                }
+                b'N' | b'n'
+                    if self.dialect == Dialect::SqlServer
+                        && self.peek(1) == Some(b'\'')
+                        && !self.prev_is_ident_char() =>
+                {
+                    // N'unicode text'.
+                    self.i += 1;
+                    self.quoted(b'\'', false);
+                    self.push(TokenKind::String, start);
+                }
+                // @variable, @@rowcount, #temp, ##global: names, not placeholders.
+                b'@' | b'#'
+                    if self.dialect == Dialect::SqlServer
+                        && self.s[self.i..]
+                            .trim_start_matches(['@', '#'])
+                            .chars()
+                            .next()
+                            .is_some_and(is_ident_start) =>
+                {
+                    while self.i < self.b.len() && matches!(self.b[self.i], b'@' | b'#') {
+                        self.i += 1;
+                    }
+                    while self.i < self.b.len() && is_ident_char(self.char_here()) {
+                        self.i += self.char_here().len_utf8();
+                    }
+                    self.push(TokenKind::Identifier, start);
                 }
                 b'?' | b':' | b'@' | b'$'
                     if self.dialect == Dialect::Sqlite
@@ -229,7 +256,7 @@ impl Lexer<'_> {
     /// MySQL needs whitespace (or the end) after `--` for it to be a comment.
     fn line_comment_dash_ok(&self) -> bool {
         match self.dialect {
-            Dialect::Postgres | Dialect::Sqlite => true,
+            Dialect::Postgres | Dialect::Sqlite | Dialect::SqlServer => true,
             Dialect::Mysql => match self.s.get(self.i + 2..) {
                 Some(rest) => rest.chars().next().is_none_or(|c| c.is_whitespace()),
                 None => true,
@@ -437,6 +464,7 @@ const KEYWORDS: &[&str] = &[
     "ENUM",
     "ESCAPE",
     "EXCEPT",
+    "EXEC",
     "EXECUTE",
     "EXISTS",
     "EXPLAIN",
@@ -451,9 +479,11 @@ const KEYWORDS: &[&str] = &[
     "FROM",
     "FULL",
     "FUNCTION",
+    "GO",
     "GRANT",
     "GROUP",
     "HAVING",
+    "IDENTITY",
     "IF",
     "ILIKE",
     "IN",
@@ -482,20 +512,25 @@ const KEYWORDS: &[&str] = &[
     "MATERIALIZED",
     "MERGE",
     "NATURAL",
+    "NOLOCK",
     "NOT",
     "NOTHING",
     "NULL",
     "NULLS",
     "NUMERIC",
+    "NVARCHAR",
     "OFFSET",
     "ON",
     "ONLY",
     "OR",
     "ORDER",
     "OUTER",
+    "OUTPUT",
     "OVER",
     "PARTITION",
+    "PIVOT",
     "PRIMARY",
+    "PRINT",
     "PROCEDURE",
     "RECURSIVE",
     "REFERENCES",
@@ -533,7 +568,9 @@ const KEYWORDS: &[&str] = &[
     "TIMESTAMPTZ",
     "TINYINT",
     "TO",
+    "TOP",
     "TRAILING",
+    "TRAN",
     "TRANSACTION",
     "TRIGGER",
     "TRUE",
@@ -541,6 +578,7 @@ const KEYWORDS: &[&str] = &[
     "TYPE",
     "UNION",
     "UNIQUE",
+    "UNPIVOT",
     "UNSIGNED",
     "UPDATE",
     "USE",
@@ -575,6 +613,81 @@ pub fn split_statements(text: &str, dialect: Dialect) -> Vec<Range<usize>> {
     if dialect == Dialect::Mysql && text.to_ascii_uppercase().contains("DELIMITER") {
         return split_with_delimiters(text);
     }
+    if dialect == Dialect::SqlServer {
+        // Statements within each GO batch.
+        return go_batches(text)
+            .into_iter()
+            .flat_map(|b| {
+                split_semicolons(&text[b.clone()], dialect)
+                    .into_iter()
+                    .map(move |r| r.start + b.start..r.end + b.start)
+            })
+            .collect();
+    }
+    split_semicolons(text, dialect)
+}
+
+/// What runs as one request: a statement each, except on SQL Server, where it's a
+/// batch (up to a `GO` line), so variables declared in it last through it.
+pub fn batches(text: &str, dialect: Dialect) -> Vec<Range<usize>> {
+    if dialect != Dialect::SqlServer {
+        return split_statements(text, dialect);
+    }
+    go_batches(text)
+        .into_iter()
+        .filter_map(|b| {
+            // Trimmed to its statements; nothing but comments isn't a batch.
+            let stmts = split_semicolons(&text[b.clone()], dialect);
+            let first = stmts.first()?.start + b.start;
+            let last = stmts.last()?.end + b.start;
+            Some(first..last)
+        })
+        .collect()
+}
+
+/// The text between `GO` lines (SQL Server's batch separator, a line of its own,
+/// maybe with a count: `GO 5`).
+fn go_batches(text: &str) -> Vec<Range<usize>> {
+    let tokens = tokenize(text, Dialect::SqlServer);
+    let mut out = vec![];
+    let mut start = 0;
+    for (i, t) in tokens.iter().enumerate() {
+        if !text[t.range.clone()].eq_ignore_ascii_case("GO") {
+            continue;
+        }
+        let line_start = text[..t.range.start].rfind('\n').map_or(0, |n| n + 1);
+        if !text[line_start..t.range.start].trim().is_empty() {
+            continue;
+        }
+        // Only a count or a comment may follow on its line.
+        let mut end = t.range.end;
+        let mut alone = true;
+        for u in &tokens[i + 1..] {
+            let s = &text[u.range.clone()];
+            match u.kind {
+                TokenKind::Whitespace if s.contains('\n') => {
+                    end = u.range.start + s.find('\n').expect("checked") + 1;
+                    break;
+                }
+                TokenKind::Whitespace | TokenKind::Number | TokenKind::Comment => {
+                    end = u.range.end;
+                }
+                _ => {
+                    alone = false;
+                    break;
+                }
+            }
+        }
+        if alone {
+            out.push(start..line_start);
+            start = end;
+        }
+    }
+    out.push(start..text.len());
+    out
+}
+
+fn split_semicolons(text: &str, dialect: Dialect) -> Vec<Range<usize>> {
     let mut out = vec![];
     let mut first: Option<usize> = None;
     let mut last_end = 0;
@@ -717,6 +830,15 @@ pub fn first_keyword(sql: &str, dialect: Dialect) -> Option<String> {
 }
 
 /// Quote an identifier for the dialect: `"a""b"` or `` `a``b` ``.
+/// The statement that begins a transaction.
+pub fn begin(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Mysql => "START TRANSACTION",
+        Dialect::SqlServer => "BEGIN TRANSACTION",
+        Dialect::Postgres | Dialect::Sqlite => "BEGIN",
+    }
+}
+
 /// Whether a transaction is open after `statement` ran (it was open before if
 /// `open`): BEGIN and START TRANSACTION open one; COMMIT, END and ROLLBACK (but not
 /// ROLLBACK TO a savepoint) close it, as do MySQL's statements that commit
@@ -731,6 +853,9 @@ pub fn transaction_after(open: bool, statement: &str, dialect: Dialect) -> bool 
     let first = words.first().map(String::as_str);
     let second = words.get(1).map(String::as_str);
     match first {
+        Some("BEGIN") if dialect == Dialect::SqlServer => {
+            open || matches!(second, Some("TRAN" | "TRANSACTION"))
+        }
         Some("BEGIN") => true,
         Some("START") => second == Some("TRANSACTION") || open,
         Some("COMMIT" | "END") => false,
@@ -780,6 +905,7 @@ pub fn quote_ident(name: &str, dialect: Dialect) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
         Dialect::Mysql => format!("`{}`", name.replace('`', "``")),
+        Dialect::SqlServer => format!("[{}]", name.replace(']', "]]")),
     }
 }
 
@@ -904,6 +1030,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sql_server_batches() {
+        use TokenKind::*;
+        let script = "declare @x int = 1;\nselect @x as [a]]b], N'it''s' -- go\nGO\n\
+                      /* GO */ select 2; select '\nGO\n'\ngo 3\n-- just a comment\nGO\n";
+        let b: Vec<&str> = batches(script, SqlServer)
+            .into_iter()
+            .map(|r| &script[r])
+            .collect();
+        assert_eq!(
+            b,
+            [
+                "declare @x int = 1;\nselect @x as [a]]b], N'it''s' -- go",
+                "/* GO */ select 2; select '\nGO\n'",
+            ]
+        );
+        assert_eq!(split_statements(script, SqlServer).len(), 4);
+        let k = kinds("select @x, @@rowcount, #t, [n], N'x', ?", SqlServer);
+        assert!(k.contains(&(Identifier, "@x")));
+        assert!(k.contains(&(Identifier, "#t")));
+        assert!(k.contains(&(QuotedIdentifier, "[n]")));
+        assert!(k.contains(&(String, "N'x'")));
+        assert_eq!(quote_ident("a]b", SqlServer), "[a]]b]");
     }
 
     #[test]

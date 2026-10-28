@@ -18,6 +18,8 @@ pub mod format;
 pub mod history;
 pub mod import;
 pub mod keychain;
+#[cfg(feature = "sqlserver")]
+pub mod mssql;
 pub mod params;
 pub mod plan;
 pub mod profile;

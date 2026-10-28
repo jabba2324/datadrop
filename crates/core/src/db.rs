@@ -227,6 +227,8 @@ enum Conn {
     Pg(PgConnection),
     My(MySqlConnection),
     Lite(SqliteConnection),
+    #[cfg(feature = "sqlserver")]
+    Ms(Box<crate::mssql::MsConn>),
 }
 
 /// How to stop a running statement.
@@ -236,6 +238,9 @@ enum Stopper {
     Server { via: Endpoint, id: u64 },
     /// SQLite checks this flag every few thousand steps and stops when it's set.
     Flag(Arc<AtomicBool>),
+    /// SQL Server's attention signal, sent on the session's own connection.
+    #[cfg(feature = "sqlserver")]
+    Tds(crate::mssql::CancelSlot),
 }
 
 macro_rules! run_text {
@@ -400,6 +405,14 @@ impl Session {
                     .set_progress_handler(10_000, move || !check.load(Ordering::Relaxed));
                 (Conn::Lite(c), Stopper::Flag(flag))
             }
+            #[cfg(feature = "sqlserver")]
+            Driver::SqlServer => {
+                let c = timed_ms(crate::mssql::connect(profile, &via)).await?;
+                let slot = c.cancel.clone();
+                (Conn::Ms(Box::new(c)), Stopper::Tds(slot))
+            }
+            #[cfg(not(feature = "sqlserver"))]
+            Driver::SqlServer => return Err(no_sql_server()),
         };
         Ok(Session {
             conn,
@@ -413,6 +426,16 @@ impl Session {
         self.profile.driver.into()
     }
 
+    /// Run what `sql::batches` makes one request: every result it returns. (One,
+    /// except for a SQL Server batch.)
+    pub async fn run_batch(&mut self, sql: &str, max_rows: usize) -> Result<Vec<StatementResult>> {
+        #[cfg(feature = "sqlserver")]
+        if let Conn::Ms(c) = &mut self.conn {
+            return c.run_batch(sql, max_rows).await;
+        }
+        Ok(vec![self.run(sql, max_rows).await?])
+    }
+
     /// Run one statement, keeping at most `max_rows` rows of its result.
     pub async fn run(&mut self, sql: &str, max_rows: usize) -> Result<StatementResult> {
         let started = Instant::now();
@@ -420,6 +443,24 @@ impl Session {
             Conn::Pg(c) => run_text!(c, sql, max_rows, Dialect::Postgres),
             Conn::My(c) => run_text!(c, sql, max_rows, Dialect::Mysql),
             Conn::Lite(c) => run_text!(c, sql, max_rows, Dialect::Sqlite),
+            #[cfg(feature = "sqlserver")]
+            Conn::Ms(c) => {
+                // The batch's last result set (or, without one, its row counts).
+                let results = c.run_batch(sql, max_rows).await?;
+                let affected = results.iter().map(|r| r.rows_affected).sum();
+                return Ok(match results.into_iter().rev().find(|r| r.returns_rows) {
+                    Some(r) => r,
+                    None => StatementResult {
+                        sql: sql.to_owned(),
+                        returns_rows: false,
+                        columns: vec![],
+                        rows: vec![],
+                        truncated: false,
+                        rows_affected: affected,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    },
+                });
+            }
         };
         Ok(StatementResult {
             sql: sql.to_owned(),
@@ -479,6 +520,25 @@ impl Session {
                     .collect();
                 plan::parse_sqlite(&rows)
             }
+            Driver::SqlServer => {
+                // SHOWPLAN_ALL describes the plan (without running it); STATISTICS
+                // PROFILE runs the statement and adds the plan with actual rows.
+                let set = if analyze {
+                    "STATISTICS PROFILE"
+                } else {
+                    "SHOWPLAN_ALL"
+                };
+                self.run_batch(&format!("SET {set} ON"), 1).await?;
+                let r = self.run_batch(sql, 100_000).await;
+                let _ = self.run_batch(&format!("SET {set} OFF"), 1).await;
+                let results = r?;
+                let profile = results
+                    .iter()
+                    .rev()
+                    .find(|r| r.columns.iter().any(|c| c.name == "NodeId"))
+                    .ok_or_else(|| CoreError::Database("SQL Server returned no plan".into()))?;
+                plan::parse_sqlserver(profile, analyze)
+            }
         }
     }
 
@@ -493,6 +553,8 @@ impl Session {
             Conn::Pg(c) => export_text!(c, sql, w, Dialect::Postgres),
             Conn::My(c) => export_text!(c, sql, w, Dialect::Mysql),
             Conn::Lite(c) => export_text!(c, sql, w, Dialect::Sqlite),
+            #[cfg(feature = "sqlserver")]
+            Conn::Ms(c) => c.export(sql, w).await?,
         })
     }
 
@@ -501,6 +563,16 @@ impl Session {
             Conn::Pg(c) => scalar!(c, "SELECT version()").await,
             Conn::My(c) => scalar!(c, "SELECT CONCAT('MySQL ', VERSION())").await,
             Conn::Lite(c) => scalar!(c, "SELECT 'SQLite ' || sqlite_version()").await,
+            #[cfg(feature = "sqlserver")]
+            Conn::Ms(c) => {
+                let r = c.run_batch("SELECT @@VERSION", 1).await?;
+                let v = r
+                    .into_iter()
+                    .find_map(|r| r.rows.into_iter().next())
+                    .and_then(|row| row.into_iter().next().flatten())
+                    .unwrap_or_default();
+                Ok(v.lines().next().unwrap_or_default().trim().to_owned())
+            }
         }
     }
 
@@ -513,6 +585,24 @@ impl Session {
                 flag.store(true, Ordering::Relaxed);
                 Ok(())
             }
+            #[cfg(feature = "sqlserver")]
+            Stopper::Tds(slot) => {
+                crate::mssql::cancel(slot);
+                Ok(())
+            }
+        }
+    }
+
+    /// A way to stop what's running from elsewhere while it runs, for drivers that
+    /// do that on the session's own connection (SQL Server).
+    pub fn interrupter(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
+        match &self.stop {
+            #[cfg(feature = "sqlserver")]
+            Stopper::Tds(slot) => {
+                let slot = slot.clone();
+                Some(Box::new(move || crate::mssql::cancel(&slot)))
+            }
+            _ => None,
         }
     }
 
@@ -528,6 +618,11 @@ impl Session {
             Conn::Pg(c) => c.close().await,
             Conn::My(c) => c.close().await,
             Conn::Lite(c) => c.close().await,
+            #[cfg(feature = "sqlserver")]
+            Conn::Ms(c) => {
+                c.close().await;
+                Ok(())
+            }
         };
     }
 }
@@ -555,9 +650,21 @@ async fn cancel_on_server(profile: &Profile, via: &Endpoint, server_id: u64) -> 
                 .await?;
             let _ = c.close().await;
         }
-        Driver::Sqlite => {}
+        Driver::Sqlite | Driver::SqlServer => {}
     }
     Ok(())
+}
+
+#[cfg(not(feature = "sqlserver"))]
+fn no_sql_server() -> CoreError {
+    CoreError::Invalid("this DataDrop was built without SQL Server support".into())
+}
+
+#[cfg(feature = "sqlserver")]
+async fn timed_ms<T>(f: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(CONNECT_TIMEOUT, f)
+        .await
+        .map_err(|_| CoreError::Database("timed out connecting to SQL Server".into()))?
 }
 
 /// A small connection pool for browsing the schema, so that never waits behind a
@@ -567,6 +674,34 @@ pub enum MetaPool {
     Pg(PgPool),
     My(MySqlPool),
     Lite(SqlitePool),
+    /// One shared connection, opened when first needed.
+    #[cfg(feature = "sqlserver")]
+    Ms(Arc<MsMeta>),
+}
+
+#[cfg(feature = "sqlserver")]
+pub struct MsMeta {
+    profile: Profile,
+    via: Endpoint,
+    conn: tokio::sync::Mutex<Option<crate::mssql::MsConn>>,
+}
+
+/// The type of a SQL Server column as it's written (`nvarchar(50)`, `decimal(10,2)`),
+/// from `sys.columns c` joined to `sys.types tp`.
+#[cfg(feature = "sqlserver")]
+pub(crate) const MS_TYPE: &str = "CASE \
+    WHEN tp.name IN ('varchar', 'char', 'varbinary', 'binary') THEN tp.name + '(' + \
+      CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length AS varchar(10)) END + ')' \
+    WHEN tp.name IN ('nvarchar', 'nchar') THEN tp.name + '(' + \
+      CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length / 2 AS varchar(10)) END + ')' \
+    WHEN tp.name IN ('decimal', 'numeric') THEN tp.name + '(' + CAST(c.precision AS varchar(10)) \
+      + ',' + CAST(c.scale AS varchar(10)) + ')' \
+    WHEN tp.name IN ('datetime2', 'time', 'datetimeoffset') AND c.scale <> 7 \
+      THEN tp.name + '(' + CAST(c.scale AS varchar(10)) + ')' \
+    ELSE tp.name END";
+
+fn arr<const N: usize>(r: Vec<Option<String>>) -> [Option<String>; N] {
+    std::array::from_fn(|i| r.get(i).cloned().flatten())
 }
 
 /// Text of column `i`, for metadata queries that cast everything to text.
@@ -605,6 +740,14 @@ impl MetaPool {
                     .idle_timeout(Duration::from_secs(300))
                     .connect_lazy_with(lite_options(profile)?),
             ),
+            #[cfg(feature = "sqlserver")]
+            Driver::SqlServer => MetaPool::Ms(Arc::new(MsMeta {
+                profile: profile.clone(),
+                via,
+                conn: tokio::sync::Mutex::default(),
+            })),
+            #[cfg(not(feature = "sqlserver"))]
+            Driver::SqlServer => return Err(no_sql_server()),
         })
     }
 
@@ -627,6 +770,31 @@ impl MetaPool {
             MetaPool::Pg(p) => rows!(p),
             MetaPool::My(p) => rows!(p),
             MetaPool::Lite(p) => rows!(p),
+            #[cfg(feature = "sqlserver")]
+            MetaPool::Ms(m) => {
+                // Parameters are @p1, @p2... written in as literals.
+                let mut sql = sql.to_owned();
+                for (i, b) in binds.iter().enumerate().rev() {
+                    sql = sql.replace(&format!("@p{}", i + 1), &crate::mssql::literal(b));
+                }
+                let mut guard = m.conn.lock().await;
+                if guard.is_none() {
+                    *guard = Some(timed_ms(crate::mssql::connect(&m.profile, &m.via)).await?);
+                }
+                let c = guard.as_mut().expect("connected above");
+                match c.run_batch(&sql, usize::MAX).await {
+                    Ok(results) => results
+                        .into_iter()
+                        .find(|r| r.returns_rows)
+                        .map(|r| r.rows)
+                        .unwrap_or_default(),
+                    Err(e) => {
+                        // Start again next time.
+                        guard.take();
+                        return Err(e);
+                    }
+                }
+            }
         })
     }
 
@@ -635,6 +803,8 @@ impl MetaPool {
             MetaPool::Pg(_) => Driver::Postgres,
             MetaPool::My(_) => Driver::Mysql,
             MetaPool::Lite(_) => Driver::Sqlite,
+            #[cfg(feature = "sqlserver")]
+            MetaPool::Ms(_) => Driver::SqlServer,
         }
     }
 
@@ -667,12 +837,23 @@ impl MetaPool {
             .iter()
             .filter_map(|r| text_col(r, 0))
             .collect(),
+            #[cfg(feature = "sqlserver")]
+            MetaPool::Ms(_) => self
+                .text_rows(
+                    "SELECT name FROM sys.schemas WHERE schema_id < 16384 \
+                     AND name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') ORDER BY name",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .filter_map(|r| r.into_iter().next().flatten())
+                .collect(),
         })
     }
 
     pub async fn tables(&self, schema: &str) -> Result<Vec<TableInfo>> {
         let kind = |k: Option<String>| match k.as_deref() {
-            Some("v" | "VIEW" | "SYSTEM VIEW" | "view") => TableKind::View,
+            Some("v" | "V" | "VIEW" | "SYSTEM VIEW" | "view") => TableKind::View,
             Some("m") => TableKind::MaterializedView,
             Some("f") => TableKind::ForeignTable,
             _ => TableKind::Table,
@@ -715,6 +896,22 @@ impl MetaPool {
                     .map(|r| (text_col(r, 0), text_col(r, 1)))
                     .collect()
             }
+            #[cfg(feature = "sqlserver")]
+            MetaPool::Ms(_) => self
+                .text_rows(
+                    "SELECT o.name, RTRIM(o.type) FROM sys.objects o \
+                     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+                     WHERE s.name = @p1 AND o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+                     ORDER BY o.name",
+                    &[schema],
+                )
+                .await?
+                .into_iter()
+                .map(|r| {
+                    let [a, b] = arr(r);
+                    (a, b)
+                })
+                .collect(),
         };
         Ok(rows
             .into_iter()
@@ -775,6 +972,26 @@ impl MetaPool {
             .iter()
             .map(|r| std::array::from_fn(|i| text_col(r, i)))
             .collect(),
+            #[cfg(feature = "sqlserver")]
+            MetaPool::Ms(_) => self
+                .text_rows(
+                    &format!(
+                        "SELECT c.name, {MS_TYPE}, CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END, \
+                         OBJECT_DEFINITION(c.default_object_id), \
+                         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic \
+                           ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+                           WHERE i.object_id = c.object_id AND i.is_primary_key = 1 \
+                           AND ic.column_id = c.column_id) THEN 'YES' ELSE 'NO' END \
+                         FROM sys.columns c JOIN sys.types tp ON tp.user_type_id = c.user_type_id \
+                         WHERE c.object_id = OBJECT_ID(QUOTENAME(@p1) + '.' + QUOTENAME(@p2)) \
+                         ORDER BY c.column_id"
+                    ),
+                    &[schema, table],
+                )
+                .await?
+                .into_iter()
+                .map(arr)
+                .collect(),
         };
         Ok(rows
             .into_iter()
@@ -831,6 +1048,20 @@ impl MetaPool {
             .iter()
             .map(|r| std::array::from_fn(|i| text_col(r, i)))
             .collect(),
+            #[cfg(feature = "sqlserver")]
+            MetaPool::Ms(_) => self
+                .text_rows(
+                    "SELECT TOP 100000 s.name, o.name, RTRIM(o.type), c.name FROM sys.objects o \
+                     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+                     LEFT JOIN sys.columns c ON c.object_id = o.object_id \
+                     WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0 \
+                     ORDER BY s.name, o.name, c.column_id",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(arr)
+                .collect(),
         };
         let mut out: Vec<CatalogTable> = vec![];
         for [schema, table, kind, column] in rows {
@@ -843,7 +1074,7 @@ impl MetaPool {
             if !same {
                 let view = matches!(
                     kind.as_deref(),
-                    Some("v" | "m" | "VIEW" | "SYSTEM VIEW" | "view")
+                    Some("v" | "m" | "V" | "VIEW" | "SYSTEM VIEW" | "view")
                 );
                 out.push(CatalogTable {
                     schema,
@@ -864,6 +1095,12 @@ impl MetaPool {
             MetaPool::Pg(p) => p.close().await,
             MetaPool::My(p) => p.close().await,
             MetaPool::Lite(p) => p.close().await,
+            #[cfg(feature = "sqlserver")]
+            MetaPool::Ms(m) => {
+                if let Some(c) = m.conn.lock().await.take() {
+                    c.close().await;
+                }
+            }
         }
     }
 }

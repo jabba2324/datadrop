@@ -6,8 +6,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = ["sqlserver"]
+# SQL Server, through Microsoft's mssql-tds (which brings OpenSSL on Linux; built from
+# source, so the binary doesn't need the system's).
+sqlserver = ["dep:mssql-tds", "dep:openssl"]
+
 [dependencies]
 csv.workspace = true
+mssql-tds = { workspace = true, optional = true }
 futures.workspace = true
 keyring-core.workspace = true
 russh.workspace = true
@@ -28,6 +35,7 @@ windows-native-keyring-store = { version = "1", default-features = false }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

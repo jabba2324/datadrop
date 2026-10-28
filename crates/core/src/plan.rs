@@ -241,6 +241,102 @@ pub fn parse_sqlite(rows: &[(i64, i64, String)]) -> Result<Plan> {
     })
 }
 
+/// SQL Server's `SHOWPLAN_ALL` (or, after a run, `STATISTICS PROFILE`) result: a row a
+/// step, with `NodeId` and `Parent` making the tree.
+pub fn parse_sqlserver(r: &crate::db::StatementResult, analyzed: bool) -> Result<Plan> {
+    let col = |name: &str| r.columns.iter().position(|c| c.name == name);
+    let (Some(id), Some(parent)) = (col("NodeId"), col("Parent")) else {
+        return Err(bad("no NodeId and Parent columns"));
+    };
+    let get = |row: &Vec<Option<String>>, c: Option<usize>| -> Option<String> {
+        c.and_then(|c| row.get(c).cloned().flatten())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    };
+    let num = |row: &Vec<Option<String>>, c: Option<usize>| -> Option<f64> {
+        get(row, c).and_then(|s| s.parse().ok())
+    };
+    struct Step {
+        id: i64,
+        parent: i64,
+        node: PlanNode,
+    }
+    let mut steps = vec![];
+    for row in &r.rows {
+        let Some(nid) = get(row, Some(id)).and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        let pid = get(row, Some(parent))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let physical = get(row, col("PhysicalOp"));
+        let logical = get(row, col("LogicalOp"));
+        let label = match (&physical, &logical) {
+            (Some(p), Some(l)) if p != l => format!("{p} ({l})"),
+            (Some(p), _) => p.clone(),
+            (None, _) => get(row, col("StmtText")).unwrap_or_default(),
+        };
+        let mut details = vec![];
+        for (key, column) in [("Argument", "Argument"), ("Output", "OutputList")] {
+            if let Some(v) = get(row, col(column)) {
+                details.push((key.to_owned(), v));
+            }
+        }
+        steps.push(Step {
+            id: nid,
+            parent: pid,
+            node: PlanNode {
+                label,
+                details,
+                estimated_rows: num(row, col("EstimateRows")),
+                estimated_cost: num(row, col("TotalSubtreeCost")),
+                actual_rows: num(row, col("Rows")),
+                loops: num(row, col("Executes")),
+                ..PlanNode::default()
+            },
+        });
+    }
+    fn build(parent: i64, steps: &[Step]) -> Vec<PlanNode> {
+        steps
+            .iter()
+            .filter(|s| s.parent == parent && s.id != parent)
+            .map(|s| {
+                let mut n = s.node.clone();
+                n.children = build(s.id, steps);
+                n
+            })
+            .collect()
+    }
+    // The statement itself is the node no other step is the parent of... the top
+    // step's parent is 0 (and the statement row's NodeId is 1, or the plan's root).
+    let mut roots = build(0, &steps);
+    if roots.is_empty()
+        && let Some(min) = steps.iter().map(|s| s.parent).min()
+    {
+        roots = build(min, &steps);
+    }
+    if roots.is_empty() {
+        return Err(bad("no steps"));
+    }
+    let raw = r
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| v.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Plan {
+        roots,
+        analyzed,
+        raw,
+        ..Plan::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,7 @@
 # DataDrop
 
-A fast, open-source SQL client for **PostgreSQL**, **MySQL** and **SQLite**: a desktop
+A fast, open-source SQL client for **PostgreSQL**, **MySQL**, **SQLite** and **SQL
+Server**: a desktop
 app with a schema browser, a highlighted SQL editor with autocompletion and a results
 grid you can edit, plus a command line that can do everything the app can.
 
@@ -83,6 +84,7 @@ On macOS the app isn't notarised yet; the first time, right-click it and choose 
 datadrop profile add shop --url postgres://alice@db.example.com/shop --ask-password
 datadrop profile add local --driver mysql --host 127.0.0.1 --user root --database app --ask-password
 datadrop profile add notes --driver sqlite --database ./notes.db --create-if-missing
+datadrop profile add erp --url sqlserver://sa@erp.example.com:1433/sales --ask-password
 datadrop profile list
 datadrop profile test shop
 
@@ -171,7 +173,9 @@ browsing.
 ## Building from source
 
 You need Rust (stable). On Linux, the desktop app also needs the usual X11/Wayland
-development headers (`libxkbcommon`, `libwayland`, `libgl`).
+development headers (`libxkbcommon`, `libwayland`, `libgl`), and SQL Server support
+builds OpenSSL from source (it needs `perl` and `make`); leave it out with
+`cargo build --no-default-features`.
 
 ```sh
 cargo build --release
@@ -185,14 +189,17 @@ Tests:
 cargo test --workspace
 ```
 
-SQLite tests always run. The PostgreSQL and MySQL tests run when these point at
-servers you can create schemas and databases on (they're skipped otherwise):
+SQLite tests always run. The PostgreSQL, MySQL and SQL Server tests run when these
+point at servers you can create schemas and databases on (they're skipped otherwise):
 
 ```sh
 docker run -d --rm -p 5432:5432 -e POSTGRES_PASSWORD=test postgres:17
 docker run -d --rm -p 3306:3306 -e MYSQL_ROOT_PASSWORD=test mysql:8.4
 export DATADROP_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:5432/postgres
 export DATADROP_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:3306/mysql
+docker run -d --rm -p 1433:1433 -e ACCEPT_EULA=Y -e 'MSSQL_SA_PASSWORD=Test_pw_1234' \
+  mcr.microsoft.com/mssql/server:2022-latest
+export DATADROP_TEST_MSSQL_URL='sqlserver://sa:Test_pw_1234@127.0.0.1:1433/master'
 cargo test --workspace
 ```
 

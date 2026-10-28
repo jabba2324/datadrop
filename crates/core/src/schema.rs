@@ -194,7 +194,11 @@ pub fn column_list(cols: &[String], dialect: Dialect) -> String {
 
 /// A column as it's written in `CREATE TABLE` / `ADD COLUMN`.
 pub fn column_sql(c: &ColumnModel, dialect: Dialect) -> String {
-    let mut s = format!("{} {}", quote_ident(&c.name, dialect), c.data_type);
+    let mut s = quote_ident(&c.name, dialect);
+    if !c.data_type.is_empty() {
+        s.push(' ');
+        s.push_str(&c.data_type);
+    }
     if let Some(g) = &c.generated {
         s.push(' ');
         s.push_str(g);
@@ -227,8 +231,7 @@ pub fn table_ddl(schema: &str, t: &TableModel, dialect: Dialect) -> String {
     let mut out = String::new();
     if t.is_view() {
         if let Some(d) = &t.definition {
-            out.push_str(d.trim_end().trim_end_matches(';'));
-            out.push_str(";\n");
+            out.push_str(&statement(d.trim_end().trim_end_matches(';'), dialect));
         }
     } else if dialect == Dialect::Sqlite
         && let Some(d) = &t.definition
@@ -265,6 +268,29 @@ pub fn table_ddl(schema: &str, t: &TableModel, dialect: Dialect) -> String {
             }
         }
     }
+    if dialect == Dialect::SqlServer {
+        let describe = |text: &str, column: Option<&str>| {
+            let mut s = format!(
+                "EXEC sp_addextendedproperty N'MS_Description', {}, N'SCHEMA', {}, N'{}', {}",
+                literal(Some(text), dialect),
+                literal(Some(schema), dialect),
+                if t.is_view() { "VIEW" } else { "TABLE" },
+                literal(Some(&t.name), dialect)
+            );
+            if let Some(c) = column {
+                s.push_str(&format!(", N'COLUMN', {}", literal(Some(c), dialect)));
+            }
+            s + ";\n"
+        };
+        if let Some(c) = &t.comment {
+            out.push_str(&describe(c, None));
+        }
+        for col in &t.columns {
+            if let Some(c) = &col.comment {
+                out.push_str(&describe(c, Some(&col.name)));
+            }
+        }
+    }
     for tr in &t.triggers {
         out.push_str(&statement(&tr.definition, dialect));
     }
@@ -274,6 +300,10 @@ pub fn table_ddl(schema: &str, t: &TableModel, dialect: Dialect) -> String {
 /// A statement with its terminator: MySQL bodies with `;` inside need a delimiter.
 fn statement(sql: &str, dialect: Dialect) -> String {
     let sql = sql.trim_end();
+    // CREATE VIEW / PROCEDURE / FUNCTION / TRIGGER must be alone in its batch.
+    if dialect == Dialect::SqlServer {
+        return format!("GO\n{sql}\nGO\n");
+    }
     if dialect == Dialect::Mysql && sql.contains(';') {
         format!("DELIMITER $$\n{sql}$$\nDELIMITER ;\n")
     } else {
@@ -495,6 +525,7 @@ pub async fn load(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
         Driver::Postgres => load_postgres(pool, schema).await,
         Driver::Mysql => load_mysql(pool, schema).await,
         Driver::Sqlite => load_sqlite(pool, schema).await,
+        Driver::SqlServer => load_sqlserver(pool, schema).await,
     }
 }
 
@@ -1423,6 +1454,390 @@ async fn load_sqlite(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
         tables: tables.list,
         routines: vec![],
         sequences: vec![],
+    })
+}
+
+async fn load_sqlserver(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
+    let d = Dialect::SqlServer;
+    #[cfg(feature = "sqlserver")]
+    let ms_type = crate::db::MS_TYPE;
+    #[cfg(not(feature = "sqlserver"))]
+    let ms_type = "tp.name";
+    // The objects in the schema, by id.
+    const IN_SCHEMA: &str = "JOIN sys.schemas s ON s.schema_id = o.schema_id \
+        WHERE s.name = @p1 AND o.is_ms_shipped = 0";
+    let objects = pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, RTRIM(o.type), OBJECT_DEFINITION(o.object_id), \
+                 CAST(ep.value AS nvarchar(4000)) FROM sys.objects o \
+                 LEFT JOIN sys.extended_properties ep ON ep.class = 1 \
+                   AND ep.major_id = o.object_id AND ep.minor_id = 0 \
+                   AND ep.name = 'MS_Description' \
+                 {IN_SCHEMA} AND o.type IN ('U', 'V') ORDER BY o.name"
+            ),
+            &[schema],
+        )
+        .await?;
+    let mut tables = Tables::new(
+        objects
+            .iter()
+            .map(|r| {
+                let view = col(r, 1) == "V";
+                let mut t = new_table(
+                    col(r, 0),
+                    if view {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                );
+                if view {
+                    t.definition = opt(r, 2).map(|s| s.trim().to_owned());
+                }
+                t.comment = opt(r, 3);
+                t
+            })
+            .collect(),
+    );
+
+    for r in pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, c.name, {ms_type}, c.is_nullable, \
+                 OBJECT_DEFINITION(c.default_object_id), \
+                 CASE WHEN ic.column_id IS NOT NULL THEN 'IDENTITY(' + \
+                   CAST(ic.seed_value AS varchar(40)) + ',' + \
+                   CAST(ic.increment_value AS varchar(40)) + ')' END, \
+                 cc.definition, cc.is_persisted, CAST(ep.value AS nvarchar(4000)) \
+                 FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id \
+                 JOIN sys.types tp ON tp.user_type_id = c.user_type_id \
+                 LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id \
+                   AND ic.column_id = c.column_id \
+                 LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id \
+                   AND cc.column_id = c.column_id \
+                 LEFT JOIN sys.extended_properties ep ON ep.class = 1 \
+                   AND ep.major_id = c.object_id AND ep.minor_id = c.column_id \
+                   AND ep.name = 'MS_Description' \
+                 {IN_SCHEMA} AND o.type IN ('U', 'V') ORDER BY o.name, c.column_id"
+            ),
+            &[schema],
+        )
+        .await?
+    {
+        let Some(t) = tables.get(&col(&r, 0)) else {
+            continue;
+        };
+        let computed = opt(&r, 6);
+        t.columns.push(ColumnModel {
+            name: col(&r, 1),
+            // A computed column has no type of its own in its definition.
+            data_type: if computed.is_some() {
+                String::new()
+            } else {
+                col(&r, 2)
+            },
+            nullable: col(&r, 3) == "1",
+            default: opt(&r, 4),
+            identity: opt(&r, 5),
+            generated: computed.map(|c| {
+                format!(
+                    "AS {c}{}",
+                    if col(&r, 7) == "1" { " PERSISTED" } else { "" }
+                )
+            }),
+            comment: opt(&r, 8),
+        });
+    }
+
+    // Keys (primary and unique), with their columns in order.
+    let mut keys: BTreeMap<(String, String), Constraint> = BTreeMap::new();
+    for r in pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, k.name, k.type, i.type_desc, c.name \
+                 FROM sys.key_constraints k JOIN sys.objects o ON o.object_id = k.parent_object_id \
+                 JOIN sys.indexes i ON i.object_id = k.parent_object_id \
+                   AND i.index_id = k.unique_index_id \
+                 JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+                 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+                 {IN_SCHEMA} ORDER BY o.name, k.name, ic.key_ordinal"
+            ),
+            &[schema],
+        )
+        .await?
+    {
+        let primary = col(&r, 2).trim() == "PK";
+        let c = keys
+            .entry((col(&r, 0), col(&r, 1)))
+            .or_insert_with(|| Constraint {
+                name: col(&r, 1),
+                kind: if primary {
+                    ConstraintKind::PrimaryKey
+                } else {
+                    ConstraintKind::Unique
+                },
+                columns: vec![],
+                // Finished below, with the columns.
+                definition: format!(
+                    "{} {}",
+                    if primary { "PRIMARY KEY" } else { "UNIQUE" },
+                    col(&r, 3)
+                ),
+                references: None,
+            });
+        c.columns.push(col(&r, 4));
+    }
+    for ((table, _), mut c) in keys {
+        c.definition = format!("{} ({})", c.definition, column_list(&c.columns, d));
+        if let Some(t) = tables.get(&table) {
+            if c.kind == ConstraintKind::PrimaryKey {
+                t.constraints.insert(0, c);
+            } else {
+                t.constraints.push(c);
+            }
+        }
+    }
+    for r in pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, k.name, k.definition FROM sys.check_constraints k \
+                 JOIN sys.objects o ON o.object_id = k.parent_object_id \
+                 {IN_SCHEMA} ORDER BY o.name, k.name"
+            ),
+            &[schema],
+        )
+        .await?
+    {
+        if let Some(t) = tables.get(&col(&r, 0)) {
+            t.constraints.push(Constraint {
+                name: col(&r, 1),
+                kind: ConstraintKind::Check,
+                columns: vec![],
+                definition: format!("CHECK {}", col(&r, 2)),
+                references: None,
+            });
+        }
+    }
+    let mut fks: BTreeMap<(String, String), Constraint> = BTreeMap::new();
+    for r in pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, f.name, pc.name, rs.name, ro.name, rc.name, \
+                 f.update_referential_action_desc, f.delete_referential_action_desc \
+                 FROM sys.foreign_keys f JOIN sys.objects o ON o.object_id = f.parent_object_id \
+                 JOIN sys.foreign_key_columns fc ON fc.constraint_object_id = f.object_id \
+                 JOIN sys.columns pc ON pc.object_id = fc.parent_object_id \
+                   AND pc.column_id = fc.parent_column_id \
+                 JOIN sys.objects ro ON ro.object_id = fc.referenced_object_id \
+                 JOIN sys.schemas rs ON rs.schema_id = ro.schema_id \
+                 JOIN sys.columns rc ON rc.object_id = fc.referenced_object_id \
+                   AND rc.column_id = fc.referenced_column_id \
+                 {IN_SCHEMA} ORDER BY o.name, f.name, fc.constraint_column_id"
+            ),
+            &[schema],
+        )
+        .await?
+    {
+        let rule = |i| col(&r, i).replace('_', " ");
+        let c = fks
+            .entry((col(&r, 0), col(&r, 1)))
+            .or_insert_with(|| Constraint {
+                name: col(&r, 1),
+                kind: ConstraintKind::ForeignKey,
+                columns: vec![],
+                definition: String::new(),
+                references: Some(Reference {
+                    schema: col(&r, 3),
+                    table: col(&r, 4),
+                    columns: vec![],
+                    on_update: rule(6),
+                    on_delete: rule(7),
+                }),
+            });
+        c.columns.push(col(&r, 2));
+        if let Some(rf) = &mut c.references {
+            rf.columns.push(col(&r, 5));
+        }
+    }
+    for ((table, _), mut c) in fks {
+        c.definition = fk_definition(&c, schema, d);
+        if let Some(t) = tables.get(&table) {
+            t.constraints.push(c);
+        }
+    }
+
+    // Indexes that aren't a key's.
+    /// Unique, type, filter, key columns, how each is written, included columns.
+    type Parts = (bool, String, String, Vec<String>, Vec<String>, Vec<String>);
+    let mut idx: BTreeMap<(String, String), Parts> = BTreeMap::new();
+    for r in pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, i.name, i.is_unique, i.type_desc, i.filter_definition, \
+                 c.name, ic.is_descending_key, ic.is_included_column \
+                 FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id \
+                 JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+                 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+                 {IN_SCHEMA} AND i.is_primary_key = 0 AND i.is_unique_constraint = 0 \
+                   AND i.is_hypothetical = 0 AND i.type > 0 \
+                 ORDER BY o.name, i.name, ic.key_ordinal, ic.index_column_id"
+            ),
+            &[schema],
+        )
+        .await?
+    {
+        let e = idx.entry((col(&r, 0), col(&r, 1))).or_insert_with(|| {
+            (
+                col(&r, 2) == "1",
+                col(&r, 3),
+                col(&r, 4),
+                vec![],
+                vec![],
+                vec![],
+            )
+        });
+        let name = col(&r, 5);
+        if col(&r, 7) == "1" {
+            e.5.push(quote_ident(&name, d));
+        } else {
+            let mut part = quote_ident(&name, d);
+            if col(&r, 6) == "1" {
+                part.push_str(" DESC");
+            }
+            e.4.push(part);
+            e.3.push(name);
+        }
+    }
+    for ((table, name), (unique, kind, filter, columns, parts, include)) in idx {
+        let Some(t) = tables.get(&table) else {
+            continue;
+        };
+        let mut def = format!(
+            "CREATE {}{} INDEX {} ON {} ({})",
+            if unique { "UNIQUE " } else { "" },
+            kind,
+            quote_ident(&name, d),
+            qualified(schema, &table, d),
+            parts.join(", ")
+        );
+        if !include.is_empty() {
+            def.push_str(&format!(" INCLUDE ({})", include.join(", ")));
+        }
+        if !filter.is_empty() {
+            def.push_str(&format!(" WHERE {filter}"));
+        }
+        t.indexes.push(Index {
+            name,
+            columns,
+            unique,
+            definition: def,
+            inline: None,
+        });
+    }
+    for r in pool
+        .text_rows(
+            "SELECT o.name, t.name, OBJECT_DEFINITION(t.object_id) FROM sys.triggers t \
+             JOIN sys.objects o ON o.object_id = t.parent_id \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = @p1 \
+             ORDER BY o.name, t.name",
+            &[schema],
+        )
+        .await?
+    {
+        if let Some(t) = tables.get(&col(&r, 0)) {
+            t.triggers.push(Trigger {
+                name: col(&r, 1),
+                definition: col(&r, 2).trim().to_owned(),
+            });
+        }
+    }
+
+    let mut params: BTreeMap<String, (Vec<String>, Option<String>)> = BTreeMap::new();
+    for r in pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, p.name, TYPE_NAME(p.user_type_id), p.is_output, p.parameter_id \
+                 FROM sys.parameters p JOIN sys.objects o ON o.object_id = p.object_id \
+                 {IN_SCHEMA} AND o.type IN ('P', 'FN', 'IF', 'TF') ORDER BY o.name, p.parameter_id"
+            ),
+            &[schema],
+        )
+        .await?
+    {
+        let e = params.entry(col(&r, 0)).or_default();
+        if col(&r, 4) == "0" {
+            // The return value of a scalar function.
+            e.1 = opt(&r, 2);
+        } else {
+            e.0.push(format!(
+                "{} {}{}",
+                col(&r, 1),
+                col(&r, 2),
+                if col(&r, 3) == "1" { " OUTPUT" } else { "" }
+            ));
+        }
+    }
+    let routines = pool
+        .text_rows(
+            &format!(
+                "SELECT o.name, RTRIM(o.type), OBJECT_DEFINITION(o.object_id) FROM sys.objects o \
+                 {IN_SCHEMA} AND o.type IN ('P', 'FN', 'IF', 'TF') ORDER BY o.name"
+            ),
+            &[schema],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            let (args, ret) = params.remove(&col(r, 0)).unwrap_or_default();
+            let kind = if col(r, 1) == "P" {
+                RoutineKind::Procedure
+            } else {
+                RoutineKind::Function
+            };
+            Routine {
+                name: col(r, 0),
+                kind,
+                arguments: args.join(", "),
+                returns: ret
+                    .or_else(|| (kind == RoutineKind::Function).then(|| "TABLE".to_owned())),
+                definition: opt(r, 2).map(|s| s.trim().to_owned()),
+            }
+        })
+        .collect();
+    let sequences = pool
+        .text_rows(
+            "SELECT q.name, TYPE_NAME(q.user_type_id), CAST(q.start_value AS varchar(40)), \
+             CAST(q.increment AS varchar(40)), CAST(q.minimum_value AS varchar(40)), \
+             CAST(q.maximum_value AS varchar(40)), q.is_cycling, q.cache_size \
+             FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id \
+             WHERE s.name = @p1 ORDER BY q.name",
+            &[schema],
+        )
+        .await?
+        .iter()
+        .map(|r| Sequence {
+            name: col(r, 0),
+            definition: format!(
+                "CREATE SEQUENCE {} AS {} START WITH {} INCREMENT BY {} MINVALUE {} \
+                 MAXVALUE {}{}{}",
+                qualified(schema, &col(r, 0), d),
+                col(r, 1),
+                col(r, 2),
+                col(r, 3),
+                col(r, 4),
+                col(r, 5),
+                if col(r, 6) == "1" { " CYCLE" } else { "" },
+                opt(r, 7).map(|c| format!(" CACHE {c}")).unwrap_or_default()
+            ),
+        })
+        .collect();
+
+    Ok(SchemaModel {
+        schema: schema.to_owned(),
+        tables: tables.list,
+        routines,
+        sequences,
     })
 }
 
