@@ -6,6 +6,7 @@
 mod app;
 mod backend;
 mod browser;
+mod diagram_view;
 mod diff_dialog;
 mod editor;
 mod grid_edit;

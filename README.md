@@ -38,6 +38,8 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
   foreign keys, checks) from a form, with the `CREATE`/`ALTER` statements shown before
   they run. On SQLite, changes it can't make in place rebuild the table and copy its
   rows.
+- **Diagrams**: a schema's tables and their foreign keys, laid out by how they refer to
+  each other; drag, pan and zoom, save as SVG or copy as Mermaid.
 - **Schema diff**: compare two schemas (on two servers, or one) and get the SQL that
   makes one like the other, in a tab to look over and run.
 - **Import** a CSV, TSV or JSON file into a table (right-click it in the browser):
@@ -109,6 +111,10 @@ datadrop query shop "select * from orders where placed > :since" \
 
 # Export every row to a file (format from the extension)
 datadrop query shop "select * from orders" -o orders.csv
+
+# An ER diagram, as Mermaid (for Markdown) or Graphviz
+datadrop diagram shop > schema.mmd
+datadrop diagram shop --format dot | dot -Tsvg > schema.svg
 
 # The SQL that makes staging's schema like dev's (--apply runs it)
 datadrop diff dev staging --source-schema public --target-schema public

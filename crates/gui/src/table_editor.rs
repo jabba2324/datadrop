@@ -73,6 +73,8 @@ pub struct TableEditor {
     section: Section,
     applying: Option<Task>,
     error: Option<String>,
+    /// Focus the name on the first frame.
+    focus: bool,
 }
 
 pub enum EditorDone {
@@ -87,6 +89,14 @@ const RULES: [&str; 5] = [
     "SET NULL",
     "SET DEFAULT",
 ];
+
+/// A text box of a set width (in a grid cell, a plain one shrinks to the column).
+fn text(ui: &mut egui::Ui, value: &mut String, width: f32, hint: &str) -> egui::Response {
+    ui.add_sized(
+        [width, ui.spacing().interact_size.y],
+        egui::TextEdit::singleline(value).hint_text(hint),
+    )
+}
 
 fn split_list(s: &str) -> Vec<String> {
     s.split(',')
@@ -154,6 +164,7 @@ impl TableEditor {
             section: Section::Columns,
             applying: None,
             error: None,
+            focus: true,
         };
         match table {
             None => {
@@ -468,13 +479,14 @@ impl TableEditor {
             ui.add_space(6.0);
             egui::Grid::new("table-head").num_columns(2).show(ui, |ui| {
                 let l = ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(300.0))
-                    .labelled_by(l.id);
+                let name = text(ui, &mut self.name, 300.0, "").labelled_by(l.id);
+                if std::mem::take(&mut self.focus) && self.old.is_none() {
+                    name.request_focus();
+                }
                 ui.end_row();
                 if self.dialect != Dialect::Sqlite {
                     let l = ui.label("Comment");
-                    ui.add(egui::TextEdit::singleline(&mut self.comment).desired_width(500.0))
-                        .labelled_by(l.id);
+                    text(ui, &mut self.comment, 500.0, "optional").labelled_by(l.id);
                     ui.end_row();
                 }
             });
@@ -591,9 +603,9 @@ impl TableEditor {
                 ui.end_row();
                 let n = self.columns.len();
                 for (i, c) in self.columns.iter_mut().enumerate() {
-                    ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(150.0));
+                    text(ui, &mut c.name, 150.0, "");
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut c.data_type).desired_width(150.0));
+                        text(ui, &mut c.data_type, 150.0, "");
                         ui.menu_button(icon::CARET_DOWN, |ui| {
                             for t in types {
                                 if ui.button(*t).clicked() {
@@ -608,11 +620,7 @@ impl TableEditor {
                         !c.primary_key,
                         egui::Checkbox::without_text(&mut c.nullable),
                     );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut c.default)
-                            .hint_text("none")
-                            .desired_width(150.0),
-                    );
+                    text(ui, &mut c.default, 150.0, "none");
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(i > 0, egui::Button::new(icon::ARROW_UP).small())
@@ -663,12 +671,8 @@ impl TableEditor {
                 ui.label("");
                 ui.end_row();
                 for (i, r) in self.indexes.iter_mut().enumerate() {
-                    ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(200.0));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut r.columns)
-                            .hint_text("a, b")
-                            .desired_width(300.0),
-                    );
+                    text(ui, &mut r.name, 200.0, "");
+                    text(ui, &mut r.columns, 300.0, "a, b");
                     ui.checkbox(&mut r.unique, "");
                     if ui.small_button(icon::TRASH).clicked() {
                         remove = Some(i);
@@ -702,14 +706,10 @@ impl TableEditor {
                 ui.label("");
                 ui.end_row();
                 for (i, r) in self.fks.iter_mut().enumerate() {
-                    ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(140.0));
-                    ui.add(egui::TextEdit::singleline(&mut r.columns).desired_width(120.0));
-                    ui.add(egui::TextEdit::singleline(&mut r.table).desired_width(120.0));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut r.ref_columns)
-                            .hint_text("its key")
-                            .desired_width(120.0),
-                    );
+                    text(ui, &mut r.name, 140.0, "");
+                    text(ui, &mut r.columns, 120.0, "");
+                    text(ui, &mut r.table, 120.0, "");
+                    text(ui, &mut r.ref_columns, 120.0, "its key");
                     egui::ComboBox::from_id_salt(("fk-delete", i))
                         .selected_text(if r.on_delete.is_empty() {
                             "NO ACTION"
@@ -750,12 +750,12 @@ impl TableEditor {
                 ui.label("");
                 ui.end_row();
                 for (i, r) in self.checks.iter_mut().enumerate() {
-                    ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(160.0));
-                    ui.add(
+                    text(ui, &mut r.name, 160.0, "");
+                    ui.add_sized(
+                        [420.0, ui.spacing().interact_size.y],
                         egui::TextEdit::singleline(&mut r.definition)
                             .font(egui::TextStyle::Monospace)
-                            .hint_text("CHECK (price >= 0)")
-                            .desired_width(420.0),
+                            .hint_text("CHECK (price >= 0)"),
                     );
                     if ui.small_button(icon::TRASH).clicked() {
                         remove = Some(i);

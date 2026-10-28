@@ -312,6 +312,22 @@ impl Profile {
         }
     }
 
+    /// The schema used when none is named: `public`, the MySQL database (if the
+    /// profile names one), or SQLite's `main`.
+    pub fn default_schema(&self) -> Option<String> {
+        match self.driver {
+            Driver::Postgres => Some("public".into()),
+            Driver::Sqlite => Some("main".into()),
+            Driver::Mysql => {
+                let db = match self.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
+                    Some(u) => decode(u.path().trim_start_matches('/')),
+                    None => self.database.clone(),
+                };
+                Some(db).filter(|d| !d.is_empty())
+            }
+        }
+    }
+
     /// Whether the profile has any password or passphrase.
     pub fn has_secrets(&self) -> bool {
         let mut p = self.clone();

@@ -1032,23 +1032,9 @@ fn default_schema(p: &Profile, schema: Option<String>) -> Result<String> {
     if let Some(s) = schema.filter(|s| !s.is_empty()) {
         return Ok(s);
     }
-    match p.driver {
-        Driver::Postgres => Ok("public".into()),
-        Driver::Sqlite => Ok("main".into()),
-        Driver::Mysql => {
-            let db = match p.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
-                Some(u) => u.path().trim_start_matches('/').to_owned(),
-                None => p.database.clone(),
-            };
-            if db.is_empty() {
-                Err(CoreError::Invalid(
-                    "say which database (schema): the profile doesn't name one".into(),
-                ))
-            } else {
-                Ok(db)
-            }
-        }
-    }
+    p.default_schema().ok_or_else(|| {
+        CoreError::Invalid("say which database (schema): the profile doesn't name one".into())
+    })
 }
 
 fn is_connection_lost(e: &CoreError) -> bool {

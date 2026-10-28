@@ -849,3 +849,30 @@ fn compares_two_schemas() {
     assert_eq!(doc.profile.as_deref(), Some("other"));
     assert!(doc.text.contains("CREATE TABLE pets"), "{}", doc.text);
 }
+
+#[test]
+fn draws_a_diagram() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(
+        &mut h,
+        "create table owners (id integer primary key, name text); \
+         create table pets (id integer primary key, owner integer references owners (id))",
+    );
+    {
+        let a = h.state_mut();
+        let d = crate::diagram_view::DiagramView::new(&a.backend, "local".into(), "main".into());
+        a.diagrams.push(d);
+    }
+    until(&mut h, "the schema", |a| a.diagrams[0].loaded());
+    h.run_steps(3);
+    h.get_by_label_contains("Save as SVG");
+    let svg = h.state().diagrams[0].svg();
+    assert!(
+        svg.contains(">owners</text>") && svg.contains(">pets</text>"),
+        "{svg}"
+    );
+    assert!(svg.contains("<path d=\"M"), "{svg}");
+}

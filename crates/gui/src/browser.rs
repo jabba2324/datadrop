@@ -41,6 +41,11 @@ pub enum BrowserAction {
     Edit(String),
     Delete(String),
     Add,
+    /// Show a schema's diagram.
+    Diagram {
+        profile: String,
+        schema: String,
+    },
     /// Compare a schema with another.
     Compare {
         profile: String,
@@ -329,6 +334,12 @@ impl Browser {
                     profile: p.name.clone(),
                     schema: schema.to_owned(),
                     table: None,
+                });
+            }
+            if ui.button(format!("{} Diagram", icon::GRAPH)).clicked() {
+                action = Some(BrowserAction::Diagram {
+                    profile: p.name.clone(),
+                    schema: schema.to_owned(),
                 });
             }
             if ui

@@ -107,6 +107,15 @@ enum Cmd {
         #[command(flatten)]
         params: Params,
     },
+    /// An entity-relationship diagram of a schema, as Mermaid (for Markdown) or
+    /// Graphviz (`| dot -Tsvg > schema.svg`).
+    Diagram {
+        profile: String,
+        #[arg(long, short)]
+        schema: Option<String>,
+        #[arg(long, value_parser = ["mermaid", "dot"], default_value = "mermaid")]
+        format: String,
+    },
     /// The SQL that makes the target schema like the source one: tables, columns,
     /// keys, indexes, triggers, views, routines and sequences.
     Diff {
@@ -507,6 +516,23 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Schemas { profile } => (Command::Schemas { profile }, Format::Table),
         Cmd::Catalog { profile } => (Command::Catalog { profile }, Format::Table),
         Cmd::Schema { profile, schema } => (Command::Schema { profile, schema }, Format::Table),
+        Cmd::Diagram {
+            profile,
+            schema,
+            format,
+        } => {
+            let out = client.execute(Command::Schema { profile, schema }).await?;
+            let Output::Schema(m) = out else {
+                bail!("unexpected reply");
+            };
+            let text = if format == "dot" {
+                datadrop_core::diagram::dot(&m)
+            } else {
+                datadrop_core::diagram::mermaid(&m)
+            };
+            print!("{text}");
+            return Ok(ExitCode::SUCCESS);
+        }
         Cmd::Ddl {
             profile,
             name,

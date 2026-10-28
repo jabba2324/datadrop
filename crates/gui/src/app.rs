@@ -14,6 +14,7 @@ use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
 use crate::browser::{Browser, BrowserAction};
+use crate::diagram_view::DiagramView;
 use crate::diff_dialog::{DiffDialog, DiffDone};
 use crate::editor::{self, Document, Find, ResultView};
 use crate::grid_edit::{Editability, Review};
@@ -84,6 +85,8 @@ pub struct App {
     pub import: Option<ImportDialog>,
     pub editor: Option<TableEditor>,
     pub diff: Option<DiffDialog>,
+    /// Open diagram windows.
+    pub diagrams: Vec<DiagramView>,
     /// DDL being read, to open in a new tab: (task, profile, tab name).
     ddl_tasks: Vec<(Option<Task>, String, String)>,
     /// An SSH server to trust (its key isn't known yet), and the task trusting it.
@@ -159,6 +162,7 @@ impl App {
             import: None,
             editor: None,
             diff: None,
+            diagrams: vec![],
             trust: None,
             trusting: None,
             toasts: egui_notify::Toasts::default(),
@@ -175,6 +179,18 @@ impl App {
         }
         app.active = 0;
         app
+    }
+
+    /// The active tab's connection and its default schema.
+    fn active_schema(&self) -> Option<(String, String)> {
+        let profile = self.docs[self.active].profile.clone()?;
+        let p = self
+            .backend
+            .client
+            .store()
+            .get_without_secrets(&profile)
+            .ok()?;
+        Some((profile, p.default_schema()?))
     }
 
     /// Whether passwords can go in the keychain (checked once).
@@ -966,6 +982,48 @@ impl App {
                     t.cancel();
                 }
             });
+            ui.menu_button("Schema", |ui| {
+                let target = self.active_schema();
+                ui.add_enabled_ui(target.is_some(), |ui| {
+                    let (profile, schema) = target.clone().unwrap_or_default();
+                    if ui.button(format!("{} New table…", icon::PLUS)).clicked() {
+                        self.browser_action(BrowserAction::EditTable {
+                            profile: profile.clone(),
+                            schema: schema.clone(),
+                            table: None,
+                        });
+                    }
+                    if ui.button(format!("{} Diagram", icon::GRAPH)).clicked() {
+                        self.browser_action(BrowserAction::Diagram {
+                            profile: profile.clone(),
+                            schema: schema.clone(),
+                        });
+                    }
+                    if ui
+                        .button(format!("{} Compare with…", icon::ARROWS_LEFT_RIGHT))
+                        .clicked()
+                    {
+                        self.browser_action(BrowserAction::Compare {
+                            profile: profile.clone(),
+                            schema: schema.clone(),
+                        });
+                    }
+                    if ui.button(format!("{} Show DDL", icon::CODE)).clicked() {
+                        self.browser_action(BrowserAction::ShowDdl {
+                            profile,
+                            schema,
+                            kind: ObjectKind::Schema,
+                            name: String::new(),
+                        });
+                    }
+                })
+                .response
+                .on_disabled_hover_text("Choose a connection for this tab first");
+                if let Some((p, s)) = &target {
+                    ui.separator();
+                    ui.weak(format!("{s} on {p}"));
+                }
+            });
             ui.menu_button("Connections", |ui| {
                 if ui.button("Add a connection…").clicked() {
                     self.form = Some(ProfileForm::new(self.keychain()));
@@ -1373,6 +1431,16 @@ impl App {
                         .into(),
                     kind: ConfirmKind::DeleteProfile(name),
                 });
+            }
+            BrowserAction::Diagram { profile, schema } => {
+                if !self
+                    .diagrams
+                    .iter()
+                    .any(|d| d.profile == profile && d.schema == schema)
+                {
+                    self.diagrams
+                        .push(DiagramView::new(&self.backend, profile, schema));
+                }
             }
             BrowserAction::Compare { profile, schema } => {
                 self.diff = Some(DiffDialog::new(profile, schema));
@@ -1825,6 +1893,10 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        for d in &mut self.diagrams {
+            d.ui(ctx, &mut self.toasts);
+        }
+        self.diagrams.retain(|d| d.open);
         self.review_dialog(ctx);
         if let Some(d) = &mut self.diff
             && let Some(done) = d.ui(ctx, &self.backend, &self.profiles)
