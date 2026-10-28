@@ -522,3 +522,51 @@ fn trusts_an_ssh_server_then_runs() {
         Some("through the tunnel")
     );
 }
+
+#[test]
+fn browses_keys_indexes_and_ddl() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(
+        &mut h,
+        "create table owners (id integer primary key, name text not null unique); \
+         create table pets (id integer primary key, owner integer references owners (id), \
+           name text); \
+         create index pets_name on pets (name); \
+         create view named as select name from pets",
+    );
+    h.get_by_label_contains("local").click();
+    until(&mut h, "the schemas", |_| true);
+    h.run_steps(5);
+    h.get_by_label_contains("main").click();
+    for _ in 0..40 {
+        h.run_steps(1);
+        if h.query_by_label_contains("Tables (2)").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    h.get_by_label_contains("Views (1)");
+    h.get_by_label(&format!("{}  pets", egui_phosphor::regular::TABLE))
+        .click();
+    h.run_steps(3);
+    h.get_by_label_contains("Foreign keys (1)").click();
+    h.run_steps(5);
+    h.get_by_label_contains("Indexes (1)").click();
+    h.run_steps(5);
+    h.get_by_label_contains("pets_name");
+    h.get_by_label("→ owners(id)");
+
+    let pets = format!("{}  pets", egui_phosphor::regular::TABLE);
+    h.get_by_label(&pets).click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("Show DDL").click();
+    until(&mut h, "the DDL tab", |a| a.docs.len() == 2);
+    let doc = &h.state().docs[1];
+    assert_eq!(doc.title(), "pets (DDL)");
+    assert!(doc.text.contains("CREATE TABLE pets"), "{}", doc.text);
+    assert!(doc.text.contains("CREATE INDEX pets_name"), "{}", doc.text);
+    assert!(!doc.dirty());
+}

@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use datadrop_core::sql::{self, Dialect};
 use datadrop_core::{
-    Catalog, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, ProfileSummary,
-    QueryOutput, StatementError,
+    Catalog, Command, ConfigDir, CoreError, Driver, ExportFormat, ObjectKind, Output,
+    ProfileSummary, QueryOutput, StatementError,
 };
 use datadrop_core::{edit, export};
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
@@ -73,6 +73,8 @@ pub struct App {
     pub form: Option<ProfileForm>,
     pub confirm: Option<Confirm>,
     delete_task: Option<Task>,
+    /// DDL being read, to open in a new tab: (task, profile, tab name).
+    ddl_tasks: Vec<(Option<Task>, String, String)>,
     /// An SSH server to trust (its key isn't known yet), and the task trusting it.
     pub trust: Option<TrustPrompt>,
     trusting: Option<Task>,
@@ -138,6 +140,7 @@ impl App {
             form: None,
             confirm: None,
             delete_task: None,
+            ddl_tasks: vec![],
             trust: None,
             trusting: None,
             toasts: egui_notify::Toasts::default(),
@@ -447,6 +450,27 @@ impl App {
     }
 
     fn poll_tasks(&mut self) {
+        let mut i = 0;
+        while i < self.ddl_tasks.len() {
+            let Some(r) = poll(&mut self.ddl_tasks[i].0) else {
+                i += 1;
+                continue;
+            };
+            let (_, profile, name) = self.ddl_tasks.remove(i);
+            match r {
+                Ok(Output::Ddl { sql }) => {
+                    let t = self.new_tab(Some(profile));
+                    let doc = &mut self.docs[t];
+                    doc.untitled_name = name;
+                    doc.text = sql.clone();
+                    doc.saved_text = sql;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.toasts.error(format!("Couldn't read the DDL: {e}"));
+                }
+            }
+        }
         if let Some(r) = poll(&mut self.profiles_task) {
             match r {
                 Ok(Output::Profiles { profiles }) => {
@@ -1154,6 +1178,24 @@ impl App {
                         .into(),
                     kind: ConfirmKind::DeleteProfile(name),
                 });
+            }
+            BrowserAction::ShowDdl {
+                profile,
+                schema,
+                kind,
+                name,
+            } => {
+                let title = match kind {
+                    ObjectKind::Schema => format!("{schema} (DDL)"),
+                    _ => format!("{name} (DDL)"),
+                };
+                let task = self.backend.run(Command::Ddl {
+                    profile: profile.clone(),
+                    schema: Some(schema),
+                    kind,
+                    name,
+                });
+                self.ddl_tasks.push((Some(task), profile, title));
             }
             BrowserAction::OpenTable {
                 profile,

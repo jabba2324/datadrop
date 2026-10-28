@@ -206,6 +206,28 @@ impl Client {
                     tables,
                 }))
             }
+            Command::Schema { profile, schema } => {
+                let p = self.store.get(&profile)?;
+                let schema = default_schema(&p, schema)?;
+                let pool = self.pool(&profile).await?;
+                Ok(Output::Schema(
+                    cancellable(cancel, crate::schema::load(&pool, &schema)).await?,
+                ))
+            }
+            Command::Ddl {
+                profile,
+                schema,
+                kind,
+                name,
+            } => {
+                let p = self.store.get(&profile)?;
+                let schema = default_schema(&p, schema)?;
+                let pool = self.pool(&profile).await?;
+                Ok(Output::Ddl {
+                    sql: cancellable(cancel, crate::schema::ddl(&pool, &schema, kind, &name))
+                        .await?,
+                })
+            }
             Command::Query {
                 profile,
                 sql,

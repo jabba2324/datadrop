@@ -788,3 +788,221 @@ both!(
         assert_eq!(q.results[0].rows[0][1].as_deref(), Some("Rex's"));
     }
 );
+
+async fn schema_model(db: &Db, profile: &str, schema: &str) -> datadrop_core::SchemaModel {
+    match db
+        .client
+        .execute(Command::Schema {
+            profile: profile.into(),
+            schema: Some(schema.into()),
+        })
+        .await
+        .unwrap()
+    {
+        Output::Schema(m) => m,
+        o => panic!("{o:?}"),
+    }
+}
+
+both!(
+    reads_and_recreates_the_schema,
+    |driver, schema| async move {
+        use datadrop_core::ObjectKind;
+        use datadrop_core::schema::ConstraintKind;
+        let Some(db) = setup(driver, schema).await else {
+            return;
+        };
+        let s = schema;
+        let script = match driver {
+            Driver::Postgres => format!(
+                "CREATE TABLE {s}.customers (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                   email text NOT NULL UNIQUE, name text DEFAULT 'anon'); \
+                 COMMENT ON TABLE {s}.customers IS 'People'; \
+                 CREATE TABLE {s}.orders (id serial PRIMARY KEY, \
+                   customer_id int NOT NULL REFERENCES {s}.customers (id) ON DELETE CASCADE, \
+                   total numeric(10,2) CHECK (total >= 0), placed timestamptz DEFAULT now()); \
+                 CREATE INDEX orders_placed ON {s}.orders (placed DESC); \
+                 CREATE VIEW {s}.big AS SELECT id, total FROM {s}.orders WHERE total > 100; \
+                 CREATE FUNCTION {s}.touch() RETURNS trigger LANGUAGE plpgsql AS \
+                   $$ BEGIN NEW.placed := now(); RETURN NEW; END $$; \
+                 CREATE TRIGGER orders_touch BEFORE UPDATE ON {s}.orders \
+                   FOR EACH ROW EXECUTE FUNCTION {s}.touch(); \
+                 CREATE SEQUENCE {s}.tickets START 100"
+            ),
+            Driver::Mysql => "CREATE TABLE customers (id int AUTO_INCREMENT PRIMARY KEY, \
+                   email varchar(100) NOT NULL UNIQUE, name varchar(50) DEFAULT 'anon') \
+                   COMMENT='People'; \
+                 CREATE TABLE orders (id int AUTO_INCREMENT PRIMARY KEY, \
+                   customer_id int NOT NULL, total decimal(10,2) CHECK (total >= 0), \
+                   placed timestamp NULL DEFAULT CURRENT_TIMESTAMP, \
+                   CONSTRAINT orders_customer FOREIGN KEY (customer_id) \
+                   REFERENCES customers (id) ON DELETE CASCADE); \
+                 CREATE INDEX orders_placed ON orders (placed); \
+                 CREATE VIEW big AS SELECT id, total FROM orders WHERE total > 100; \
+                 CREATE FUNCTION twice(x int) RETURNS int DETERMINISTIC RETURN x * 2; \
+                 CREATE TRIGGER orders_touch BEFORE UPDATE ON orders \
+                   FOR EACH ROW SET NEW.placed = NOW()"
+                .to_owned(),
+            Driver::Sqlite => "CREATE TABLE customers (id INTEGER PRIMARY KEY, \
+                   email TEXT NOT NULL UNIQUE, name TEXT DEFAULT 'anon'); \
+                 CREATE TABLE orders (id INTEGER PRIMARY KEY, \
+                   customer_id INTEGER NOT NULL REFERENCES customers (id) ON DELETE CASCADE, \
+                   total REAL CHECK (total >= 0), placed TEXT DEFAULT CURRENT_TIMESTAMP); \
+                 CREATE INDEX orders_placed ON orders (placed); \
+                 CREATE VIEW big AS SELECT id, total FROM orders WHERE total > 100; \
+                 CREATE TRIGGER orders_touch AFTER UPDATE ON orders BEGIN \
+                   UPDATE orders SET placed = CURRENT_TIMESTAMP WHERE id = NEW.id; END"
+                .to_owned(),
+        };
+        ok(run(&db.client, "test", &script, None).await);
+        let home = home(&db, schema);
+        let m = schema_model(&db, "test", home).await;
+
+        let customers = m.table("customers").expect("customers");
+        assert_eq!(customers.primary_key().unwrap().columns, ["id"]);
+        let unique_email = customers
+            .constraints
+            .iter()
+            .any(|c| c.kind == ConstraintKind::Unique && c.columns == ["email"])
+            || customers
+                .indexes
+                .iter()
+                .any(|i| i.unique && i.columns == ["email"]);
+        assert!(unique_email, "{customers:#?}");
+        let default = customers.column("name").unwrap().default.clone();
+        assert!(
+            default.as_deref().is_some_and(|d| d.starts_with("'anon'")),
+            "{default:?}"
+        );
+        if driver != Driver::Sqlite {
+            assert_eq!(customers.comment.as_deref(), Some("People"));
+            assert!(customers.column("id").unwrap().identity.is_some());
+        }
+
+        let orders = m.table("orders").expect("orders");
+        let fk = orders.foreign_keys().next().expect("a foreign key");
+        let r = fk.references.as_ref().unwrap();
+        assert_eq!(
+            (
+                fk.columns.as_slice(),
+                r.table.as_str(),
+                r.columns.as_slice()
+            ),
+            (
+                &["customer_id".to_owned()][..],
+                "customers",
+                &["id".to_owned()][..]
+            )
+        );
+        assert_eq!(r.on_delete, "CASCADE");
+        if driver != Driver::Sqlite {
+            assert!(
+                orders
+                    .constraints
+                    .iter()
+                    .any(|c| c.kind == ConstraintKind::Check),
+                "{orders:#?}"
+            );
+        }
+        let idx = orders
+            .indexes
+            .iter()
+            .find(|i| i.name == "orders_placed")
+            .expect("orders_placed");
+        assert!(idx.columns[0].contains("placed"), "{idx:?}");
+        assert!(!idx.unique);
+        assert_eq!(orders.triggers[0].name, "orders_touch");
+        let big = m.table("big").expect("the view");
+        assert!(big.is_view() && big.definition.is_some());
+        assert_eq!(big.columns.len(), 2);
+        match driver {
+            Driver::Postgres => {
+                assert_eq!(m.routines[0].name, "touch");
+                assert_eq!(m.routines[0].returns.as_deref(), Some("trigger"));
+                let names: Vec<&str> = m.sequences.iter().map(|s| s.name.as_str()).collect();
+                assert_eq!(names, ["orders_id_seq", "tickets"]);
+            }
+            Driver::Mysql => {
+                assert_eq!(m.routines[0].name, "twice");
+                assert!(
+                    m.routines[0]
+                        .definition
+                        .as_deref()
+                        .is_some_and(|d| d.starts_with("CREATE FUNCTION") && d.contains("x * 2")),
+                    "{:?}",
+                    m.routines[0]
+                );
+            }
+            Driver::Sqlite => {}
+        }
+
+        // One table's DDL.
+        let Output::Ddl { sql } = db
+            .client
+            .execute(Command::Ddl {
+                profile: "test".into(),
+                schema: Some(home.into()),
+                kind: ObjectKind::Table,
+                name: "orders".into(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(sql.contains("CREATE TABLE"), "{sql}");
+        assert!(sql.contains("orders_touch"), "{sql}");
+
+        // The whole schema's DDL recreates it exactly.
+        let Output::Ddl { sql } = db
+            .client
+            .execute(Command::Ddl {
+                profile: "test".into(),
+                schema: Some(home.into()),
+                kind: ObjectKind::Schema,
+                name: String::new(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let target = match driver {
+            Driver::Postgres => {
+                ok(run(
+                    &db.client,
+                    "admin",
+                    &format!("DROP SCHEMA {s} CASCADE; CREATE SCHEMA {s}"),
+                    None,
+                )
+                .await);
+                "test"
+            }
+            Driver::Mysql => {
+                ok(run(
+                    &db.client,
+                    "admin",
+                    &format!("DROP DATABASE {s}; CREATE DATABASE {s}"),
+                    None,
+                )
+                .await);
+                "test"
+            }
+            Driver::Sqlite => {
+                let copy = Profile {
+                    name: "copy".into(),
+                    driver,
+                    database: db._dir.path().join("copy.db").display().to_string(),
+                    create_if_missing: true,
+                    ..Profile::default()
+                };
+                save(&db.client, copy).await;
+                "copy"
+            }
+        };
+        let q = run(&db.client, target, &sql, None).await;
+        assert!(q.error.is_none(), "{:?}\n{sql}", q.error);
+        let again = schema_model(&db, target, home).await;
+        assert_eq!(again, m, "{sql}");
+    }
+);

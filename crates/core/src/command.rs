@@ -12,6 +12,7 @@ use crate::export::ExportFormat;
 use crate::history::HistoryEntry;
 use crate::plan::Plan;
 use crate::profile::{Profile, ProfileSummary};
+use crate::schema::{ObjectKind, SchemaModel};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -66,6 +67,22 @@ pub enum Command {
     /// Every table and column, for autocompletion.
     Catalog {
         profile: String,
+    },
+    /// A schema's structure: tables with their columns, keys, indexes and triggers;
+    /// views, routines and sequences.
+    Schema {
+        profile: String,
+        #[serde(default)]
+        schema: Option<String>,
+    },
+    /// The SQL that creates an object (or everything in the schema).
+    Ddl {
+        profile: String,
+        #[serde(default)]
+        schema: Option<String>,
+        kind: ObjectKind,
+        #[serde(default)]
+        name: String,
     },
     /// Run SQL: one statement or a script, statement by statement, stopping at the
     /// first error. With a `session` the connection stays open for the next query
@@ -174,6 +191,10 @@ pub enum Output {
     },
     Query(QueryOutput),
     Catalog(Catalog),
+    Schema(SchemaModel),
+    Ddl {
+        sql: String,
+    },
     SessionClosed,
     HostTrusted {
         host: String,

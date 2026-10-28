@@ -605,6 +605,36 @@ impl MetaPool {
         })
     }
 
+    /// Run a metadata query with string parameters, every column read as text.
+    pub async fn text_rows(&self, sql: &str, binds: &[&str]) -> Result<Vec<Vec<Option<String>>>> {
+        macro_rules! rows {
+            ($pool:expr) => {{
+                let mut q = sqlx::query(AssertSqlSafe(sql.to_owned()));
+                for b in binds {
+                    q = q.bind(*b);
+                }
+                q.fetch_all($pool)
+                    .await?
+                    .iter()
+                    .map(|r| (0..r.len()).map(|i| text_col(r, i)).collect())
+                    .collect()
+            }};
+        }
+        Ok(match self {
+            MetaPool::Pg(p) => rows!(p),
+            MetaPool::My(p) => rows!(p),
+            MetaPool::Lite(p) => rows!(p),
+        })
+    }
+
+    pub fn driver(&self) -> Driver {
+        match self {
+            MetaPool::Pg(_) => Driver::Postgres,
+            MetaPool::My(_) => Driver::Mysql,
+            MetaPool::Lite(_) => Driver::Sqlite,
+        }
+    }
+
     pub async fn schemas(&self) -> Result<Vec<String>> {
         Ok(match self {
             MetaPool::Pg(p) => sqlx::query(

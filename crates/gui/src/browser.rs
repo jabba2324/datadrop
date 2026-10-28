@@ -1,9 +1,15 @@
-//! The left pane: connection profiles and, under each, its schemas, tables and
-//! columns, loaded when opened.
+//! The left pane: connection profiles and, under each, its schemas with their tables
+//! (columns, keys, indexes, triggers), views, routines and sequences, loaded when
+//! opened.
 
 use std::collections::HashMap;
 
-use datadrop_core::{ColumnInfo, Command, Output, ProfileSummary, TableInfo, TableKind};
+use std::sync::Arc;
+
+use datadrop_core::schema::{ConstraintKind, RoutineKind};
+use datadrop_core::{
+    Command, ObjectKind, Output, ProfileSummary, SchemaModel, TableKind, TableModel,
+};
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
@@ -21,8 +27,7 @@ pub struct Browser {
     /// An SSH server whose key isn't known came up while loading.
     pub untrusted: Option<TrustPrompt>,
     schemas: HashMap<String, Load<Vec<String>>>,
-    tables: HashMap<(String, String), Load<Vec<TableInfo>>>,
-    columns: HashMap<(String, String, String), Load<Vec<ColumnInfo>>>,
+    models: HashMap<(String, String), Load<Arc<SchemaModel>>>,
 }
 
 pub enum BrowserAction {
@@ -36,6 +41,13 @@ pub enum BrowserAction {
     Edit(String),
     Delete(String),
     Add,
+    /// Open a tab with the SQL that creates something.
+    ShowDdl {
+        profile: String,
+        schema: String,
+        kind: ObjectKind,
+        name: String,
+    },
 }
 
 /// Collect results of finished loads into `Ready` / `Failed`.
@@ -71,28 +83,22 @@ impl Browser {
             Output::Schemas { schemas } => Some(schemas),
             _ => None,
         });
-        settle(&mut self.tables, &mut self.untrusted, |o| match o {
-            Output::Tables { tables, .. } => Some(tables),
-            _ => None,
-        });
-        settle(&mut self.columns, &mut self.untrusted, |o| match o {
-            Output::Columns { columns, .. } => Some(columns),
+        settle(&mut self.models, &mut self.untrusted, |o| match o {
+            Output::Schema(m) => Some(Arc::new(m)),
             _ => None,
         });
     }
 
-    /// Drop everything loaded for a profile, so it's read again when shown.
     /// Drop everything loaded, for every profile.
     pub fn forget_all(&mut self) {
         self.schemas.clear();
-        self.tables.clear();
-        self.columns.clear();
+        self.models.clear();
     }
 
+    /// Drop everything loaded for a profile, so it's read again when shown.
     pub fn forget(&mut self, profile: &str) {
         self.schemas.remove(profile);
-        self.tables.retain(|(p, _), _| p != profile);
-        self.columns.retain(|(p, _, _), _| p != profile);
+        self.models.retain(|(p, _), _| p != profile);
     }
 
     pub fn ui(
@@ -214,107 +220,292 @@ impl Browser {
         backend: &Backend,
     ) -> Option<BrowserAction> {
         let mut action = None;
-        egui::CollapsingHeader::new(format!("{}  {schema}", icon::FOLDER_SIMPLE))
+        let header = egui::CollapsingHeader::new(format!("{}  {schema}", icon::FOLDER_SIMPLE))
             .id_salt(("schema", &p.name, schema))
             .show(ui, |ui| {
                 let key = (p.name.clone(), schema.to_owned());
-                let load = self.tables.entry(key).or_insert_with(|| {
-                    Load::Loading(Some(backend.run(Command::Tables {
+                let load = self.models.entry(key).or_insert_with(|| {
+                    Load::Loading(Some(backend.run(Command::Schema {
                         profile: p.name.clone(),
                         schema: Some(schema.to_owned()),
                     })))
                 });
-                let tables = match load {
+                let m = match load {
                     Load::Loading(_) => return spinner(ui),
                     Load::Failed(e) => return failed(ui, e),
-                    Load::Ready(t) => t.clone(),
+                    Load::Ready(m) => m.clone(),
                 };
-                if tables.is_empty() {
-                    ui.weak("No tables.");
+                let (views, tables): (Vec<&TableModel>, Vec<&TableModel>) =
+                    m.tables.iter().partition(|t| t.is_view());
+                if m.tables.is_empty() && m.routines.is_empty() && m.sequences.is_empty() {
+                    ui.weak("Nothing here yet.");
                 }
-                for t in tables {
-                    if let Some(a) = self.table_ui(ui, p, schema, &t, backend) {
-                        action = Some(a);
+                for (label, list) in [("Tables", &tables), ("Views", &views)] {
+                    if list.is_empty() {
+                        continue;
                     }
+                    egui::CollapsingHeader::new(format!("{label} ({})", list.len()))
+                        .id_salt(("group", &p.name, schema, label))
+                        .default_open(label == "Tables")
+                        .show(ui, |ui| {
+                            for t in list {
+                                if let Some(a) = table_ui(ui, p, schema, t) {
+                                    action = Some(a);
+                                }
+                            }
+                        });
+                }
+                if !m.routines.is_empty() {
+                    egui::CollapsingHeader::new(format!("Routines ({})", m.routines.len()))
+                        .id_salt(("group", &p.name, schema, "routines"))
+                        .show(ui, |ui| {
+                            for r in &m.routines {
+                                let glyph = match r.kind {
+                                    RoutineKind::Function => icon::FUNCTION,
+                                    RoutineKind::Procedure => icon::GEAR,
+                                };
+                                let resp = ui.label(format!("{glyph}  {}", r.name)).on_hover_text(
+                                    match &r.returns {
+                                        Some(ret) => {
+                                            format!("{}({}) → {ret}", r.name, r.arguments)
+                                        }
+                                        None => format!("{}({})", r.name, r.arguments),
+                                    },
+                                );
+                                resp.context_menu(|ui| {
+                                    if ui.button(format!("{} Show DDL", icon::CODE)).clicked() {
+                                        action = Some(BrowserAction::ShowDdl {
+                                            profile: p.name.clone(),
+                                            schema: schema.to_owned(),
+                                            kind: ObjectKind::Routine,
+                                            name: r.name.clone(),
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                }
+                if !m.sequences.is_empty() {
+                    egui::CollapsingHeader::new(format!("Sequences ({})", m.sequences.len()))
+                        .id_salt(("group", &p.name, schema, "sequences"))
+                        .show(ui, |ui| {
+                            for seq in &m.sequences {
+                                let resp =
+                                    ui.label(format!("{}  {}", icon::LIST_NUMBERS, seq.name));
+                                resp.context_menu(|ui| {
+                                    if ui.button(format!("{} Show DDL", icon::CODE)).clicked() {
+                                        action = Some(BrowserAction::ShowDdl {
+                                            profile: p.name.clone(),
+                                            schema: schema.to_owned(),
+                                            kind: ObjectKind::Sequence,
+                                            name: seq.name.clone(),
+                                        });
+                                    }
+                                });
+                            }
+                        });
                 }
             });
-        action
-    }
-
-    fn table_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        p: &ProfileSummary,
-        schema: &str,
-        t: &TableInfo,
-        backend: &Backend,
-    ) -> Option<BrowserAction> {
-        let mut action = None;
-        let glyph = match t.kind {
-            TableKind::Table | TableKind::ForeignTable => icon::TABLE,
-            TableKind::View | TableKind::MaterializedView => icon::EYE,
-        };
-        let header = egui::CollapsingHeader::new(format!("{glyph}  {}", t.name))
-            .id_salt(("table", &p.name, schema, &t.name))
-            .show(ui, |ui| {
-                let key = (p.name.clone(), schema.to_owned(), t.name.clone());
-                let load = self.columns.entry(key).or_insert_with(|| {
-                    Load::Loading(Some(backend.run(Command::Columns {
-                        profile: p.name.clone(),
-                        schema: Some(schema.to_owned()),
-                        table: t.name.clone(),
-                    })))
+        header.header_response.context_menu(|ui| {
+            if ui
+                .button(format!("{} Show DDL of everything", icon::CODE))
+                .clicked()
+            {
+                action = Some(BrowserAction::ShowDdl {
+                    profile: p.name.clone(),
+                    schema: schema.to_owned(),
+                    kind: ObjectKind::Schema,
+                    name: String::new(),
                 });
-                let columns = match load {
-                    Load::Loading(_) => return spinner(ui),
-                    Load::Failed(e) => return failed(ui, e),
-                    Load::Ready(c) => c,
-                };
-                for c in columns.iter() {
-                    let key = if c.primary_key { icon::KEY } else { " " };
-                    let resp = ui.horizontal(|ui| {
-                        ui.label(format!("{key} {}", c.name));
-                        ui.weak(&c.data_type);
-                    });
-                    let mut tip = format!(
-                        "{} {}{}",
-                        c.name,
-                        c.data_type,
-                        if c.nullable { "" } else { " NOT NULL" }
-                    );
-                    if let Some(d) = &c.default {
-                        tip.push_str(&format!("\nDEFAULT {d}"));
-                    }
-                    resp.response.on_hover_text(tip);
-                }
-            });
-        let kind = match t.kind {
-            TableKind::Table => "Table",
-            TableKind::View => "View",
-            TableKind::MaterializedView => "Materialized view",
-            TableKind::ForeignTable => "Foreign table",
-        };
-        let open = || BrowserAction::OpenTable {
-            profile: p.name.clone(),
-            schema: schema.to_owned(),
-            table: t.name.clone(),
-        };
-        let resp = header
-            .header_response
-            .on_hover_text(format!("{kind}. Double-click to see its rows."));
-        if resp.double_clicked() {
-            action = Some(open());
-        }
-        resp.context_menu(|ui| {
-            if ui.button(format!("{} Show rows", icon::ROWS)).clicked() {
-                action = Some(open());
             }
-            if ui.button(format!("{} Copy name", icon::COPY)).clicked() {
-                ui.ctx().copy_text(t.name.clone());
+            if ui
+                .button(format!("{} Refresh", icon::ARROWS_CLOCKWISE))
+                .clicked()
+            {
+                self.models.remove(&(p.name.clone(), schema.to_owned()));
             }
         });
         action
     }
+}
+
+fn table_ui(
+    ui: &mut egui::Ui,
+    p: &ProfileSummary,
+    schema: &str,
+    t: &TableModel,
+) -> Option<BrowserAction> {
+    let mut action = None;
+    let glyph = match t.kind {
+        TableKind::Table | TableKind::ForeignTable => icon::TABLE,
+        TableKind::View | TableKind::MaterializedView => icon::EYE,
+    };
+    let pk: &[String] = t.primary_key().map_or(&[], |k| &k.columns);
+    let fk_columns: Vec<&String> = t.foreign_keys().flat_map(|f| &f.columns).collect();
+    let header = egui::CollapsingHeader::new(format!("{glyph}  {}", t.name))
+        .id_salt(("table", &p.name, schema, &t.name))
+        .show(ui, |ui| {
+            for c in &t.columns {
+                let mark = if pk.contains(&c.name) {
+                    icon::KEY
+                } else if fk_columns.contains(&&c.name) {
+                    icon::LINK
+                } else {
+                    " "
+                };
+                let resp = ui.horizontal(|ui| {
+                    ui.label(format!("{mark} {}", c.name));
+                    ui.weak(&c.data_type);
+                });
+                let mut tip = format!(
+                    "{} {}{}",
+                    c.name,
+                    c.data_type,
+                    if c.nullable { "" } else { " NOT NULL" }
+                );
+                if let Some(d) = &c.default {
+                    tip.push_str(&format!("\nDEFAULT {d}"));
+                }
+                for extra in [&c.identity, &c.generated, &c.comment]
+                    .into_iter()
+                    .flatten()
+                {
+                    tip.push_str(&format!("\n{extra}"));
+                }
+                resp.response.on_hover_text(tip);
+            }
+            let keys: Vec<_> = t
+                .constraints
+                .iter()
+                .filter(|c| c.kind != ConstraintKind::ForeignKey)
+                .collect();
+            let fks: Vec<_> = t.foreign_keys().collect();
+            if !keys.is_empty() {
+                section(
+                    ui,
+                    ("keys", &p.name, schema, &t.name),
+                    "Keys",
+                    keys.len(),
+                    |ui| {
+                        for c in &keys {
+                            let glyph = match c.kind {
+                                ConstraintKind::PrimaryKey => icon::KEY,
+                                ConstraintKind::Unique => icon::FINGERPRINT,
+                                _ => icon::CHECK_SQUARE,
+                            };
+                            ui.label(format!("{glyph} {}", c.name))
+                                .on_hover_text(&c.definition);
+                        }
+                    },
+                );
+            }
+            if !fks.is_empty() {
+                section(
+                    ui,
+                    ("fks", &p.name, schema, &t.name),
+                    "Foreign keys",
+                    fks.len(),
+                    |ui| {
+                        for c in &fks {
+                            let target = c.references.as_ref().map_or(String::new(), |r| {
+                                format!("→ {}({})", r.table, r.columns.join(", "))
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} {}", icon::LINK, c.columns.join(", ")));
+                                ui.weak(target);
+                            })
+                            .response
+                            .on_hover_text(format!("{}\n{}", c.name, c.definition));
+                        }
+                    },
+                );
+            }
+            if !t.indexes.is_empty() {
+                section(
+                    ui,
+                    ("indexes", &p.name, schema, &t.name),
+                    "Indexes",
+                    t.indexes.len(),
+                    |ui| {
+                        for i in &t.indexes {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} {}", icon::LIGHTNING, i.name));
+                                ui.weak(format!(
+                                    "{}({})",
+                                    if i.unique { "unique " } else { "" },
+                                    i.columns.join(", ")
+                                ));
+                            })
+                            .response
+                            .on_hover_text(&i.definition);
+                        }
+                    },
+                );
+            }
+            if !t.triggers.is_empty() {
+                section(
+                    ui,
+                    ("triggers", &p.name, schema, &t.name),
+                    "Triggers",
+                    t.triggers.len(),
+                    |ui| {
+                        for tr in &t.triggers {
+                            ui.label(format!("{} {}", icon::LIGHTNING_A, tr.name))
+                                .on_hover_text(&tr.definition);
+                        }
+                    },
+                );
+            }
+        });
+    let kind = match t.kind {
+        TableKind::Table => "Table",
+        TableKind::View => "View",
+        TableKind::MaterializedView => "Materialized view",
+        TableKind::ForeignTable => "Foreign table",
+    };
+    let open = || BrowserAction::OpenTable {
+        profile: p.name.clone(),
+        schema: schema.to_owned(),
+        table: t.name.clone(),
+    };
+    let mut tip = format!("{kind}. Double-click to see its rows.");
+    if let Some(c) = &t.comment {
+        tip = format!("{c}\n\n{tip}");
+    }
+    let resp = header.header_response.on_hover_text(tip);
+    if resp.double_clicked() {
+        action = Some(open());
+    }
+    resp.context_menu(|ui| {
+        if ui.button(format!("{} Show rows", icon::ROWS)).clicked() {
+            action = Some(open());
+        }
+        if ui.button(format!("{} Show DDL", icon::CODE)).clicked() {
+            action = Some(BrowserAction::ShowDdl {
+                profile: p.name.clone(),
+                schema: schema.to_owned(),
+                kind: ObjectKind::Table,
+                name: t.name.clone(),
+            });
+        }
+        if ui.button(format!("{} Copy name", icon::COPY)).clicked() {
+            ui.ctx().copy_text(t.name.clone());
+        }
+    });
+    action
+}
+
+/// A collapsed group under a table (keys, indexes...).
+fn section(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    n: usize,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    egui::CollapsingHeader::new(RichText::new(format!("{label} ({n})")).weak())
+        .id_salt(id)
+        .show(ui, body);
 }
 
 fn spinner(ui: &mut egui::Ui) {

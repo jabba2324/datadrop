@@ -16,8 +16,10 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
 - **SSH tunnels**: reach a database through an SSH server, signing in with your SSH
   agent, a key file or a password. Host keys are checked (unknown ones show their
   fingerprint to confirm).
-- **Schema browser**: schemas (databases on MySQL), tables and views, columns with
-  types, keys, nullability and defaults. Double-click a table to see its rows.
+- **Schema browser**: schemas (databases on MySQL); tables with their columns, keys,
+  foreign keys, indexes and triggers; views, functions and procedures, sequences.
+  Double-click a table to see its rows; right-click for its DDL (or the whole
+  schema's).
 - **SQL editor** with syntax highlighting, line numbers and tabs. Open, save and close
   `.sql` files; open files come back next time.
 - **Autocompletion** of tables, columns (of the tables the statement uses, or after
@@ -73,6 +75,9 @@ datadrop schemas shop
 datadrop tables shop --schema public
 datadrop columns shop orders
 datadrop catalog shop                 # every table with its columns
+datadrop schema shop                  # tables with keys, indexes, triggers; routines...
+datadrop ddl shop orders              # the SQL that creates it (--routine, --sequence)
+datadrop ddl shop --all > schema.sql  # everything in the schema, in an order that runs
 
 # Run SQL: an argument, a file, or standard input
 datadrop query shop "select id, total from orders order by id desc limit 5"

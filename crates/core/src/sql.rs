@@ -566,14 +566,31 @@ pub fn split_statements(text: &str, dialect: Dialect) -> Vec<Range<usize>> {
     let mut first: Option<usize> = None;
     let mut last_end = 0;
     let mut has_code = false;
+    // SQLite's CREATE TRIGGER has a BEGIN ... END body with `;`s inside (and CASE
+    // ... END expressions in it).
+    let mut keywords = 0;
+    let mut trigger = false;
+    let mut depth = 0usize;
     for t in tokenize(text, dialect) {
+        if dialect == Dialect::Sqlite && t.kind == TokenKind::Keyword {
+            let word = text[t.range.clone()].to_ascii_uppercase();
+            keywords += 1;
+            match word.as_str() {
+                "TRIGGER" if keywords <= 3 && has_code => trigger = true,
+                "BEGIN" | "CASE" if trigger => depth += 1,
+                "END" if trigger => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
         match t.kind {
-            TokenKind::Punctuation if &text[t.range.clone()] == ";" => {
+            TokenKind::Punctuation if &text[t.range.clone()] == ";" && depth == 0 => {
                 if has_code && let Some(f) = first {
                     out.push(f..last_end);
                 }
                 first = None;
                 has_code = false;
+                keywords = 0;
+                trigger = false;
             }
             TokenKind::Whitespace => {}
             kind => {
@@ -826,6 +843,20 @@ mod tests {
         );
         let body = "create function f() returns int as $$ begin return 1; end $$ language plpgsql; select f()";
         assert_eq!(stmts(body, Postgres).len(), 2);
+        let trigger = "create temp trigger t after insert on a begin \
+                       update a set n = case when new.n > 0 then 1 else 0 end; \
+                       delete from b; end; select 1";
+        assert_eq!(
+            stmts(trigger, Sqlite),
+            [
+                "create temp trigger t after insert on a begin \
+                 update a set n = case when new.n > 0 then 1 else 0 end; \
+                 delete from b; end",
+                "select 1"
+            ]
+        );
+        // BEGIN on its own is a transaction.
+        assert_eq!(stmts("begin; select 1; end", Sqlite).len(), 3);
         assert_eq!(stmts("", Postgres), Vec::<&str>::new());
         assert_eq!(
             stmts("-- just this\nselect 2", Mysql),

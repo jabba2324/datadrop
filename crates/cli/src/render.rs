@@ -80,6 +80,69 @@ pub fn plan(out: &mut impl Write, plan: &datadrop_core::Plan) -> io::Result<()> 
     Ok(())
 }
 
+/// A schema as an outline: each table with its columns, keys, indexes and triggers;
+/// then views, routines and sequences.
+pub fn schema(out: &mut impl Write, m: &datadrop_core::SchemaModel) -> io::Result<()> {
+    use datadrop_core::schema::{ConstraintKind, RoutineKind};
+    for t in &m.tables {
+        writeln!(out, "{} {}", kind(t.kind), t.name)?;
+        for c in &t.columns {
+            let pk = t.primary_key().is_some_and(|k| k.columns.contains(&c.name));
+            let mut line = format!(
+                "    {}{} {}",
+                if pk { "* " } else { "" },
+                c.name,
+                c.data_type
+            );
+            if !c.nullable {
+                line.push_str(" NOT NULL");
+            }
+            if let Some(d) = &c.default {
+                line.push_str(&format!(" DEFAULT {d}"));
+            }
+            for extra in [&c.identity, &c.generated].into_iter().flatten() {
+                line.push_str(&format!(" {extra}"));
+            }
+            writeln!(out, "{line}")?;
+        }
+        for c in &t.constraints {
+            let what = match c.kind {
+                ConstraintKind::PrimaryKey => "primary key",
+                ConstraintKind::Unique => "unique",
+                ConstraintKind::Check => "check",
+                ConstraintKind::ForeignKey => "foreign key",
+            };
+            writeln!(out, "    {what} {}: {}", c.name, c.definition)?;
+        }
+        for i in &t.indexes {
+            writeln!(
+                out,
+                "    {}index {} ({})",
+                if i.unique { "unique " } else { "" },
+                i.name,
+                i.columns.join(", ")
+            )?;
+        }
+        for tr in &t.triggers {
+            writeln!(out, "    trigger {}", tr.name)?;
+        }
+    }
+    for r in &m.routines {
+        let what = match r.kind {
+            RoutineKind::Function => "function",
+            RoutineKind::Procedure => "procedure",
+        };
+        match &r.returns {
+            Some(ret) => writeln!(out, "{what} {}({}) returns {ret}", r.name, r.arguments)?,
+            None => writeln!(out, "{what} {}({})", r.name, r.arguments)?,
+        }
+    }
+    for s in &m.sequences {
+        writeln!(out, "sequence {}", s.name)?;
+    }
+    Ok(())
+}
+
 pub fn kind(k: TableKind) -> &'static str {
     match k {
         TableKind::Table => "table",

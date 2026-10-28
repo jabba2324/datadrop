@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use datadrop_core::{
-    Client, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, PasswordStorage, Profile,
-    QueryOutput, SshAuth, SshTunnel, SslMode, StatementResult,
+    Client, Command, ConfigDir, CoreError, Driver, ExportFormat, ObjectKind, Output,
+    PasswordStorage, Profile, QueryOutput, SshAuth, SshTunnel, SslMode, StatementResult,
 };
 
 mod render;
@@ -50,6 +50,29 @@ enum Cmd {
     },
     /// Every table and view with its columns (what autocompletion uses).
     Catalog { profile: String },
+    /// A schema's tables with their keys, indexes, foreign keys and triggers; views,
+    /// routines and sequences.
+    Schema {
+        profile: String,
+        #[arg(long, short)]
+        schema: Option<String>,
+    },
+    /// The SQL that creates a table or view (with its indexes and triggers), a
+    /// routine, a sequence, or (with --all) everything in the schema.
+    Ddl {
+        profile: String,
+        /// The table or view (or, with --routine / --sequence, that).
+        name: Option<String>,
+        #[arg(long, short)]
+        schema: Option<String>,
+        #[arg(long, conflicts_with = "sequence")]
+        routine: bool,
+        #[arg(long)]
+        sequence: bool,
+        /// Everything in the schema.
+        #[arg(long, conflicts_with_all = ["name", "routine", "sequence"])]
+        all: bool,
+    },
     /// Run SQL: from the argument, a file (-f), or standard input.
     Query {
         profile: String,
@@ -352,6 +375,37 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Profile(p) => (profile_command(&client, p)?, Format::Table),
         Cmd::Schemas { profile } => (Command::Schemas { profile }, Format::Table),
         Cmd::Catalog { profile } => (Command::Catalog { profile }, Format::Table),
+        Cmd::Schema { profile, schema } => (Command::Schema { profile, schema }, Format::Table),
+        Cmd::Ddl {
+            profile,
+            name,
+            schema,
+            routine,
+            sequence,
+            all,
+        } => {
+            let kind = if all {
+                ObjectKind::Schema
+            } else if routine {
+                ObjectKind::Routine
+            } else if sequence {
+                ObjectKind::Sequence
+            } else {
+                ObjectKind::Table
+            };
+            if kind != ObjectKind::Schema && name.is_none() {
+                bail!("say which object, or --all for the whole schema");
+            }
+            (
+                Command::Ddl {
+                    profile,
+                    schema,
+                    kind,
+                    name: name.unwrap_or_default(),
+                },
+                Format::Table,
+            )
+        }
         Cmd::Tables { profile, schema } => (Command::Tables { profile, schema }, Format::Table),
         Cmd::Columns {
             profile,
@@ -733,6 +787,8 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
                 if *removed == 1 { "y" } else { "ies" }
             )
         }
+        Output::Schema(m) => render::schema(&mut stdout, m)?,
+        Output::Ddl { sql } => write!(stdout, "{sql}")?,
         Output::Keychain {
             name,
             available,

@@ -71,6 +71,23 @@ Host keys are checked against `~/.ssh/known_hosts` and DataDrop's own
 `known_hosts`. An unknown key is an error carrying its fingerprint and key, so the
 front-end can ask and then `SshTrustHost`; a changed key is refused outright.
 
+## Schema structure
+
+`crates/core/src/schema.rs`. The `Schema` command reads a schema into a
+`SchemaModel`: tables and views with columns (type, default, identity or generated
+clause, comment), constraints (primary key, unique, check, foreign keys with their
+target and rules), indexes, triggers and view definitions; routines and sequences.
+It's a few catalog queries per schema (PostgreSQL's `pg_catalog`, MySQL's
+`information_schema` plus `SHOW CREATE` for routines, SQLite's `sqlite_master` and
+pragmas). Constraints, indexes and triggers keep their SQL as the server renders it
+(`pg_get_constraintdef`, `pg_get_indexdef`...), so DDL needs no per-type knowledge.
+
+`Ddl` turns the model back into SQL (MySQL tables use `SHOW CREATE TABLE`, for the
+engine and options). For a whole schema the order is the one pg_dump uses:
+sequences, routines (with `check_function_bodies` off), tables with referenced ones
+first (a foreign key in a cycle is added afterwards), views, triggers. The live tests
+recreate a schema from its DDL and check it reads back identical.
+
 ## Autocompletion
 
 `crates/core/src/complete.rs`. The `Catalog` command reads every table and column in

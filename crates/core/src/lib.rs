@@ -16,6 +16,7 @@ pub mod history;
 pub mod keychain;
 pub mod plan;
 pub mod profile;
+pub mod schema;
 pub mod sql;
 pub mod tunnel;
 
@@ -31,4 +32,5 @@ pub use plan::{Plan, PlanNode};
 pub use profile::{
     Driver, PasswordStorage, Profile, ProfileStore, ProfileSummary, SshAuth, SshTunnel, SslMode,
 };
+pub use schema::{ObjectKind, SchemaModel, TableModel};
 pub use tokio_util::sync::CancellationToken;
