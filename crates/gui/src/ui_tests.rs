@@ -632,3 +632,38 @@ fn sorts_and_filters_results() {
                 .is_some_and(|o| o.results[0].rows.len() == 4)
     });
 }
+
+#[test]
+fn asks_for_parameter_values() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    h.state_mut().docs[0].text = "select :n * 2 as twice, :who as who".into();
+    let ctx = h.ctx.clone();
+    h.state_mut().run(&ctx, true);
+    h.run_steps(2);
+    assert!(h.state().docs[0].running.is_none());
+    h.get_by_label("Values for the query");
+    h.get_by_label(":n").click();
+    h.run_steps(1);
+    h.get_by_label(":n").type_text("21");
+    h.run_steps(1);
+    h.get_by_label(":who").click();
+    h.run_steps(1);
+    h.get_by_label(":who").type_text("O'Brien");
+    h.run_steps(1);
+    h.get_by_label("Run").click();
+    until(&mut h, "the query", |a| {
+        a.docs[0].output.is_some() && a.docs[0].running.is_none()
+    });
+    let out = h.state().docs[0].output.clone().unwrap();
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(out.results[0].rows[0][0].as_deref(), Some("42"));
+    assert_eq!(out.results[0].rows[0][1].as_deref(), Some("O'Brien"));
+    // The values are offered again next time.
+    let ctx = h.ctx.clone();
+    h.state_mut().run(&ctx, true);
+    h.run_steps(2);
+    assert_eq!(h.state().params.as_ref().unwrap().values[0].0, "21");
+}

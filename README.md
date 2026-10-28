@@ -28,6 +28,8 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
   Mac), or the whole tab (`Ctrl+Shift+Enter`). Scripts run statement by statement and
   stop at the first error. MySQL scripts can change the `DELIMITER`.
 - **Stop** a running query: it's cancelled on the server, not just abandoned.
+- **Parameters**: write `:name` (or `?`, or `$1` on PostgreSQL) and you're asked for
+  the values when it runs; the last ones are remembered per tab.
 - **Results grid** for every result set, with NULLs marked, copy as text, and
   **export** to CSV, TSV or JSON (every row, not just those shown). Click a header
   to sort; type a `WHERE` condition to filter. Both run on the server when the
@@ -85,6 +87,11 @@ datadrop ddl shop --all > schema.sql  # everything in the schema, in an order th
 datadrop query shop "select id, total from orders order by id desc limit 5"
 datadrop query shop -f report.sql --format csv
 echo "select now()" | datadrop query shop --format json
+
+# Placeholders: :name, ? (MySQL, SQLite) or $1 (PostgreSQL)
+datadrop query shop "select * from orders where customer_id = :id" --param id=42
+datadrop query shop "select * from orders where placed > :since" \
+  --param-sql since="now() - interval '1 day'"
 
 # Export every row to a file (format from the extension)
 datadrop query shop "select * from orders" -o orders.csv

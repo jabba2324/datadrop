@@ -90,6 +90,8 @@ enum Cmd {
         /// limit). The format comes from the extension (.csv, .tsv, .json) or --format.
         #[arg(long, short)]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        params: Params,
     },
     /// Show how the database will run a statement (its query plan).
     Explain {
@@ -102,6 +104,8 @@ enum Cmd {
         /// rolled back afterwards.
         #[arg(long)]
         analyze: bool,
+        #[command(flatten)]
+        params: Params,
     },
     /// Queries run before, from the app and the command line.
     #[command(subcommand)]
@@ -110,6 +114,67 @@ enum Cmd {
     Keychain,
     /// Run a command given as JSON (see the docs for the shape), printing JSON.
     Exec { command: String },
+}
+
+/// Values for `:name`, `?` and `$1` placeholders.
+#[derive(Args, Default)]
+struct Params {
+    /// A value for a placeholder: `--param id=42` fills `:id`, `--param 1=x` the first
+    /// `?` (or `$1`). Numbers go in as they are, `null` as NULL, the rest as text.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    values: Vec<String>,
+    /// A value written into the SQL as it is: `--param-sql since="now() - interval '1 day'"`.
+    #[arg(long = "param-sql", value_name = "NAME=SQL")]
+    sql_values: Vec<String>,
+}
+
+impl Params {
+    /// The SQL with its placeholders filled in.
+    fn bind(&self, client: &Client, profile: &str, sql: String) -> Result<String> {
+        use datadrop_core::params::{self, ParamMode};
+        let dialect: datadrop_core::sql::Dialect =
+            client.store().get_without_secrets(profile)?.driver.into();
+        let found = params::parameters(&sql, dialect);
+        if found.is_empty() {
+            if !self.values.is_empty() || !self.sql_values.is_empty() {
+                bail!("the SQL has no placeholders (:name, ?, $1) for --param");
+            }
+            return Ok(sql);
+        }
+        let mut given = std::collections::HashMap::new();
+        for (list, mode) in [
+            (&self.values, ParamMode::Auto),
+            (&self.sql_values, ParamMode::Sql),
+        ] {
+            for v in list {
+                let (name, value) = v
+                    .split_once('=')
+                    .with_context(|| format!("give --param as NAME=VALUE, not '{v}'"))?;
+                given.insert(params::short_name(name.trim()).to_owned(), (value, mode));
+            }
+        }
+        let mut values = std::collections::HashMap::new();
+        let mut missing = vec![];
+        for p in &found {
+            match given.remove(params::short_name(&p.name)) {
+                Some((v, mode)) => {
+                    values.insert(p.name.clone(), params::value_sql(v, mode, dialect));
+                }
+                None => missing.push(p.name.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            bail!(
+                "the SQL needs a value for {} (--param {}=...)",
+                missing.join(", "),
+                params::short_name(&missing[0])
+            );
+        }
+        if let Some(extra) = given.keys().next() {
+            bail!("the SQL has no placeholder called {extra}");
+        }
+        Ok(params::bind(&sql, &found, &values))
+    }
 }
 
 #[derive(Subcommand)]
@@ -426,8 +491,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             max_rows,
             format,
             output,
+            params,
         } => {
-            let sql = read_sql(sql, file)?;
+            let sql = params.bind(&client, &profile, read_sql(sql, file)?)?;
             if let Some(path) = output {
                 let format = match format {
                     Format::Csv => Some(ExportFormat::Csv),
@@ -463,10 +529,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             sql,
             file,
             analyze,
+            params,
         } => (
             Command::Explain {
+                sql: params.bind(&client, &profile, read_sql(sql, file)?)?,
                 profile,
-                sql: read_sql(sql, file)?,
                 analyze,
                 session: None,
             },
@@ -863,4 +930,13 @@ fn print_result(out: &mut impl Write, r: &StatementResult, format: Format) -> Re
         Format::Json => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cli_is_consistent() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
 }

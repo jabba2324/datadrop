@@ -45,6 +45,8 @@ pub struct Document {
     pub grid: crate::grid_edit::GridEdit,
     /// The results filtered or sorted by the server.
     pub filter: Option<crate::grid_edit::Filter>,
+    /// The values last given for the query's placeholders.
+    pub param_values: std::collections::HashMap<String, (String, datadrop_core::params::ParamMode)>,
     pub view: ResultView,
     pub plan: Option<datadrop_core::Plan>,
     pub plan_error: Option<String>,
@@ -80,6 +82,7 @@ impl Document {
             running: None,
             grid: Default::default(),
             filter: None,
+            param_values: Default::default(),
             view: ResultView::Results,
             plan: None,
             plan_error: None,

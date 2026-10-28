@@ -182,6 +182,19 @@ impl Lexer<'_> {
                     self.i += 1;
                     self.push(TokenKind::Parameter, start);
                 }
+                // :name, for running with values asked for (not PostgreSQL's ::type).
+                b':' if self.s[self.i + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_ident_start)
+                    && (self.i == 0 || self.b[self.i - 1] != b':') =>
+                {
+                    self.i += 1;
+                    while self.i < self.b.len() && is_ident_char(self.char_here()) {
+                        self.i += self.char_here().len_utf8();
+                    }
+                    self.push(TokenKind::Parameter, start);
+                }
                 b'0'..=b'9' => {
                     self.number();
                     self.push(TokenKind::Number, start);

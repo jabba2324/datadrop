@@ -17,6 +17,7 @@ use crate::browser::{Browser, BrowserAction};
 use crate::editor::{self, Document, Find, ResultView};
 use crate::grid_edit::{Editability, Review};
 use crate::history_view::{HistoryAction, HistoryView};
+use crate::params_dialog::{ParamPrompt, ParamsDone, Then};
 use crate::profile_form::{FormDone, ProfileForm, TrustPrompt};
 use crate::results::{self, ResultsAction};
 use crate::settings::{Settings, Theme};
@@ -73,6 +74,8 @@ pub struct App {
     pub form: Option<ProfileForm>,
     pub confirm: Option<Confirm>,
     delete_task: Option<Task>,
+    /// Asking for the values of the query's placeholders.
+    pub params: Option<ParamPrompt>,
     /// DDL being read, to open in a new tab: (task, profile, tab name).
     ddl_tasks: Vec<(Option<Task>, String, String)>,
     /// An SSH server to trust (its key isn't known yet), and the task trusting it.
@@ -141,6 +144,7 @@ impl App {
             confirm: None,
             delete_task: None,
             ddl_tasks: vec![],
+            params: None,
             trust: None,
             trusting: None,
             toasts: egui_notify::Toasts::default(),
@@ -371,14 +375,7 @@ impl App {
         let Some((profile, sql)) = self.sql_to_run(ctx, whole) else {
             return;
         };
-        let doc = &self.docs[self.active];
-        let command = Command::Query {
-            profile,
-            sql,
-            session: Some(doc.session()),
-            max_rows: Some(self.settings.max_rows),
-        };
-        self.start(self.active, command, ResultView::Results);
+        self.then(Then::Run, profile, sql);
     }
 
     /// Show the plan for the selection or the statement under the cursor.
@@ -386,14 +383,50 @@ impl App {
         let Some((profile, sql)) = self.sql_to_run(ctx, false) else {
             return;
         };
+        self.then(Then::Explain { analyze }, profile, sql);
+    }
+
+    /// Run or explain `sql` in the active tab, asking for placeholder values first.
+    fn then(&mut self, then: Then, profile: String, sql: String) {
+        let dialect = self.dialect_of(Some(&profile));
         let doc = &self.docs[self.active];
-        let command = Command::Explain {
-            profile,
-            sql,
-            analyze,
-            session: Some(doc.session()),
+        if let Some(prompt) = ParamPrompt::new(
+            doc.id,
+            then,
+            profile.clone(),
+            sql.clone(),
+            dialect,
+            &doc.param_values,
+        ) {
+            self.params = Some(prompt);
+            return;
+        }
+        self.run_sql(self.active, then, profile, sql);
+    }
+
+    fn run_sql(&mut self, i: usize, then: Then, profile: String, sql: String) {
+        let session = Some(self.docs[i].session());
+        let (command, view) = match then {
+            Then::Run => (
+                Command::Query {
+                    profile,
+                    sql,
+                    session,
+                    max_rows: Some(self.settings.max_rows),
+                },
+                ResultView::Results,
+            ),
+            Then::Explain { analyze } => (
+                Command::Explain {
+                    profile,
+                    sql,
+                    analyze,
+                    session,
+                },
+                ResultView::Plan,
+            ),
         };
-        self.start(self.active, command, ResultView::Plan);
+        self.start(i, command, view);
     }
 
     /// Run a command in tab `i`, first asking about grid edits it would throw away.
@@ -644,7 +677,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let modal_open = self.form.is_some() || self.confirm.is_some();
+        let modal_open = self.form.is_some() || self.confirm.is_some() || self.params.is_some();
         if modal_open {
             return;
         }
@@ -1593,6 +1626,17 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.review_dialog(ctx);
+        if let Some(p) = &mut self.params
+            && let Some(done) = p.ui(ctx)
+        {
+            let p = self.params.take().expect("checked above");
+            if let ParamsDone::Run(sql, remember) = done
+                && let Some(i) = self.docs.iter().position(|d| d.id == p.doc)
+            {
+                self.docs[i].param_values.extend(remember);
+                self.run_sql(i, p.then, p.profile, sql);
+            }
+        }
         if self.form.is_none() {
             self.trust_dialog(ctx);
         }

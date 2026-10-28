@@ -9,6 +9,7 @@ mod browser;
 mod editor;
 mod grid_edit;
 mod history_view;
+mod params_dialog;
 mod plan_view;
 mod profile_form;
 mod results;
