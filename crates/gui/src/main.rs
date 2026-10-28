@@ -6,6 +6,7 @@
 mod app;
 mod backend;
 mod browser;
+mod diff_dialog;
 mod editor;
 mod grid_edit;
 mod history_view;
@@ -15,6 +16,7 @@ mod plan_view;
 mod profile_form;
 mod results;
 mod settings;
+mod table_editor;
 mod theme;
 #[cfg(test)]
 mod ui_tests;

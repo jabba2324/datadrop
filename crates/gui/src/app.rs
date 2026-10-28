@@ -14,6 +14,7 @@ use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
 use crate::browser::{Browser, BrowserAction};
+use crate::diff_dialog::{DiffDialog, DiffDone};
 use crate::editor::{self, Document, Find, ResultView};
 use crate::grid_edit::{Editability, Review};
 use crate::history_view::{HistoryAction, HistoryView};
@@ -22,6 +23,7 @@ use crate::params_dialog::{ParamPrompt, ParamsDone, Then};
 use crate::profile_form::{FormDone, ProfileForm, TrustPrompt};
 use crate::results::{self, ResultsAction};
 use crate::settings::{Settings, Theme};
+use crate::table_editor::{EditorDone, TableEditor};
 use crate::theme;
 
 pub enum ConfirmKind {
@@ -80,6 +82,8 @@ pub struct App {
     /// Asking for the values of the query's placeholders.
     pub params: Option<ParamPrompt>,
     pub import: Option<ImportDialog>,
+    pub editor: Option<TableEditor>,
+    pub diff: Option<DiffDialog>,
     /// DDL being read, to open in a new tab: (task, profile, tab name).
     ddl_tasks: Vec<(Option<Task>, String, String)>,
     /// An SSH server to trust (its key isn't known yet), and the task trusting it.
@@ -153,6 +157,8 @@ impl App {
             ddl_tasks: vec![],
             params: None,
             import: None,
+            editor: None,
+            diff: None,
             trust: None,
             trusting: None,
             toasts: egui_notify::Toasts::default(),
@@ -728,7 +734,9 @@ impl App {
         let modal_open = self.form.is_some()
             || self.confirm.is_some()
             || self.params.is_some()
-            || self.import.is_some();
+            || self.import.is_some()
+            || self.editor.is_some()
+            || self.diff.is_some();
         if modal_open {
             return;
         }
@@ -1366,6 +1374,22 @@ impl App {
                     kind: ConfirmKind::DeleteProfile(name),
                 });
             }
+            BrowserAction::Compare { profile, schema } => {
+                self.diff = Some(DiffDialog::new(profile, schema));
+            }
+            BrowserAction::EditTable {
+                profile,
+                schema,
+                table,
+            } => {
+                let dialect = self.dialect_of(Some(&profile));
+                self.editor = Some(TableEditor::new(
+                    profile,
+                    schema,
+                    dialect,
+                    table.map(|t| *t),
+                ));
+            }
             BrowserAction::Import {
                 profile,
                 schema,
@@ -1802,6 +1826,34 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.review_dialog(ctx);
+        if let Some(d) = &mut self.diff
+            && let Some(done) = d.ui(ctx, &self.backend, &self.profiles)
+        {
+            self.diff = None;
+            if let DiffDone::Script {
+                profile,
+                title,
+                sql,
+            } = done
+            {
+                let i = self.new_tab(Some(profile));
+                self.docs[i].untitled_name = title;
+                self.docs[i].text = sql;
+            }
+        }
+        if let Some(e) = &mut self.editor
+            && let Some(done) = e.ui(ctx, &self.backend)
+        {
+            let e = self.editor.take().expect("checked above");
+            if let EditorDone::Applied = done {
+                self.toasts.success(if e.is_new() {
+                    "Table created".to_owned()
+                } else {
+                    "Table changed".to_owned()
+                });
+                self.schema_changed(&e.profile);
+            }
+        }
         if let Some(d) = &mut self.import
             && let Some(done) = d.ui(ctx, &self.backend)
         {

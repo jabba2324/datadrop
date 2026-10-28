@@ -41,6 +41,17 @@ pub enum BrowserAction {
     Edit(String),
     Delete(String),
     Add,
+    /// Compare a schema with another.
+    Compare {
+        profile: String,
+        schema: String,
+    },
+    /// Open the table editor on a table, or (`None`) a new one.
+    EditTable {
+        profile: String,
+        schema: String,
+        table: Option<Box<TableModel>>,
+    },
     /// Import a file into a table.
     Import {
         profile: String,
@@ -313,6 +324,22 @@ impl Browser {
                 }
             });
         header.header_response.context_menu(|ui| {
+            if ui.button(format!("{} New table…", icon::PLUS)).clicked() {
+                action = Some(BrowserAction::EditTable {
+                    profile: p.name.clone(),
+                    schema: schema.to_owned(),
+                    table: None,
+                });
+            }
+            if ui
+                .button(format!("{} Compare with…", icon::ARROWS_LEFT_RIGHT))
+                .clicked()
+            {
+                action = Some(BrowserAction::Compare {
+                    profile: p.name.clone(),
+                    schema: schema.to_owned(),
+                });
+            }
             if ui
                 .button(format!("{} Show DDL of everything", icon::CODE))
                 .clicked()

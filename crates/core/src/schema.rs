@@ -185,7 +185,7 @@ pub fn qualified(schema: &str, name: &str, dialect: Dialect) -> String {
     }
 }
 
-pub(crate) fn column_list(cols: &[String], dialect: Dialect) -> String {
+pub fn column_list(cols: &[String], dialect: Dialect) -> String {
     cols.iter()
         .map(|c| quote_ident(c, dialect))
         .collect::<Vec<_>>()
@@ -1215,7 +1215,7 @@ async fn load_mysql(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
 }
 
 /// `FOREIGN KEY (a) REFERENCES t (id) ON DELETE CASCADE`, from its parts.
-pub(crate) fn fk_definition(c: &Constraint, schema: &str, d: Dialect) -> String {
+pub fn fk_definition(c: &Constraint, schema: &str, d: Dialect) -> String {
     let Some(r) = &c.references else {
         return String::new();
     };

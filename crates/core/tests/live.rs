@@ -1202,3 +1202,194 @@ both!(
         assert_eq!(same.results[0].rows[0][0].as_deref(), Some("450"));
     }
 );
+
+both!(
+    edits_tables_and_diffs_schemas,
+    |driver, schema| async move {
+        use datadrop_core::diff::TableEdit;
+        use datadrop_core::schema::{ConstraintKind, Index};
+        let Some(db) = setup(driver, schema).await else {
+            return;
+        };
+        let p = prefix(&db, schema);
+        ok(run(
+            &db.client,
+            "test",
+            &format!(
+                "CREATE TABLE {p}owners (id int PRIMARY KEY, name varchar(40)); \
+             CREATE TABLE {p}pets (id int PRIMARY KEY, name varchar(40), age int, \
+             note varchar(100)); INSERT INTO {p}pets VALUES (1, 'Rex', 3, 'x'), (2, 'Tom', 5, NULL)"
+            ),
+            None,
+        )
+        .await);
+        let home = home(&db, schema);
+        let m = schema_model(&db, "test", home).await;
+        let old = m.table("pets").unwrap().clone();
+
+        // Rename a column, change a type, drop one, add a NOT NULL one with a default,
+        // an index and a foreign key.
+        let mut new = old.clone();
+        new.columns[1].name = "label".into();
+        new.columns[2].data_type = match driver {
+            Driver::Postgres => "bigint".into(),
+            Driver::Mysql => "bigint".into(),
+            Driver::Sqlite => "BIGINT".into(),
+        };
+        new.columns.retain(|c| c.name != "note");
+        let mut owner = new.columns[0].clone();
+        owner.name = "owner".into();
+        owner.nullable = false;
+        owner.default = Some("1".into());
+        new.columns.push(owner);
+        new.indexes.push(Index {
+            name: "pets_label".into(),
+            columns: vec!["label".into()],
+            unique: false,
+            definition: String::new(),
+            inline: None,
+        });
+        new.constraints.push(datadrop_core::schema::Constraint {
+            name: "pets_owner_fk".into(),
+            kind: ConstraintKind::ForeignKey,
+            columns: vec!["owner".into()],
+            definition: format!(
+                "FOREIGN KEY ({}) REFERENCES {} ({})",
+                datadrop_core::sql::quote_ident("owner", driver.into()),
+                datadrop_core::schema::qualified(home, "owners", driver.into()),
+                datadrop_core::sql::quote_ident("id", driver.into())
+            ),
+            references: None,
+        });
+        ok(run(
+            &db.client,
+            "test",
+            &format!("INSERT INTO {p}owners VALUES (1, 'Ann')"),
+            None,
+        )
+        .await);
+        let out = db
+            .client
+            .execute(Command::AlterTable {
+                profile: "test".into(),
+                edit: TableEdit {
+                    schema: home.into(),
+                    old: Some(old),
+                    new,
+                    renamed_columns: vec![("name".into(), "label".into())],
+                },
+                apply: true,
+            })
+            .await
+            .unwrap();
+        let Output::Migration { migration, applied } = out else {
+            panic!()
+        };
+        assert!(applied, "{migration:?}");
+        let q = ok(run(
+            &db.client,
+            "test",
+            &format!("SELECT id, label, age, owner FROM {p}pets ORDER BY id"),
+            None,
+        )
+        .await);
+        assert_eq!(
+            q.results[0].rows[1],
+            [
+                Some("2".into()),
+                Some("Tom".into()),
+                Some("5".into()),
+                Some("1".into())
+            ],
+            "{}",
+            migration.script()
+        );
+        let m = schema_model(&db, "test", home).await;
+        let pets = m.table("pets").unwrap();
+        assert!(pets.column("note").is_none());
+        assert!(pets.indexes.iter().any(|i| i.name == "pets_label"));
+        assert_eq!(pets.foreign_keys().count(), 1, "{pets:#?}");
+
+        // A second schema (database, file) like the first in part; the diff makes it
+        // the same.
+        let (other_profile, other_schema) = match driver {
+            Driver::Sqlite => {
+                let other = Profile {
+                    name: "other".into(),
+                    driver,
+                    database: db._dir.path().join("other.db").display().to_string(),
+                    create_if_missing: true,
+                    ..Profile::default()
+                };
+                save(&db.client, other).await;
+                ok(run(
+                    &db.client,
+                    "other",
+                    "CREATE TABLE owners (id int PRIMARY KEY, name varchar(10), extra int); \
+                 CREATE TABLE gone (id int)",
+                    None,
+                )
+                .await);
+                ("other".to_owned(), "main".to_owned())
+            }
+            _ => {
+                let other = format!("{schema}_b");
+                let create = if driver == Driver::Postgres {
+                    format!(
+                        "DROP SCHEMA IF EXISTS {other} CASCADE; CREATE SCHEMA {other}; \
+                     CREATE TABLE {other}.owners (id int PRIMARY KEY, name varchar(10), extra int); \
+                     CREATE TABLE {other}.gone (id int)"
+                    )
+                } else {
+                    format!(
+                        "DROP DATABASE IF EXISTS {other}; CREATE DATABASE {other}; \
+                     CREATE TABLE {other}.owners (id int PRIMARY KEY, name varchar(10), extra int); \
+                     CREATE TABLE {other}.gone (id int)"
+                    )
+                };
+                ok(run(&db.client, "test", &create, None).await);
+                ("test".to_owned(), other)
+            }
+        };
+        let diff = |apply| Command::SchemaDiff {
+            source_profile: "test".into(),
+            source_schema: Some(home.into()),
+            target_profile: other_profile.clone(),
+            target_schema: Some(other_schema.clone()),
+            apply,
+        };
+        let Output::Migration { migration, .. } = db.client.execute(diff(true)).await.unwrap()
+        else {
+            panic!()
+        };
+        let source = schema_model(&db, "test", home).await;
+        let target = schema_model(&db, &other_profile, &other_schema).await;
+        let names = |m: &datadrop_core::SchemaModel| -> Vec<String> {
+            m.tables.iter().map(|t| t.name.clone()).collect()
+        };
+        assert_eq!(names(&target), names(&source), "{}", migration.script());
+        for t in &source.tables {
+            let u = target.table(&t.name).unwrap();
+            let cols = |t: &datadrop_core::TableModel| -> Vec<(String, String, bool)> {
+                t.columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                    .collect()
+            };
+            assert_eq!(cols(u), cols(t), "{}\n{}", t.name, migration.script());
+            assert_eq!(u.indexes.len(), t.indexes.len(), "{}", migration.script());
+            assert_eq!(
+                u.foreign_keys().count(),
+                t.foreign_keys().count(),
+                "{}",
+                migration.script()
+            );
+        }
+        // And now there's nothing to do.
+        let Output::Migration { migration, .. } = db.client.execute(diff(false)).await.unwrap()
+        else {
+            panic!()
+        };
+        assert!(migration.statements.is_empty(), "{}", migration.script());
+    }
+);

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::complete::Catalog;
 use crate::db::{ColumnInfo, StatementResult, TableInfo};
+use crate::diff::{Migration, TableEdit};
 use crate::export::ExportFormat;
 use crate::history::HistoryEntry;
 use crate::import::ImportPreview;
@@ -159,6 +160,26 @@ pub enum Command {
     },
     /// Whether the OS keychain can be used for passwords here.
     KeychainStatus,
+    /// The statements that create a table, or change it into an edited version; run
+    /// them too with `apply`.
+    AlterTable {
+        profile: String,
+        edit: TableEdit,
+        #[serde(default)]
+        apply: bool,
+    },
+    /// The statements that make the target schema like the source one (on the same
+    /// kind of database); run them on the target too with `apply`.
+    SchemaDiff {
+        source_profile: String,
+        #[serde(default)]
+        source_schema: Option<String>,
+        target_profile: String,
+        #[serde(default)]
+        target_schema: Option<String>,
+        #[serde(default)]
+        apply: bool,
+    },
     /// A CSV, TSV or JSON file's columns and first rows, before importing it.
     ImportPreview {
         path: PathBuf,
@@ -272,6 +293,10 @@ pub enum Output {
     /// A session's transaction state, after a commit, rollback or change of mode.
     Transaction {
         in_transaction: bool,
+    },
+    Migration {
+        migration: Migration,
+        applied: bool,
     },
     ImportPreview(ImportPreview),
     Imported {

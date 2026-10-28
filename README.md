@@ -34,6 +34,12 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
   **export** to CSV, TSV or JSON (every row, not just those shown). Click a header
   to sort; type a `WHERE` condition to filter. Both run on the server when the
   result was cut short, so they cover every row.
+- **Table editor**: create a table, or change one (columns, primary key, indexes,
+  foreign keys, checks) from a form, with the `CREATE`/`ALTER` statements shown before
+  they run. On SQLite, changes it can't make in place rebuild the table and copy its
+  rows.
+- **Schema diff**: compare two schemas (on two servers, or one) and get the SQL that
+  makes one like the other, in a tab to look over and run.
 - **Import** a CSV, TSV or JSON file into a table (right-click it in the browser):
   match the file's columns to the table's, see the first rows, and import in one
   transaction (all or nothing).
@@ -103,6 +109,9 @@ datadrop query shop "select * from orders where placed > :since" \
 
 # Export every row to a file (format from the extension)
 datadrop query shop "select * from orders" -o orders.csv
+
+# The SQL that makes staging's schema like dev's (--apply runs it)
+datadrop diff dev staging --source-schema public --target-schema public
 
 # Import a file into a table (columns matched by the header's names)
 datadrop import shop customers customers.csv

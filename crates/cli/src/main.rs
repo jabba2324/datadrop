@@ -107,6 +107,21 @@ enum Cmd {
         #[command(flatten)]
         params: Params,
     },
+    /// The SQL that makes the target schema like the source one: tables, columns,
+    /// keys, indexes, triggers, views, routines and sequences.
+    Diff {
+        /// The profile with the schema as it should be.
+        source: String,
+        /// The profile whose schema changes.
+        target: String,
+        #[arg(long)]
+        source_schema: Option<String>,
+        #[arg(long)]
+        target_schema: Option<String>,
+        /// Run it on the target too.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Insert the rows of a CSV, TSV or JSON file into a table (in one transaction).
     Import {
         profile: String,
@@ -608,6 +623,22 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             (Command::HistoryClear { profile }, Format::Table)
         }
         Cmd::Keychain => (Command::KeychainStatus, Format::Table),
+        Cmd::Diff {
+            source,
+            target,
+            source_schema,
+            target_schema,
+            apply,
+        } => (
+            Command::SchemaDiff {
+                source_profile: source,
+                source_schema,
+                target_profile: target,
+                target_schema,
+                apply,
+            },
+            Format::Table,
+        ),
         Cmd::Import {
             profile,
             table,
@@ -953,6 +984,16 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
             )
         }
         Output::Schema(m) => render::schema(&mut stdout, m)?,
+        Output::Migration { migration, applied } => {
+            if migration.statements.is_empty() {
+                eprintln!("Nothing to change: they're the same.");
+            } else {
+                write!(stdout, "{}", migration.script())?;
+                if *applied {
+                    eprintln!("Applied {} statements.", migration.statements.len());
+                }
+            }
+        }
         Output::ImportPreview(p) => {
             let names: Vec<&str> = p.columns.iter().map(String::as_str).collect();
             render::table(&mut stdout, &names, &p.rows)?;

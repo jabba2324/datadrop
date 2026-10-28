@@ -121,6 +121,22 @@ an `UPDATE` to the same values as changing none, which is allowed).
 tree. With analyze, a statement that changes data runs inside a transaction that's
 rolled back, on its own connection (so the tab's own transaction isn't touched).
 
+## Changing tables, and schema diffs
+
+`crates/core/src/diff.rs` compares two `TableModel`s and writes the statements between
+them: renames (table and columns, which the editor tracks), dropped and added
+columns, changed columns (PostgreSQL `ALTER COLUMN` for each change; MySQL `MODIFY
+COLUMN` with the whole column), and constraints, indexes and triggers dropped before
+and added after. SQLite can only rename, add and drop columns in place, so for anything
+else it rebuilds the table: create the new one, copy the rows, drop the old, rename,
+recreate indexes and triggers. The table editor builds the new model from its form;
+`AlterTable` runs the result.
+
+`SchemaDiff` loads two schemas and does the same for every table (created in
+dependency order when missing, dropped when gone), plus views, routines and sequences.
+Definitions naming the source schema are rewritten to the target's. Migrations run in
+one transaction on PostgreSQL and SQLite; MySQL commits each DDL statement itself.
+
 ## Import
 
 `crates/core/src/import.rs` reads CSV/TSV (the `csv` crate: quoted fields, line

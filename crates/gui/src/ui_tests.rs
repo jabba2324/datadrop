@@ -763,3 +763,89 @@ fn imports_a_csv_file() {
         ]
     );
 }
+
+#[test]
+fn edits_a_table_from_the_form() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(
+        &mut h,
+        "create table pets (id integer primary key, name text); insert into pets values (1, 'Rex')",
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let Ok(datadrop_core::Output::Schema(m)) =
+        rt.block_on(Client::new(&config(dir.path())).execute(Command::Schema {
+            profile: "local".into(),
+            schema: None,
+        }))
+    else {
+        panic!()
+    };
+    let mut editor = crate::table_editor::TableEditor::new(
+        "local".into(),
+        "main".into(),
+        datadrop_core::sql::Dialect::Sqlite,
+        m.table("pets").cloned(),
+    );
+    // Opened and left alone: nothing to do.
+    assert!(editor.migration().unwrap().statements.is_empty());
+    editor.add_column("age", "INTEGER", "0");
+    h.state_mut().editor = Some(editor);
+    h.run_steps(3);
+    h.get_by_label("Edit pets");
+    let sql = h
+        .state()
+        .editor
+        .as_ref()
+        .unwrap()
+        .migration()
+        .unwrap()
+        .statements;
+    assert_eq!(
+        sql,
+        ["ALTER TABLE \"pets\" ADD COLUMN \"age\" INTEGER DEFAULT 0"]
+    );
+    h.get_by_label("Apply").click();
+    until(&mut h, "the change", |a| a.editor.is_none());
+    let out = run_tab(&mut h, "select id, name, age from pets");
+    assert_eq!(
+        out.results[0].rows[0],
+        [Some("1".into()), Some("Rex".into()), Some("0".into())]
+    );
+}
+
+#[test]
+fn compares_two_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    save_profile(
+        dir.path(),
+        Profile {
+            name: "other".into(),
+            driver: Driver::Sqlite,
+            database: dir.path().join("other.db").display().to_string(),
+            create_if_missing: true,
+            ..Profile::default()
+        },
+    );
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| a.profiles.len() == 2);
+    run_tab(
+        &mut h,
+        "create table pets (id integer primary key, name text)",
+    );
+    {
+        let mut d = crate::diff_dialog::DiffDialog::new("local".into(), "main".into());
+        d.target_profile = "other".into();
+        d.target_schema = "main".into();
+        h.state_mut().diff = Some(d);
+    }
+    h.run_steps(3);
+    h.get_by_label("Compare").click();
+    until(&mut h, "the comparison", |a| a.diff.is_none());
+    let doc = h.state().docs.last().unwrap();
+    assert_eq!(doc.profile.as_deref(), Some("other"));
+    assert!(doc.text.contains("CREATE TABLE pets"), "{}", doc.text);
+}

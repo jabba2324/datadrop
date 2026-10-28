@@ -162,6 +162,52 @@ impl Client {
                 self.test(&p, cancel).await
             }
             Command::ConnectionTest { profile } => self.test(&profile, cancel).await,
+            Command::AlterTable {
+                profile,
+                edit,
+                apply,
+            } => {
+                let p = self.store.get(&profile)?;
+                let migration = crate::diff::table_edit(&edit, p.driver.into());
+                if apply {
+                    self.migrate(&p, &migration, cancel).await?;
+                }
+                Ok(Output::Migration {
+                    migration,
+                    applied: apply,
+                })
+            }
+            Command::SchemaDiff {
+                source_profile,
+                source_schema,
+                target_profile,
+                target_schema,
+                apply,
+            } => {
+                let sp = self.store.get(&source_profile)?;
+                let tp = self.store.get(&target_profile)?;
+                if sp.driver != tp.driver {
+                    return Err(CoreError::Invalid(format!(
+                        "both need to be the same kind of database ({} and {} aren't)",
+                        sp.driver.label(),
+                        tp.driver.label()
+                    )));
+                }
+                let ss = default_schema(&sp, source_schema)?;
+                let ts = default_schema(&tp, target_schema)?;
+                let source_pool = self.pool(&source_profile).await?;
+                let target_pool = self.pool(&target_profile).await?;
+                let source = cancellable(cancel, crate::schema::load(&source_pool, &ss)).await?;
+                let target = cancellable(cancel, crate::schema::load(&target_pool, &ts)).await?;
+                let migration = crate::diff::schema_diff(&source, &target, tp.driver.into());
+                if apply {
+                    self.migrate(&tp, &migration, cancel).await?;
+                }
+                Ok(Output::Migration {
+                    migration,
+                    applied: apply,
+                })
+            }
             Command::ImportPreview {
                 path,
                 format,
@@ -203,10 +249,12 @@ impl Client {
                 };
                 let statements =
                     import::insert_statements(&schema, &table, &targets, &rows, p.driver.into())?;
-                self.in_transaction(&p, &statements, cancel, |i| {
+                self.in_transaction(&p, &statements, cancel, |i, e| {
                     let first = i * import::BATCH + 1;
                     let last = ((i + 1) * import::BATCH).min(rows.len());
-                    format!("rows {first}–{last}")
+                    CoreError::Database(format!(
+                        "rows {first}–{last} failed, so nothing was imported: {e}"
+                    ))
                 })
                 .await?;
                 Ok(Output::Imported {
@@ -736,14 +784,46 @@ impl Client {
         result
     }
 
+    /// Run a migration's statements: in one transaction where DDL is transactional
+    /// (PostgreSQL, SQLite); MySQL commits each one, so a failure there leaves the
+    /// ones before it done.
+    async fn migrate(
+        &self,
+        profile: &Profile,
+        m: &crate::diff::Migration,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let mysql = profile.driver == Driver::Mysql;
+        let r = self
+            .in_transaction(profile, &m.statements, cancel, |i, e| {
+                let st = m.statements[i].lines().next().unwrap_or_default();
+                CoreError::Database(if mysql {
+                    format!(
+                        "statement {} ({st}) failed; MySQL had already made the {i} before it: {e}",
+                        i + 1
+                    )
+                } else {
+                    format!(
+                        "statement {} ({st}) failed, so nothing was changed: {e}",
+                        i + 1
+                    )
+                })
+            })
+            .await;
+        // Browsing connections may hold statements prepared against the old tables.
+        self.forget_pool(&profile.name).await;
+        r
+    }
+
     /// Run statements in one transaction on a connection of their own, rolling back if
-    /// any fails (or it's cancelled). `what(i)` names statement `i` in errors.
+    /// any fails (or it's cancelled). `failed(i, e)` says what statement `i` failing
+    /// means.
     async fn in_transaction(
         &self,
         profile: &Profile,
         statements: &[String],
         cancel: &CancellationToken,
-        what: impl Fn(usize) -> String,
+        failed: impl Fn(usize, CoreError) -> CoreError,
     ) -> Result<()> {
         let via = cancellable(cancel, self.via(profile)).await?;
         let mut s = cancellable(cancel, Session::connect(profile, via)).await?;
@@ -760,10 +840,7 @@ impl Client {
             result = match cancellable(cancel, s.run(st, 0)).await {
                 Ok(_) => Ok(()),
                 Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
-                Err(e) => Err(CoreError::Database(format!(
-                    "{} failed, so nothing was imported: {e}",
-                    what(i)
-                ))),
+                Err(e) => Err(failed(i, e)),
             };
         }
         match &result {
