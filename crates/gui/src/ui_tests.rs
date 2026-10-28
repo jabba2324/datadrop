@@ -700,3 +700,17 @@ fn manual_commit_mode() {
     let out = run_tab(&mut h, "select count(*) from t");
     assert_eq!(out.results[0].rows[0][0].as_deref(), Some("1"));
 }
+
+#[test]
+fn formats_the_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = app(dir.path());
+    h.run_steps(2);
+    h.state_mut().docs[0].text = "select a, b from t where x = 1 and y = 2".into();
+    let ctx = h.ctx.clone();
+    h.state_mut().format_sql(&ctx);
+    assert_eq!(
+        h.state().docs[0].text,
+        "SELECT a, b\nFROM t\nWHERE x = 1\n    AND y = 2;\n"
+    );
+}

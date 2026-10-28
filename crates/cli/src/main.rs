@@ -112,6 +112,17 @@ enum Cmd {
     History(HistoryCmd),
     /// Whether passwords can be kept in the OS keychain here.
     Keychain,
+    /// Format SQL (from a file or standard input): clauses on their own lines,
+    /// keywords in capitals. Nothing is run.
+    Format {
+        file: Option<PathBuf>,
+        /// The SQL dialect: postgres, mysql or sqlite.
+        #[arg(long, default_value = "postgres")]
+        driver: Driver,
+        /// Rewrite the file instead of printing.
+        #[arg(long, short, requires = "file")]
+        in_place: bool,
+    },
     /// Run a command given as JSON (see the docs for the shape), printing JSON.
     Exec { command: String },
 }
@@ -430,6 +441,22 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
+    if let Cmd::Format {
+        file,
+        driver,
+        in_place,
+    } = &cli.command
+    {
+        let sql = read_sql(None, file.clone())?;
+        let formatted = datadrop_core::format::format_sql(&sql, (*driver).into());
+        match file {
+            Some(f) if *in_place => {
+                std::fs::write(f, formatted).with_context(|| format!("writing {}", f.display()))?
+            }
+            _ => print!("{formatted}"),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let config = ConfigDir::default_location()?;
     let client = Client::new(&config);
     let json = cli.json;
@@ -557,6 +584,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             (Command::HistoryClear { profile }, Format::Table)
         }
         Cmd::Keychain => (Command::KeychainStatus, Format::Table),
+        Cmd::Format { .. } => unreachable!("handled above"),
         Cmd::Exec { command } => {
             let cmd: Command =
                 serde_json::from_str(&command).context("parsing the JSON command")?;

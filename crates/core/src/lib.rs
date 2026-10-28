@@ -12,6 +12,7 @@ pub mod db;
 pub mod edit;
 pub mod error;
 pub mod export;
+pub mod format;
 pub mod history;
 pub mod keychain;
 pub mod params;

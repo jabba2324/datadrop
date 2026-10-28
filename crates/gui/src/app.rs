@@ -97,6 +97,8 @@ const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O)
 const NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const FORMAT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::F);
 const ANALYZE: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
 const EXPLAIN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
@@ -116,6 +118,7 @@ enum Shortcut {
     New,
     Close,
     Find,
+    Format,
     Replace,
     FindPrev,
     FindNext,
@@ -735,6 +738,7 @@ impl App {
                 (OPEN, Shortcut::Open),
                 (NEW, Shortcut::New),
                 (CLOSE, Shortcut::Close),
+                (FORMAT, Shortcut::Format),
                 (FIND, Shortcut::Find),
                 (REPLACE, Shortcut::Replace),
                 (FIND_PREV, Shortcut::FindPrev),
@@ -762,6 +766,7 @@ impl App {
             }
             Some(Shortcut::Close) => self.request_close_tab(self.active),
             Some(Shortcut::Find) => self.open_find(ctx, false),
+            Some(Shortcut::Format) => self.format_sql(ctx),
             Some(Shortcut::Replace) => self.open_find(ctx, true),
             Some(Shortcut::FindPrev) => self.find_step(false),
             Some(Shortcut::FindNext) => self.find_step(true),
@@ -915,6 +920,17 @@ impl App {
                 }
                 if ui.button("Replace").clicked() {
                     self.open_find(ui.ctx(), true);
+                }
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Button::new("Format SQL")
+                            .shortcut_text(ui.ctx().format_shortcut(&FORMAT)),
+                    )
+                    .on_hover_text("The selection, or the whole tab")
+                    .clicked()
+                {
+                    self.format_sql(ui.ctx());
                 }
             });
             ui.menu_button("Query", |ui| {
@@ -1142,6 +1158,32 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Format the selection, or the whole tab.
+    pub fn format_sql(&mut self, ctx: &egui::Context) {
+        let dialect = self.dialect_of(self.docs[self.active].profile.as_deref());
+        let doc = &mut self.docs[self.active];
+        let range = doc.selection(ctx).unwrap_or(0..doc.text.len());
+        let original = &doc.text[range.clone()];
+        let mut formatted = datadrop_core::format::format_sql(original, dialect);
+        if formatted.is_empty() {
+            return;
+        }
+        // A selection gets back only what it had: no `;` or newline added at the end.
+        if range != (0..doc.text.len()) {
+            let had_semicolon = original.trim_end().ends_with(';');
+            formatted = formatted.trim_end().to_owned();
+            if !had_semicolon {
+                formatted.pop();
+            }
+        }
+        if formatted == original {
+            return;
+        }
+        doc.text.replace_range(range.clone(), &formatted);
+        doc.select = Some(range.start..range.start + formatted.len());
+        doc.request_focus = true;
     }
 
     /// Auto-commit on or off, and Commit / Roll back while a transaction is open.

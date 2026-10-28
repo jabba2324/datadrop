@@ -40,6 +40,8 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
   tree, with each step's estimated and actual rows and its share of the time.
 - **Query history** of everything run, searchable, from the app and the command line.
 - **Find and replace** (`Ctrl+F`, `Ctrl+R`), with match case.
+- **Format SQL** (`Ctrl+Shift+F`): the selection or the whole tab, clauses on their
+  own lines and keywords in capitals; only whitespace and keyword case change.
 - Each tab keeps its own connection, so `SET`, temporary tables and transactions carry
   over between runs, as in `psql`.
 - **Transactions**: turn off **Auto-commit** for a tab and what you run stays in a
@@ -102,6 +104,10 @@ datadrop query shop "select * from orders" -o orders.csv
 # Query plans
 datadrop explain shop "select * from orders where customer_id = 42"
 datadrop explain shop --analyze "select * from orders where customer_id = 42"
+
+# Format SQL (no connection needed)
+datadrop format report.sql --driver mysql
+datadrop format -i report.sql          # rewrite the file
 
 # History
 datadrop history list --search orders
