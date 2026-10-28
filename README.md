@@ -5,6 +5,8 @@ Server**: a desktop
 app with a schema browser, a highlighted SQL editor with autocompletion and a results
 grid you can edit, plus a command line that can do everything the app can.
 
+CockroachDB works through the PostgreSQL driver (browsing and query plans included).
+
 It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
 [egui](https://github.com/emilk/egui).
 

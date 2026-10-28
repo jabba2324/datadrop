@@ -241,6 +241,96 @@ pub fn parse_sqlite(rows: &[(i64, i64, String)]) -> Result<Plan> {
     })
 }
 
+/// A duration as CockroachDB writes it (`982µs`, `1.2ms`, `3s`), in milliseconds.
+fn crdb_ms(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (n, unit) = s.split_at(s.find(|c: char| !(c.is_ascii_digit() || c == '.'))?);
+    let n: f64 = n.parse().ok()?;
+    Some(match unit.trim() {
+        "ns" => n / 1e6,
+        "µs" | "us" => n / 1e3,
+        "ms" => n,
+        "s" => n * 1e3,
+        "m" => n * 60e3,
+        _ => return None,
+    })
+}
+
+/// CockroachDB's `EXPLAIN` / `EXPLAIN ANALYZE`: a text tree, a line per row, steps
+/// marked `•` and their details (`estimated row count: 10`) indented under them.
+pub fn parse_cockroach(lines: &[String], analyzed: bool) -> Result<Plan> {
+    let mut plan = Plan {
+        analyzed,
+        raw: lines.join("\n"),
+        ..Plan::default()
+    };
+    // Open steps: (the bullet's column, the step).
+    let mut stack: Vec<(usize, PlanNode)> = vec![];
+    fn close(stack: &mut Vec<(usize, PlanNode)>, roots: &mut Vec<PlanNode>, to: usize) {
+        while stack.last().is_some_and(|(c, _)| *c >= to) {
+            let (_, node) = stack.pop().expect("checked");
+            match stack.last_mut() {
+                Some((_, parent)) => parent.children.push(node),
+                None => roots.push(node),
+            }
+        }
+    }
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        if let Some(col) = chars.iter().position(|c| *c == '•') {
+            close(&mut stack, &mut plan.roots, col);
+            let label: String = chars[col + 1..].iter().collect();
+            stack.push((
+                col,
+                PlanNode {
+                    label: label.trim().to_owned(),
+                    ..PlanNode::default()
+                },
+            ));
+            continue;
+        }
+        let text: String = chars
+            .iter()
+            .skip_while(|c| c.is_whitespace() || matches!(c, '│' | '├' | '└' | '─'))
+            .collect();
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (key, value) = match text.split_once(": ") {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (text, ""),
+        };
+        let number = || -> Option<f64> {
+            value
+                .split_whitespace()
+                .next()?
+                .replace(',', "")
+                .parse()
+                .ok()
+        };
+        match stack.last_mut() {
+            None => match key {
+                "planning time" => plan.planning_ms = crdb_ms(value),
+                "execution time" => plan.execution_ms = crdb_ms(value),
+                _ => {}
+            },
+            Some((_, n)) => match key {
+                "estimated row count" => n.estimated_rows = number(),
+                "actual row count" => n.actual_rows = number(),
+                "execution time" => n.actual_ms = crdb_ms(value),
+                _ if value.is_empty() => n.details.push((key.to_owned(), String::new())),
+                _ => n.details.push((key.to_owned(), value.to_owned())),
+            },
+        }
+    }
+    close(&mut stack, &mut plan.roots, 0);
+    if plan.roots.is_empty() {
+        return Err(bad("no steps"));
+    }
+    Ok(plan)
+}
+
 /// SQL Server's `SHOWPLAN_ALL` (or, after a run, `STATISTICS PROFILE`) result: a row a
 /// step, with `NodeId` and `Parent` making the tree.
 pub fn parse_sqlserver(r: &crate::db::StatementResult, analyzed: bool) -> Result<Plan> {
@@ -340,6 +430,33 @@ pub fn parse_sqlserver(r: &crate::db::StatementResult, analyzed: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cockroach_text() {
+        let text = "planning time: 344µs\nexecution time: 982µs\ndistribution: local\n\n\
+                    • render\n│\n└── • filter\n    │ execution time: 3µs\n    \
+                    │ actual row count: 1\n    │ filter: n > 'a'\n    │\n    └── • scan\n          \
+                    estimated row count: 1,000 (100% of the table)\n          actual row count: 2\n          \
+                    table: t@t_pkey";
+        let lines: Vec<String> = text.lines().map(Into::into).collect();
+        let p = parse_cockroach(&lines, true).unwrap();
+        assert_eq!(p.execution_ms, Some(0.982));
+        let render = &p.roots[0];
+        assert_eq!(render.label, "render");
+        let filter = &render.children[0];
+        assert_eq!(filter.label, "filter");
+        assert_eq!(filter.actual_rows, Some(1.0));
+        assert_eq!(
+            filter.details,
+            [("filter".to_owned(), "n > 'a'".to_owned())]
+        );
+        let scan = &filter.children[0];
+        assert_eq!(
+            (scan.estimated_rows, scan.actual_rows),
+            (Some(1000.0), Some(2.0))
+        );
+        assert_eq!(scan.details[0], ("table".to_owned(), "t@t_pkey".to_owned()));
+    }
 
     #[test]
     fn postgres_json() {

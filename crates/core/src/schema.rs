@@ -600,7 +600,7 @@ async fn load_postgres(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
              CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid, true) END::text \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-             AND NOT c.relispartition ORDER BY 1",
+             AND NOT coalesce(c.relispartition, false) ORDER BY 1",
             &[schema],
         )
         .await?;
@@ -641,7 +641,7 @@ async fn load_postgres(pool: &MetaPool, schema: &str) -> Result<SchemaModel> {
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-             AND NOT c.relispartition AND a.attnum > 0 AND NOT a.attisdropped \
+             AND NOT coalesce(c.relispartition, false) AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY c.relname, a.attnum",
             &[schema],
         )

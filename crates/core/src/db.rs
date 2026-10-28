@@ -221,6 +221,8 @@ pub struct Session {
     pub profile: Profile,
     /// A transaction is open (as far as the statements run on it say).
     pub in_transaction: bool,
+    /// It's CockroachDB, speaking PostgreSQL's protocol.
+    cockroach: bool,
 }
 
 enum Conn {
@@ -380,12 +382,15 @@ where
 impl Session {
     /// Connect with `profile`, through `via` (an SSH tunnel) if given.
     pub async fn connect(profile: &Profile, via: Endpoint) -> Result<Session> {
+        let mut cockroach = false;
         let (conn, stop) = match profile.driver {
             Driver::Postgres => {
                 let opts = pg_options(profile, &via)?;
                 let mut c = timed(PgConnection::connect_with(&opts)).await?;
                 let id = scalar!(&mut c, "SELECT pg_backend_pid()::text").await?;
                 let id = id.parse().unwrap_or(0);
+                let version = scalar!(&mut c, "SELECT version()").await?;
+                cockroach = version.starts_with("CockroachDB");
                 (Conn::Pg(c), Stopper::Server { via, id })
             }
             Driver::Mysql => {
@@ -419,6 +424,7 @@ impl Session {
             stop,
             profile: profile.clone(),
             in_transaction: false,
+            cockroach,
         })
     }
 
@@ -484,6 +490,20 @@ impl Session {
                 .ok_or_else(|| CoreError::Database("the database returned no plan".into()))
         };
         match self.profile.driver {
+            Driver::Postgres if self.cockroach => {
+                let how = if analyze {
+                    "EXPLAIN ANALYZE"
+                } else {
+                    "EXPLAIN"
+                };
+                let r = self.run(&format!("{how} {sql}"), 100_000).await?;
+                let lines: Vec<String> = r
+                    .rows
+                    .into_iter()
+                    .map(|row| row.into_iter().next().flatten().unwrap_or_default())
+                    .collect();
+                plan::parse_cockroach(&lines, analyze)
+            }
             Driver::Postgres => {
                 let opts = if analyze {
                     "FORMAT JSON, ANALYZE, BUFFERS"
@@ -863,7 +883,7 @@ impl MetaPool {
                 "SELECT c.relname::text, c.relkind::text FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-                 AND NOT c.relispartition ORDER BY c.relname",
+                 AND NOT coalesce(c.relispartition, false) ORDER BY c.relname",
             )
             .bind(schema)
             .fetch_all(p)
@@ -1015,7 +1035,7 @@ impl MetaPool {
                 "SELECT n.nspname::text, c.relname::text, c.relkind::text, a.attname::text \
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                  LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
-                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT coalesce(c.relispartition, false) \
                  AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' \
                  ORDER BY 1, 2, a.attnum LIMIT 100000",
             )
