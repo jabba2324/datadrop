@@ -95,6 +95,9 @@ pub enum Command {
         /// Keep at most this many rows per result (default 10,000).
         #[serde(default)]
         max_rows: Option<usize>,
+        /// Set the session's auto-commit first (see `SessionAutocommit`).
+        #[serde(default)]
+        autocommit: Option<bool>,
     },
     /// Run SQL and write the last statement's rows to a file, however many there are
     /// (no row limit). The format comes from the file's extension unless given.
@@ -155,6 +158,26 @@ pub enum Command {
     },
     /// Whether the OS keychain can be used for passwords here.
     KeychainStatus,
+    /// Turn auto-commit off (or back on) for a session: with it off, a transaction is
+    /// begun before the session's next query and stays open until committed or
+    /// rolled back.
+    SessionAutocommit {
+        session: String,
+        autocommit: bool,
+    },
+    /// Commit or roll back a session's open transaction.
+    Transaction {
+        profile: String,
+        session: String,
+        action: TransactionAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionAction {
+    Commit,
+    Rollback,
 }
 
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
@@ -213,6 +236,10 @@ pub enum Output {
     HistoryCleared {
         removed: usize,
     },
+    /// A session's transaction state, after a commit, rollback or change of mode.
+    Transaction {
+        in_transaction: bool,
+    },
     Keychain {
         /// What it's called here ("the macOS Keychain", ...).
         name: String,
@@ -230,6 +257,10 @@ pub struct QueryOutput {
     /// The statement that failed (the ones after it didn't run).
     pub error: Option<StatementError>,
     pub cancelled: bool,
+    /// The session has a transaction open (begun by a statement, or because
+    /// auto-commit is off), to commit or roll back.
+    #[serde(default)]
+    pub in_transaction: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,7 +286,8 @@ mod tests {
                 profile: "shop".into(),
                 sql: "select 1".into(),
                 session: None,
-                max_rows: None
+                max_rows: None,
+                autocommit: None,
             }
         );
         let out = serde_json::to_value(Output::ProfileRemoved { name: "x".into() }).unwrap();

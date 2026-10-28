@@ -519,6 +519,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         sql,
                         session: None,
                         max_rows: Some(max_rows),
+                        autocommit: None,
                     },
                     format,
                 )
@@ -855,6 +856,11 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
             )
         }
         Output::Schema(m) => render::schema(&mut stdout, m)?,
+        Output::Transaction { in_transaction } => {
+            if *in_transaction {
+                eprintln!("A transaction is open.");
+            }
+        }
         Output::Ddl { sql } => write!(stdout, "{sql}")?,
         Output::Keychain {
             name,

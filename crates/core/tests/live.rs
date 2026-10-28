@@ -106,6 +106,7 @@ async fn run(client: &Client, profile: &str, sql: &str, session: Option<&str>) -
             sql: sql.into(),
             session: session.map(Into::into),
             max_rows: None,
+            autocommit: None,
         })
         .await
         .unwrap()
@@ -395,6 +396,7 @@ both!(row_limit_and_empty_results, |driver, schema| async move {
             sql: many,
             session: None,
             max_rows: Some(1000),
+            autocommit: None,
         })
         .await
         .unwrap();
@@ -526,6 +528,7 @@ both!(cancels_on_the_server, |driver, schema| async move {
                 sql: sleep.into(),
                 session: Some("tab".into()),
                 max_rows: None,
+                autocommit: None,
             },
             &cancel,
         )
@@ -1006,3 +1009,91 @@ both!(
         assert_eq!(again, m, "{sql}");
     }
 );
+
+both!(manual_commit_and_rollback, |driver, schema| async move {
+    use datadrop_core::command::TransactionAction;
+    let Some(db) = setup(driver, schema).await else {
+        return;
+    };
+    let p = prefix(&db, schema);
+    ok(run(
+        &db.client,
+        "test",
+        &format!("CREATE TABLE {p}t (n int)"),
+        None,
+    )
+    .await);
+    let count = || async {
+        let q = ok(run(
+            &db.client,
+            "test",
+            &format!("SELECT count(*) FROM {p}t"),
+            None,
+        )
+        .await);
+        q.results[0].rows[0][0].clone().unwrap()
+    };
+    let tx = |action| Command::Transaction {
+        profile: "test".into(),
+        session: "tab".into(),
+        action,
+    };
+
+    // A statement that begins one, in auto-commit mode.
+    let q = ok(run(&db.client, "test", "BEGIN", Some("tab")).await);
+    assert!(q.in_transaction);
+    let q = ok(run(&db.client, "test", "COMMIT", Some("tab")).await);
+    assert!(!q.in_transaction);
+
+    // Auto-commit off: changes stay in the session until committed.
+    db.client
+        .execute(Command::SessionAutocommit {
+            session: "tab".into(),
+            autocommit: false,
+        })
+        .await
+        .unwrap();
+    let q = ok(run(
+        &db.client,
+        "test",
+        &format!("INSERT INTO {p}t VALUES (1)"),
+        Some("tab"),
+    )
+    .await);
+    assert!(q.in_transaction);
+    assert_eq!(count().await, "0");
+    let out = db
+        .client
+        .execute(tx(TransactionAction::Commit))
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        Output::Transaction {
+            in_transaction: false
+        }
+    );
+    assert_eq!(count().await, "1");
+
+    let q = ok(run(
+        &db.client,
+        "test",
+        &format!("INSERT INTO {p}t VALUES (2)"),
+        Some("tab"),
+    )
+    .await);
+    assert!(q.in_transaction);
+    db.client
+        .execute(tx(TransactionAction::Rollback))
+        .await
+        .unwrap();
+    assert_eq!(count().await, "1");
+
+    // MySQL commits implicitly before DDL.
+    if driver == Driver::Mysql {
+        ok(run(&db.client, "test", "INSERT INTO t VALUES (3)", Some("tab")).await);
+        let q = ok(run(&db.client, "test", "CREATE TABLE u (n int)", Some("tab")).await);
+        assert!(!q.in_transaction);
+        assert_eq!(count().await, "2");
+    }
+});

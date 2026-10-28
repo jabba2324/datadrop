@@ -717,6 +717,33 @@ pub fn first_keyword(sql: &str, dialect: Dialect) -> Option<String> {
 }
 
 /// Quote an identifier for the dialect: `"a""b"` or `` `a``b` ``.
+/// Whether a transaction is open after `statement` ran (it was open before if
+/// `open`): BEGIN and START TRANSACTION open one; COMMIT, END and ROLLBACK (but not
+/// ROLLBACK TO a savepoint) close it, as do MySQL's statements that commit
+/// implicitly (DDL and the like).
+pub fn transaction_after(open: bool, statement: &str, dialect: Dialect) -> bool {
+    let words: Vec<String> = tokenize(statement, dialect)
+        .into_iter()
+        .filter(|t| matches!(t.kind, TokenKind::Keyword | TokenKind::Identifier))
+        .take(2)
+        .map(|t| statement[t.range].to_ascii_uppercase())
+        .collect();
+    let first = words.first().map(String::as_str);
+    let second = words.get(1).map(String::as_str);
+    match first {
+        Some("BEGIN") => true,
+        Some("START") => second == Some("TRANSACTION") || open,
+        Some("COMMIT" | "END") => false,
+        Some("ROLLBACK") => open && second == Some("TO"),
+        Some("CREATE" | "ALTER" | "DROP" | "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE")
+            if dialect == Dialect::Mysql =>
+        {
+            false
+        }
+        _ => open,
+    }
+}
+
 /// Whether a statement's rows can be filtered and sorted by wrapping it in
 /// `SELECT * FROM (...)`.
 pub fn is_query(sql: &str, dialect: Dialect) -> bool {
@@ -877,6 +904,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tracks_transactions() {
+        assert!(transaction_after(false, "BEGIN", Postgres));
+        assert!(transaction_after(false, "start transaction", Mysql));
+        assert!(transaction_after(true, "update t set a = 1", Postgres));
+        assert!(!transaction_after(true, "commit", Postgres));
+        assert!(!transaction_after(true, "END", Sqlite));
+        assert!(!transaction_after(true, "rollback", Mysql));
+        assert!(transaction_after(true, "rollback to savepoint a", Postgres));
+        assert!(!transaction_after(true, "create table x (a int)", Mysql));
+        assert!(transaction_after(true, "create table x (a int)", Postgres));
+        assert!(!transaction_after(false, "select 1", Sqlite));
     }
 
     #[test]

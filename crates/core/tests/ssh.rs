@@ -76,6 +76,7 @@ async fn select_42(client: &Client, profile: &str) -> Result<String, CoreError> 
             sql: "SELECT 40 + 2".into(),
             session: None,
             max_rows: None,
+            autocommit: None,
         })
         .await?
     {
@@ -148,6 +149,7 @@ async fn tunnels_after_trusting_the_host() {
                 sql: "SELECT pg_sleep(20)".into(),
                 session: Some("tab".into()),
                 max_rows: None,
+                autocommit: None,
             },
             &cancel,
         )

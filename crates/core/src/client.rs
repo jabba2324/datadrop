@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::command::{Command, DEFAULT_MAX_ROWS, Output, QueryOutput, StatementError};
+use crate::command::{
+    Command, DEFAULT_MAX_ROWS, Output, QueryOutput, StatementError, TransactionAction,
+};
 use crate::complete::Catalog;
 use crate::db::Endpoint;
 use crate::db::{MetaPool, Session};
@@ -88,6 +90,8 @@ pub struct Client {
     /// Schema-browsing pools, per profile (rebuilt when the profile changes).
     pools: Mutex<HashMap<String, (Profile, Endpoint, MetaPool)>>,
     sessions: Mutex<HashMap<String, SessionSlot>>,
+    /// Sessions with auto-commit turned off.
+    manual_commit: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Client {
@@ -99,6 +103,7 @@ impl Client {
             tunnels: Default::default(),
             pools: Mutex::default(),
             sessions: Mutex::default(),
+            manual_commit: Mutex::default(),
         }
     }
 
@@ -233,7 +238,11 @@ impl Client {
                 sql,
                 session,
                 max_rows,
+                autocommit,
             } => {
+                if let (Some(auto), Some(s)) = (autocommit, &session) {
+                    self.set_autocommit(s, auto);
+                }
                 let p = self.store.get(&profile)?;
                 let out = self
                     .query(
@@ -303,6 +312,57 @@ impl Client {
             Command::SshTrustHost { host, port, key } => {
                 tunnel::trust_host(&self.known_hosts, &host, port, &key)?;
                 Ok(Output::HostTrusted { host })
+            }
+            Command::SessionAutocommit {
+                session,
+                autocommit,
+            } => {
+                self.set_autocommit(&session, autocommit);
+                let slot = self
+                    .sessions
+                    .lock()
+                    .expect("sessions")
+                    .get(&session)
+                    .cloned();
+                let in_transaction = match slot {
+                    Some(slot) => slot.lock().await.as_ref().is_some_and(|s| s.in_transaction),
+                    None => false,
+                };
+                Ok(Output::Transaction { in_transaction })
+            }
+            Command::Transaction {
+                profile,
+                session,
+                action,
+            } => {
+                let slot = self
+                    .sessions
+                    .lock()
+                    .expect("sessions")
+                    .get(&session)
+                    .cloned();
+                let Some(slot) = slot else {
+                    return Ok(Output::Transaction {
+                        in_transaction: false,
+                    });
+                };
+                let mut guard = slot.lock().await;
+                let Some(s) = guard.as_mut().filter(|s| s.profile.name == profile) else {
+                    return Ok(Output::Transaction {
+                        in_transaction: false,
+                    });
+                };
+                let sql = match action {
+                    TransactionAction::Commit => "COMMIT",
+                    TransactionAction::Rollback => "ROLLBACK",
+                };
+                let r = cancellable(cancel, s.run(sql, 0)).await;
+                // Even a failed COMMIT ends the transaction (PostgreSQL rolls it back).
+                s.in_transaction = false;
+                r?;
+                Ok(Output::Transaction {
+                    in_transaction: false,
+                })
             }
             Command::SessionClose { session } => {
                 let slot = self.sessions.lock().expect("sessions").remove(&session);
@@ -460,6 +520,26 @@ impl Client {
         self.connect(&mut guard, profile, cancel).await?;
 
         let mut out = QueryOutput::default();
+        // Auto-commit off: everything runs in a transaction, begun here when needed.
+        let manual = session.as_ref().is_some_and(|s| {
+            self.manual_commit
+                .lock()
+                .expect("manual_commit")
+                .contains(s)
+        });
+        if manual {
+            let live = guard.as_mut().expect("connected above");
+            let first = sql::first_keyword(&sql[statements[0].clone()], dialect);
+            let begins = matches!(first.as_deref(), Some("BEGIN" | "START"));
+            if !live.in_transaction && !begins {
+                let begin = match dialect {
+                    Dialect::Mysql => "START TRANSACTION",
+                    _ => "BEGIN",
+                };
+                cancellable(cancel, live.run(begin, 0)).await?;
+                live.in_transaction = true;
+            }
+        }
         for (index, range) in statements.into_iter().enumerate() {
             let text = &sql[range];
             let live = guard.as_mut().expect("connected above");
@@ -484,7 +564,12 @@ impl Client {
                 }
             };
             match result {
-                Ok(r) => out.results.push(r),
+                Ok(r) => {
+                    let live = guard.as_mut().expect("connected above");
+                    live.in_transaction =
+                        sql::transaction_after(live.in_transaction, text, dialect);
+                    out.results.push(r);
+                }
                 Err(e) => {
                     if is_connection_lost(&e) {
                         guard.take();
@@ -498,12 +583,22 @@ impl Client {
                 }
             }
         }
+        out.in_transaction = guard.as_ref().is_some_and(|s| s.in_transaction);
         if session.is_none()
             && let Some(s) = guard.take()
         {
             s.close().await;
         }
         Ok(out)
+    }
+
+    fn set_autocommit(&self, session: &str, autocommit: bool) {
+        let mut manual = self.manual_commit.lock().expect("manual_commit");
+        if autocommit {
+            manual.remove(session);
+        } else {
+            manual.insert(session.to_owned());
+        }
     }
 
     /// The session slot for `session`, or a throwaway one.

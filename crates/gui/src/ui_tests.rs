@@ -667,3 +667,36 @@ fn asks_for_parameter_values() {
     h.run_steps(2);
     assert_eq!(h.state().params.as_ref().unwrap().values[0].0, "21");
 }
+
+#[test]
+fn manual_commit_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(&mut h, "create table t (n int)");
+    h.get_by_label("Auto-commit").click();
+    h.run_steps(3);
+    assert!(h.state().docs[0].manual_commit);
+    run_tab(&mut h, "insert into t values (1)");
+    assert!(h.state().docs[0].in_transaction);
+    h.run_steps(2);
+    h.get_by_label_contains("Transaction");
+    h.get_by_label_contains("Roll back").click();
+    until(&mut h, "the rollback", |a| !a.docs[0].in_transaction);
+    let out = run_tab(&mut h, "select count(*) from t");
+    assert_eq!(out.results[0].rows[0][0].as_deref(), Some("0"));
+
+    // Closing with a transaction open asks first; committing then closes.
+    run_tab(&mut h, "insert into t values (2)");
+    assert!(h.state().docs[0].in_transaction);
+    h.state_mut().new_tab(Some("local".into()));
+    h.state_mut().request_close_tab(0);
+    h.run_steps(2);
+    h.get_by_label("Commit the transaction?");
+    h.get_by_label("Commit and close").click();
+    until(&mut h, "the tab to close", |a| a.docs.len() == 1);
+    h.state_mut().active = 0;
+    let out = run_tab(&mut h, "select count(*) from t");
+    assert_eq!(out.results[0].rows[0][0].as_deref(), Some("1"));
+}

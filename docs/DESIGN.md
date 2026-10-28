@@ -53,6 +53,13 @@ removing it (or moving it back to the file) deletes them.
 - Rows beyond the row limit (default 10,000 on the CLI, 1,000 in the app) are read
   and dropped, not kept, and the result is marked as truncated.
 
+A session knows whether it has a transaction open from the statements it runs
+(`sql::transaction_after`: BEGIN / START TRANSACTION open one; COMMIT, END,
+ROLLBACK, and on MySQL the statements that commit implicitly, close it). With
+auto-commit off (`autocommit: false` on a `Query`, or `SessionAutocommit`) the
+session begins a transaction before running anything when none is open; `Transaction`
+commits or rolls it back. Each query's output says whether one is open.
+
 The schema browser uses a small per-profile connection pool, separate from the tab
 sessions, so it never waits behind a long query.
 

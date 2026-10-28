@@ -45,6 +45,14 @@ pub struct Document {
     pub grid: crate::grid_edit::GridEdit,
     /// The results filtered or sorted by the server.
     pub filter: Option<crate::grid_edit::Filter>,
+    /// Auto-commit is off: queries run in a transaction until it's committed.
+    pub manual_commit: bool,
+    /// The tab's session has a transaction open.
+    pub in_transaction: bool,
+    /// Committing or rolling back.
+    pub tx_task: Option<Task>,
+    /// Close the tab once `tx_task` is done.
+    pub close_after_tx: bool,
     /// The values last given for the query's placeholders.
     pub param_values: std::collections::HashMap<String, (String, datadrop_core::params::ParamMode)>,
     pub view: ResultView,
@@ -83,6 +91,10 @@ impl Document {
             grid: Default::default(),
             filter: None,
             param_values: Default::default(),
+            manual_commit: false,
+            in_transaction: false,
+            tx_task: None,
+            close_after_tx: false,
             view: ResultView::Results,
             plan: None,
             plan_error: None,

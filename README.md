@@ -42,6 +42,9 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
 - **Find and replace** (`Ctrl+F`, `Ctrl+R`), with match case.
 - Each tab keeps its own connection, so `SET`, temporary tables and transactions carry
   over between runs, as in `psql`.
+- **Transactions**: turn off **Auto-commit** for a tab and what you run stays in a
+  transaction until you **Commit** or **Roll back**; the tab is flagged while one is
+  open (also when you begin one yourself), and closing it asks first.
 
 ## Install
 

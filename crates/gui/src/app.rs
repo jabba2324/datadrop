@@ -6,7 +6,7 @@ use std::time::Instant;
 use datadrop_core::sql::{self, Dialect};
 use datadrop_core::{
     Catalog, Command, ConfigDir, CoreError, Driver, ExportFormat, ObjectKind, Output,
-    ProfileSummary, QueryOutput, StatementError,
+    ProfileSummary, QueryOutput, StatementError, command::TransactionAction,
 };
 use datadrop_core::{edit, export};
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
@@ -30,6 +30,8 @@ pub enum ConfirmKind {
     ClearHistory,
     /// The tab has grid edits that weren't saved; then do this.
     DiscardEdits(u64, AfterDiscard),
+    /// Closing a tab with a transaction open.
+    OpenTransaction(u64),
 }
 
 pub enum AfterDiscard {
@@ -292,7 +294,18 @@ impl App {
     pub fn request_close_tab(&mut self, i: usize) {
         let doc = &self.docs[i];
         let edits = doc.grid.edits.count();
-        if edits > 0 {
+        if doc.in_transaction {
+            self.active = i;
+            self.confirm = Some(Confirm {
+                kind: ConfirmKind::OpenTransaction(doc.id),
+                title: "Commit the transaction?".into(),
+                text: format!(
+                    "{} has a transaction open. Closing it without committing rolls back \
+                     its changes.",
+                    doc.title()
+                ),
+            });
+        } else if edits > 0 {
             self.active = i;
             self.confirm = Some(Confirm {
                 kind: ConfirmKind::DiscardEdits(doc.id, AfterDiscard::Close),
@@ -413,6 +426,7 @@ impl App {
                     sql,
                     session,
                     max_rows: Some(self.settings.max_rows),
+                    autocommit: Some(!self.docs[i].manual_commit),
                 },
                 ResultView::Results,
             ),
@@ -483,6 +497,32 @@ impl App {
     }
 
     fn poll_tasks(&mut self) {
+        let mut close = vec![];
+        for d in &mut self.docs {
+            let Some(r) = poll(&mut d.tx_task) else {
+                continue;
+            };
+            match r {
+                Ok(Output::Transaction { in_transaction }) => {
+                    d.in_transaction = in_transaction;
+                    if d.close_after_tx {
+                        close.push(d.id);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    d.in_transaction = false;
+                    d.close_after_tx = false;
+                    self.toasts
+                        .error(format!("The transaction ended with an error: {e}"));
+                }
+            }
+        }
+        for id in close {
+            if let Some(i) = self.docs.iter().position(|d| d.id == id) {
+                self.close_tab(i);
+            }
+        }
         let mut i = 0;
         while i < self.ddl_tasks.len() {
             let Some(r) = poll(&mut self.ddl_tasks[i].0) else {
@@ -619,6 +659,7 @@ impl App {
             doc.shown_result = usize::MAX; // the last result set
             doc.grid = Default::default();
             self.history.stale = true;
+            doc.in_transaction = matches!(&r, Ok(Output::Query(q)) if q.in_transaction);
             doc.output = Some(match r {
                 Ok(Output::Query(q)) => {
                     let dialect = Dialect::Postgres;
@@ -636,6 +677,7 @@ impl App {
                 Ok(_) => QueryOutput::default(),
                 Err(e) => QueryOutput {
                     results: vec![],
+                    in_transaction: false,
                     cancelled: {
                         if let Some(t) = TrustPrompt::from_error(&e) {
                             untrusted = Some(t);
@@ -820,9 +862,11 @@ impl App {
         let unsaved: Vec<String> = self
             .docs
             .iter()
-            .filter(|d| d.dirty() || d.grid.edits.count() > 0)
+            .filter(|d| d.dirty() || d.grid.edits.count() > 0 || d.in_transaction)
             .map(|d| {
-                if d.grid.edits.count() > 0 {
+                if d.in_transaction {
+                    format!("{} (a transaction that will be rolled back)", d.title())
+                } else if d.grid.edits.count() > 0 {
                     format!("{} (unsaved edits to its results)", d.title())
                 } else {
                     d.title()
@@ -937,11 +981,14 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (i, d) in self.docs.iter().enumerate() {
-                        let title = if d.dirty() {
+                        let mut title = if d.dirty() {
                             format!("{} {}", d.title(), icon::DOT)
                         } else {
                             d.title()
                         };
+                        if d.in_transaction {
+                            title = format!("{} {title}", icon::FLAG);
+                        }
                         let tip = d
                             .path
                             .as_ref()
@@ -989,24 +1036,28 @@ impl App {
             let label = current
                 .clone()
                 .unwrap_or_else(|| "Choose a connection".into());
-            let resp = egui::ComboBox::from_id_salt(("tab-profile", self.docs[i].id))
-                .selected_text(format!("{}  {label}", icon::DATABASE))
-                .width(200.0)
-                .show_ui(ui, |ui| {
-                    for p in &self.profiles {
-                        ui.selectable_value(
-                            &mut self.docs[i].profile,
-                            Some(p.name.clone()),
-                            &p.name,
-                        )
-                        .on_hover_text(&p.target);
-                    }
-                    if self.profiles.is_empty() {
-                        ui.weak("No connections yet");
-                    }
-                });
-            resp.response
-                .on_hover_text("The connection this tab runs on");
+            let in_tx = self.docs[i].in_transaction;
+            ui.add_enabled_ui(!in_tx, |ui| {
+                let resp = egui::ComboBox::from_id_salt(("tab-profile", self.docs[i].id))
+                    .selected_text(format!("{}  {label}", icon::DATABASE))
+                    .width(200.0)
+                    .show_ui(ui, |ui| {
+                        for p in &self.profiles {
+                            ui.selectable_value(
+                                &mut self.docs[i].profile,
+                                Some(p.name.clone()),
+                                &p.name,
+                            )
+                            .on_hover_text(&p.target);
+                        }
+                        if self.profiles.is_empty() {
+                            ui.weak("No connections yet");
+                        }
+                    });
+                resp.response
+                    .on_hover_text("The connection this tab runs on")
+                    .on_disabled_hover_text("Commit or roll back the transaction first");
+            });
             if self.docs[i].profile != current {
                 // A different connection: the old session isn't needed.
                 self.backend.fire(Command::SessionClose {
@@ -1068,6 +1119,8 @@ impl App {
                 t.cancel();
             }
             ui.separator();
+            self.transaction_controls(ui, i);
+            ui.separator();
             ui.label("Row limit");
             ui.add(
                 egui::DragValue::new(&mut self.settings.max_rows)
@@ -1089,6 +1142,59 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Auto-commit on or off, and Commit / Roll back while a transaction is open.
+    fn transaction_controls(&mut self, ui: &mut egui::Ui, i: usize) {
+        let doc = &mut self.docs[i];
+        let mut auto = !doc.manual_commit;
+        if ui
+            .checkbox(&mut auto, "Auto-commit")
+            .on_hover_text(
+                "Off: what you run stays in a transaction until you commit it (or roll it back)",
+            )
+            .changed()
+        {
+            doc.manual_commit = !auto;
+            self.backend.fire(Command::SessionAutocommit {
+                session: doc.session(),
+                autocommit: auto,
+            });
+        }
+        if !doc.in_transaction {
+            return;
+        }
+        let busy = doc.tx_task.is_some() || doc.running.is_some();
+        ui.label(
+            RichText::new(format!("{} Transaction", icon::FLAG)).color(ui.visuals().warn_fg_color),
+        )
+        .on_hover_text(
+            "Changes made in this tab aren't saved (or seen by others) until you commit",
+        );
+        ui.add_enabled_ui(!busy, |ui| {
+            if ui.button(format!("{} Commit", icon::CHECK)).clicked() {
+                self.end_transaction(i, TransactionAction::Commit, false);
+            }
+            if ui
+                .button(format!("{} Roll back", icon::ARROW_U_UP_LEFT))
+                .clicked()
+            {
+                self.end_transaction(i, TransactionAction::Rollback, false);
+            }
+        });
+    }
+
+    fn end_transaction(&mut self, i: usize, action: TransactionAction, close: bool) {
+        let doc = &mut self.docs[i];
+        let Some(profile) = doc.profile.clone() else {
+            return;
+        };
+        doc.close_after_tx = close;
+        doc.tx_task = Some(self.backend.run(Command::Transaction {
+            profile,
+            session: doc.session(),
+            action,
+        }));
     }
 
     fn find_bar(&mut self, ui: &mut egui::Ui) {
@@ -1324,6 +1430,7 @@ impl App {
             sql: wrapped,
             session: Some(d.session()),
             max_rows: Some(self.settings.max_rows),
+            autocommit: Some(!d.manual_commit),
         };
         self.start(doc, command, ResultView::Results);
     }
@@ -1474,6 +1581,7 @@ impl App {
             sql,
             session: Some(doc.session()),
             max_rows: Some(self.settings.max_rows),
+            autocommit: Some(!doc.manual_commit),
         }));
         doc.run_started = Some(Instant::now());
         doc.view = ResultView::Results;
@@ -1581,6 +1689,7 @@ impl App {
             sql: doc.text.clone(),
             session: Some(doc.session()),
             max_rows: Some(self.settings.max_rows),
+            autocommit: Some(!doc.manual_commit),
         }));
         doc.run_started = Some(Instant::now());
     }
@@ -1703,6 +1812,22 @@ impl App {
                         choice = Some("cancel");
                     }
                 }
+                ConfirmKind::OpenTransaction(_) => {
+                    if ui.button("Commit and close").clicked() {
+                        choice = Some("commit");
+                    }
+                    if ui
+                        .button(
+                            RichText::new("Roll back and close").color(ui.visuals().error_fg_color),
+                        )
+                        .clicked()
+                    {
+                        choice = Some("rollback");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some("cancel");
+                    }
+                }
                 ConfirmKind::DiscardEdits(..) => {
                     if ui.button("Review and save").clicked() {
                         choice = Some("review");
@@ -1753,6 +1878,16 @@ impl App {
                 self.backend.fire(Command::HistoryClear { profile: None });
                 self.history.entries.clear();
                 self.history.stale = true;
+            }
+            (ConfirmKind::OpenTransaction(id), "commit") => {
+                if let Some(i) = self.docs.iter().position(|d| d.id == id) {
+                    self.end_transaction(i, TransactionAction::Commit, true);
+                }
+            }
+            (ConfirmKind::OpenTransaction(id), "rollback") => {
+                if let Some(i) = self.docs.iter().position(|d| d.id == id) {
+                    self.end_transaction(i, TransactionAction::Rollback, true);
+                }
             }
             (ConfirmKind::DiscardEdits(id, _), "review") => {
                 if let Some(i) = self.docs.iter().position(|d| d.id == id) {

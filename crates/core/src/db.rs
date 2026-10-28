@@ -219,6 +219,8 @@ pub struct Session {
     conn: Conn,
     stop: Stopper,
     pub profile: Profile,
+    /// A transaction is open (as far as the statements run on it say).
+    pub in_transaction: bool,
 }
 
 enum Conn {
@@ -403,6 +405,7 @@ impl Session {
             conn,
             stop,
             profile: profile.clone(),
+            in_transaction: false,
         })
     }
 
