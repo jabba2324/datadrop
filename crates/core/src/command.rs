@@ -10,6 +10,7 @@ use crate::complete::Catalog;
 use crate::db::{ColumnInfo, StatementResult, TableInfo};
 use crate::export::ExportFormat;
 use crate::history::HistoryEntry;
+use crate::import::ImportPreview;
 use crate::plan::Plan;
 use crate::profile::{Profile, ProfileSummary};
 use crate::schema::{ObjectKind, SchemaModel};
@@ -158,6 +159,34 @@ pub enum Command {
     },
     /// Whether the OS keychain can be used for passwords here.
     KeychainStatus,
+    /// A CSV, TSV or JSON file's columns and first rows, before importing it.
+    ImportPreview {
+        path: PathBuf,
+        #[serde(default)]
+        format: Option<ExportFormat>,
+        /// CSV/TSV: the first row names the columns (default true).
+        #[serde(default = "yes")]
+        header: bool,
+    },
+    /// Insert a file's rows into a table, all in one transaction.
+    Import {
+        profile: String,
+        #[serde(default)]
+        schema: Option<String>,
+        table: String,
+        path: PathBuf,
+        #[serde(default)]
+        format: Option<ExportFormat>,
+        #[serde(default = "yes")]
+        header: bool,
+        /// Empty CSV/TSV fields are NULL (default true).
+        #[serde(default = "yes")]
+        empty_as_null: bool,
+        /// For each of the file's columns, the table column it goes into (null to
+        /// leave it out). Default: the file's column names.
+        #[serde(default)]
+        columns: Option<Vec<Option<String>>>,
+    },
     /// Turn auto-commit off (or back on) for a session: with it off, a transaction is
     /// begun before the session's next query and stays open until committed or
     /// rolled back.
@@ -181,6 +210,10 @@ pub enum TransactionAction {
 }
 
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
+
+fn yes() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -239,6 +272,10 @@ pub enum Output {
     /// A session's transaction state, after a commit, rollback or change of mode.
     Transaction {
         in_transaction: bool,
+    },
+    ImportPreview(ImportPreview),
+    Imported {
+        rows: u64,
     },
     Keychain {
         /// What it's called here ("the macOS Keychain", ...).

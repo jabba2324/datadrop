@@ -17,6 +17,7 @@ use crate::browser::{Browser, BrowserAction};
 use crate::editor::{self, Document, Find, ResultView};
 use crate::grid_edit::{Editability, Review};
 use crate::history_view::{HistoryAction, HistoryView};
+use crate::import_dialog::{ImportDialog, ImportDone};
 use crate::params_dialog::{ParamPrompt, ParamsDone, Then};
 use crate::profile_form::{FormDone, ProfileForm, TrustPrompt};
 use crate::results::{self, ResultsAction};
@@ -78,6 +79,7 @@ pub struct App {
     delete_task: Option<Task>,
     /// Asking for the values of the query's placeholders.
     pub params: Option<ParamPrompt>,
+    pub import: Option<ImportDialog>,
     /// DDL being read, to open in a new tab: (task, profile, tab name).
     ddl_tasks: Vec<(Option<Task>, String, String)>,
     /// An SSH server to trust (its key isn't known yet), and the task trusting it.
@@ -150,6 +152,7 @@ impl App {
             delete_task: None,
             ddl_tasks: vec![],
             params: None,
+            import: None,
             trust: None,
             trusting: None,
             toasts: egui_notify::Toasts::default(),
@@ -722,7 +725,10 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let modal_open = self.form.is_some() || self.confirm.is_some() || self.params.is_some();
+        let modal_open = self.form.is_some()
+            || self.confirm.is_some()
+            || self.params.is_some()
+            || self.import.is_some();
         if modal_open {
             return;
         }
@@ -1360,6 +1366,25 @@ impl App {
                     kind: ConfirmKind::DeleteProfile(name),
                 });
             }
+            BrowserAction::Import {
+                profile,
+                schema,
+                table,
+            } => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Data", &["csv", "tsv", "tab", "txt", "json"])
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+                {
+                    self.import = Some(ImportDialog::new(
+                        &self.backend,
+                        profile,
+                        schema,
+                        table,
+                        path,
+                    ));
+                }
+            }
             BrowserAction::ShowDdl {
                 profile,
                 schema,
@@ -1777,6 +1802,18 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.review_dialog(ctx);
+        if let Some(d) = &mut self.import
+            && let Some(done) = d.ui(ctx, &self.backend)
+        {
+            let d = self.import.take().expect("checked above");
+            if let ImportDone::Imported(rows) = done {
+                self.toasts.success(format!(
+                    "Imported {rows} row{} into {}",
+                    if rows == 1 { "" } else { "s" },
+                    d.table
+                ));
+            }
+        }
         if let Some(p) = &mut self.params
             && let Some(done) = p.ui(ctx)
         {

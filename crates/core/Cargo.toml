@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+csv.workspace = true
 futures.workspace = true
 keyring-core.workspace = true
 russh.workspace = true

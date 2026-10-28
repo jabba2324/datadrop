@@ -41,6 +41,12 @@ pub enum BrowserAction {
     Edit(String),
     Delete(String),
     Add,
+    /// Import a file into a table.
+    Import {
+        profile: String,
+        schema: String,
+        table: String,
+    },
     /// Open a tab with the SQL that creates something.
     ShowDdl {
         profile: String,
@@ -486,6 +492,17 @@ fn table_ui(
                 schema: schema.to_owned(),
                 kind: ObjectKind::Table,
                 name: t.name.clone(),
+            });
+        }
+        if !t.is_view()
+            && ui
+                .button(format!("{} Import data…", icon::UPLOAD_SIMPLE))
+                .clicked()
+        {
+            action = Some(BrowserAction::Import {
+                profile: p.name.clone(),
+                schema: schema.to_owned(),
+                table: t.name.clone(),
             });
         }
         if ui.button(format!("{} Copy name", icon::COPY)).clicked() {

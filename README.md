@@ -34,6 +34,9 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
   **export** to CSV, TSV or JSON (every row, not just those shown). Click a header
   to sort; type a `WHERE` condition to filter. Both run on the server when the
   result was cut short, so they cover every row.
+- **Import** a CSV, TSV or JSON file into a table (right-click it in the browser):
+  match the file's columns to the table's, see the first rows, and import in one
+  transaction (all or nothing).
 - **Edit data in the grid**: double-click a cell, set NULL, add or delete rows. The
   `UPDATE`/`INSERT`/`DELETE` statements are shown before they run, in one transaction.
 - **Explain** (`Ctrl+E`) and **Explain analyze** (`Ctrl+Shift+E`): the query plan as a
@@ -100,6 +103,11 @@ datadrop query shop "select * from orders where placed > :since" \
 
 # Export every row to a file (format from the extension)
 datadrop query shop "select * from orders" -o orders.csv
+
+# Import a file into a table (columns matched by the header's names)
+datadrop import shop customers customers.csv
+datadrop import shop customers dump.csv --no-header --columns id,name,-,email
+datadrop import shop customers customers.csv --preview   # just show what's in it
 
 # Query plans
 datadrop explain shop "select * from orders where customer_id = 42"

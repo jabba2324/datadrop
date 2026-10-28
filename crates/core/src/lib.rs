@@ -14,6 +14,7 @@ pub mod error;
 pub mod export;
 pub mod format;
 pub mod history;
+pub mod import;
 pub mod keychain;
 pub mod params;
 pub mod plan;

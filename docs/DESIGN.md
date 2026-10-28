@@ -121,6 +121,15 @@ an `UPDATE` to the same values as changing none, which is allowed).
 tree. With analyze, a statement that changes data runs inside a transaction that's
 rolled back, on its own connection (so the tab's own transaction isn't touched).
 
+## Import
+
+`crates/core/src/import.rs` reads CSV/TSV (the `csv` crate: quoted fields, line
+breaks inside them, a BOM) or a JSON array of objects (as exported). `Import` turns the
+rows into multi-row INSERTs (200 rows each) with every value a quoted literal, which
+the database converts to the column's type as it does for typed SQL, and runs them in
+one transaction on a connection of its own: any failure (named by its rows) or a
+cancel rolls back everything.
+
 ## History and export
 
 Every `Query` is appended to `history.jsonl` (one JSON object per line; the file is

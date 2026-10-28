@@ -15,6 +15,7 @@ datadrop-core = { path = "crates/core" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+csv = "1"
 futures = "0.3"
 keyring-core = "1"
 rpassword = "7"

@@ -107,6 +107,30 @@ enum Cmd {
         #[command(flatten)]
         params: Params,
     },
+    /// Insert the rows of a CSV, TSV or JSON file into a table (in one transaction).
+    Import {
+        profile: String,
+        table: String,
+        file: PathBuf,
+        #[arg(long, short)]
+        schema: Option<String>,
+        /// csv, tsv or json (default: from the extension).
+        #[arg(long, value_parser = ["csv", "tsv", "json"])]
+        format: Option<String>,
+        /// The file has no header row (columns are then given with --columns).
+        #[arg(long)]
+        no_header: bool,
+        /// The table columns the file's columns go into, in order; `-` leaves one out.
+        /// Default: the header's names.
+        #[arg(long, value_delimiter = ',')]
+        columns: Option<Vec<String>>,
+        /// Import empty fields as empty text rather than NULL.
+        #[arg(long)]
+        keep_empty: bool,
+        /// Show the file's columns and first rows, and import nothing.
+        #[arg(long)]
+        preview: bool,
+    },
     /// Queries run before, from the app and the command line.
     #[command(subcommand)]
     History(HistoryCmd),
@@ -584,6 +608,51 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             (Command::HistoryClear { profile }, Format::Table)
         }
         Cmd::Keychain => (Command::KeychainStatus, Format::Table),
+        Cmd::Import {
+            profile,
+            table,
+            file,
+            schema,
+            format,
+            no_header,
+            columns,
+            keep_empty,
+            preview,
+        } => {
+            let format = format.map(|f| match f.as_str() {
+                "tsv" => ExportFormat::Tsv,
+                "json" => ExportFormat::Json,
+                _ => ExportFormat::Csv,
+            });
+            if preview {
+                (
+                    Command::ImportPreview {
+                        path: file,
+                        format,
+                        header: !no_header,
+                    },
+                    Format::Table,
+                )
+            } else {
+                (
+                    Command::Import {
+                        profile,
+                        schema,
+                        table,
+                        path: file,
+                        format,
+                        header: !no_header,
+                        empty_as_null: !keep_empty,
+                        columns: columns.map(|c| {
+                            c.into_iter()
+                                .map(|n| (n.trim() != "-").then(|| n.trim().to_owned()))
+                                .collect()
+                        }),
+                    },
+                    Format::Table,
+                )
+            }
+        }
         Cmd::Format { .. } => unreachable!("handled above"),
         Cmd::Exec { command } => {
             let cmd: Command =
@@ -884,6 +953,13 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
             )
         }
         Output::Schema(m) => render::schema(&mut stdout, m)?,
+        Output::ImportPreview(p) => {
+            let names: Vec<&str> = p.columns.iter().map(String::as_str).collect();
+            render::table(&mut stdout, &names, &p.rows)?;
+        }
+        Output::Imported { rows } => {
+            eprintln!("Imported {rows} row{}.", if *rows == 1 { "" } else { "s" })
+        }
         Output::Transaction { in_transaction } => {
             if *in_transaction {
                 eprintln!("A transaction is open.");

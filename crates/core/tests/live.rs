@@ -1097,3 +1097,108 @@ both!(manual_commit_and_rollback, |driver, schema| async move {
         assert_eq!(count().await, "2");
     }
 });
+
+both!(
+    imports_files_in_one_transaction,
+    |driver, schema| async move {
+        let Some(db) = setup(driver, schema).await else {
+            return;
+        };
+        let p = prefix(&db, schema);
+        ok(run(
+            &db.client,
+            "test",
+            &format!(
+                "CREATE TABLE {p}people (id int PRIMARY KEY, name varchar(50), born date, \
+             score numeric(5,2)); CREATE TABLE {p}copy (id int PRIMARY KEY, name varchar(50), \
+             born date, score numeric(5,2))"
+            ),
+            None,
+        )
+        .await);
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("people.csv");
+        let mut text = "id,name,born,score,ignored\n".to_owned();
+        for i in 1..=450 {
+            text.push_str(&format!(
+                "{i},\"Smith, {i}\",2000-01-{:02},{}.5,x\n",
+                i % 28 + 1,
+                i % 100
+            ));
+        }
+        text.push_str("451,,,,\n");
+        std::fs::write(&csv, &text).unwrap();
+        let home = home(&db, schema);
+        let import = |table: &str, path: &std::path::Path| Command::Import {
+            profile: "test".into(),
+            schema: Some(home.into()),
+            table: table.into(),
+            path: path.to_owned(),
+            format: None,
+            header: true,
+            empty_as_null: true,
+            columns: Some(vec![
+                Some("id".into()),
+                Some("name".into()),
+                Some("born".into()),
+                Some("score".into()),
+                None,
+            ]),
+        };
+        let out = db.client.execute(import("people", &csv)).await.unwrap();
+        assert_eq!(out, Output::Imported { rows: 451 });
+        let q = ok(run(
+            &db.client,
+            "test",
+            &format!("SELECT count(*), max(name) FROM {p}people"),
+            None,
+        )
+        .await);
+        assert_eq!(q.results[0].rows[0][0].as_deref(), Some("451"));
+        let q = ok(run(
+            &db.client,
+            "test",
+            &format!("SELECT name, born, score FROM {p}people WHERE id = 451"),
+            None,
+        )
+        .await);
+        assert_eq!(q.results[0].rows[0], [None, None, None]);
+
+        // Every row clashes now: nothing is imported.
+        let err = db.client.execute(import("people", &csv)).await.unwrap_err();
+        assert!(err.to_string().contains("rows 1–200"), "{err}");
+        assert!(err.to_string().contains("nothing was imported"), "{err}");
+
+        // Exported as JSON, imported elsewhere: the same rows.
+        let json = dir.path().join("people.json");
+        db.client
+            .execute(Command::Export {
+                profile: "test".into(),
+                sql: format!("SELECT id, name, born, score FROM {p}people ORDER BY id"),
+                path: json.clone(),
+                format: None,
+                session: None,
+            })
+            .await
+            .unwrap();
+        let mut back = import("copy", &json);
+        if let Command::Import { columns, .. } = &mut back {
+            *columns = None;
+        }
+        assert_eq!(
+            db.client.execute(back).await.unwrap(),
+            Output::Imported { rows: 451 }
+        );
+        let same = ok(run(
+            &db.client,
+            "test",
+            &format!(
+                "SELECT count(*) FROM {p}people a JOIN {p}copy b ON a.id = b.id \
+             AND a.name = b.name AND a.born = b.born AND a.score = b.score"
+            ),
+            None,
+        )
+        .await);
+        assert_eq!(same.results[0].rows[0][0].as_deref(), Some("450"));
+    }
+);

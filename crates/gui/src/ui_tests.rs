@@ -714,3 +714,52 @@ fn formats_the_tab() {
         "SELECT a, b\nFROM t\nWHERE x = 1\n    AND y = 2;\n"
     );
 }
+
+#[test]
+fn imports_a_csv_file() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(
+        &mut h,
+        "create table pets (id integer primary key, name text, age int)",
+    );
+    let csv = dir.path().join("pets.csv");
+    std::fs::write(&csv, "Name,ID,colour\nRex,1,brown\n\"Tom, the cat\",2,\n").unwrap();
+    {
+        let a = h.state_mut();
+        let d = crate::import_dialog::ImportDialog::new(
+            &a.backend,
+            "local".into(),
+            "main".into(),
+            "pets".into(),
+            csv,
+        );
+        a.import = Some(d);
+    }
+    for _ in 0..80 {
+        h.run_steps(1);
+        if h.query_by_label("Rex, Tom, the cat").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    h.get_by_label("Import into pets");
+    // Matched by name, whatever the case; colour has nowhere to go (so age is NULL).
+    until(&mut h, "the columns to be matched", |a| {
+        a.import
+            .as_ref()
+            .is_some_and(|d| d.targets == [Some("name".to_owned()), Some("id".to_owned()), None])
+    });
+    h.get_by_label("Import").click();
+    until(&mut h, "the import", |a| a.import.is_none());
+    let out = run_tab(&mut h, "select id, name, age from pets order by id");
+    assert_eq!(
+        out.results[0].rows,
+        [
+            vec![Some("1".into()), Some("Rex".into()), None],
+            vec![Some("2".into()), Some("Tom, the cat".into()), None],
+        ]
+    );
+}

@@ -14,6 +14,7 @@ use crate::db::{MetaPool, Session};
 use crate::error::{CoreError, Result};
 use crate::export::{ExportFormat, ExportWriter};
 use crate::history::{self, History, HistoryEntry};
+use crate::import;
 use crate::keychain::Keychain;
 use crate::plan::Plan;
 use crate::profile::SshTunnel;
@@ -161,6 +162,57 @@ impl Client {
                 self.test(&p, cancel).await
             }
             Command::ConnectionTest { profile } => self.test(&profile, cancel).await,
+            Command::ImportPreview {
+                path,
+                format,
+                header,
+            } => {
+                let opts = import::ReadOptions {
+                    format: import::format_of(&path, format),
+                    header,
+                    empty_as_null: true,
+                };
+                let preview = tokio::task::spawn_blocking(move || import::preview(&path, opts, 50))
+                    .await
+                    .map_err(|e| CoreError::Invalid(e.to_string()))??;
+                Ok(Output::ImportPreview(preview))
+            }
+            Command::Import {
+                profile,
+                schema,
+                table,
+                path,
+                format,
+                header,
+                empty_as_null,
+                columns,
+            } => {
+                let p = self.store.get(&profile)?;
+                let schema = default_schema(&p, schema)?;
+                let opts = import::ReadOptions {
+                    format: import::format_of(&path, format),
+                    header,
+                    empty_as_null,
+                };
+                let (names, rows) = tokio::task::spawn_blocking(move || import::read(&path, opts))
+                    .await
+                    .map_err(|e| CoreError::Invalid(e.to_string()))??;
+                let targets = match columns {
+                    Some(c) => c,
+                    None => names.into_iter().map(Some).collect(),
+                };
+                let statements =
+                    import::insert_statements(&schema, &table, &targets, &rows, p.driver.into())?;
+                self.in_transaction(&p, &statements, cancel, |i| {
+                    let first = i * import::BATCH + 1;
+                    let last = ((i + 1) * import::BATCH).min(rows.len());
+                    format!("rows {first}–{last}")
+                })
+                .await?;
+                Ok(Output::Imported {
+                    rows: rows.len() as u64,
+                })
+            }
             Command::KeychainStatus => {
                 let keychain = self.store.keychain().clone();
                 let status = tokio::task::spawn_blocking(move || keychain.check())
@@ -679,6 +731,48 @@ impl Client {
         .await;
         if result.is_err() {
             let _ = s.run("ROLLBACK", 1).await;
+        }
+        s.close().await;
+        result
+    }
+
+    /// Run statements in one transaction on a connection of their own, rolling back if
+    /// any fails (or it's cancelled). `what(i)` names statement `i` in errors.
+    async fn in_transaction(
+        &self,
+        profile: &Profile,
+        statements: &[String],
+        cancel: &CancellationToken,
+        what: impl Fn(usize) -> String,
+    ) -> Result<()> {
+        let via = cancellable(cancel, self.via(profile)).await?;
+        let mut s = cancellable(cancel, Session::connect(profile, via)).await?;
+        let begin = if profile.driver == Driver::Mysql {
+            "START TRANSACTION"
+        } else {
+            "BEGIN"
+        };
+        let mut result = cancellable(cancel, s.run(begin, 0)).await.map(|_| ());
+        for (i, st) in statements.iter().enumerate() {
+            if result.is_err() {
+                break;
+            }
+            result = match cancellable(cancel, s.run(st, 0)).await {
+                Ok(_) => Ok(()),
+                Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+                Err(e) => Err(CoreError::Database(format!(
+                    "{} failed, so nothing was imported: {e}",
+                    what(i)
+                ))),
+            };
+        }
+        match &result {
+            Ok(()) => result = s.run("COMMIT", 0).await.map(|_| ()),
+            // Mid-statement: dropping the connection rolls the transaction back.
+            Err(CoreError::Cancelled) => return result,
+            Err(_) => {
+                let _ = s.run("ROLLBACK", 0).await;
+            }
         }
         s.close().await;
         result
