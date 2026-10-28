@@ -704,6 +704,38 @@ pub fn first_keyword(sql: &str, dialect: Dialect) -> Option<String> {
 }
 
 /// Quote an identifier for the dialect: `"a""b"` or `` `a``b` ``.
+/// Whether a statement's rows can be filtered and sorted by wrapping it in
+/// `SELECT * FROM (...)`.
+pub fn is_query(sql: &str, dialect: Dialect) -> bool {
+    matches!(
+        first_keyword(sql, dialect).as_deref(),
+        Some("SELECT" | "WITH" | "VALUES" | "TABLE")
+    )
+}
+
+/// `base`'s rows, filtered by a `WHERE` condition and sorted by a column (descending
+/// if `desc`). On their own lines, so a comment at the end of `base` stays one.
+pub fn filtered(
+    base: &str,
+    condition: &str,
+    order: Option<(&str, bool)>,
+    dialect: Dialect,
+) -> String {
+    let mut s = format!("SELECT * FROM (\n{}\n) AS dd_rows", base.trim());
+    let condition = condition.trim().trim_end_matches(';').trim();
+    if !condition.is_empty() {
+        s.push_str(&format!("\nWHERE {condition}"));
+    }
+    if let Some((col, desc)) = order {
+        s.push_str(&format!(
+            "\nORDER BY {}{}",
+            quote_ident(col, dialect),
+            if desc { " DESC" } else { "" }
+        ));
+    }
+    s
+}
+
 pub fn quote_ident(name: &str, dialect: Dialect) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
@@ -832,6 +864,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn filtering_wraps_the_query() {
+        assert!(is_query("with x as (select 1) select * from x", Postgres));
+        assert!(!is_query("update t set a = 1", Postgres));
+        assert_eq!(
+            filtered(
+                "select * from t -- all",
+                " a > 1; ",
+                Some(("Name", true)),
+                Postgres
+            ),
+            "SELECT * FROM (\nselect * from t -- all\n) AS dd_rows\nWHERE a > 1\nORDER BY \"Name\" DESC"
+        );
+        assert_eq!(
+            filtered("select 1", "", None, Mysql),
+            "SELECT * FROM (\nselect 1\n) AS dd_rows"
+        );
     }
 
     #[test]

@@ -43,6 +43,8 @@ pub struct Document {
     pub running: Option<Task>,
     /// Editing the shown result.
     pub grid: crate::grid_edit::GridEdit,
+    /// The results filtered or sorted by the server.
+    pub filter: Option<crate::grid_edit::Filter>,
     pub view: ResultView,
     pub plan: Option<datadrop_core::Plan>,
     pub plan_error: Option<String>,
@@ -77,6 +79,7 @@ impl Document {
             shown_result: 0,
             running: None,
             grid: Default::default(),
+            filter: None,
             view: ResultView::Results,
             plan: None,
             plan_error: None,

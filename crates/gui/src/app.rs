@@ -1227,7 +1227,12 @@ impl App {
         let Some(r) = out.results.get(result) else {
             return;
         };
-        d.grid.editability = match edit::source_table(&r.sql, dialect) {
+        // A filtered result has the rows of the query as written.
+        let sql = match &d.filter {
+            Some(f) if f.wrapped == r.sql && !f.base.is_empty() => &f.base,
+            _ => &r.sql,
+        };
+        d.grid.editability = match edit::source_table(sql, dialect) {
             None => Editability::ReadOnly(
                 "Only results from a single table can be edited (no joins, grouping, DISTINCT \
                  or subqueries)."
@@ -1242,6 +1247,61 @@ impl App {
                 source,
             ),
         };
+    }
+
+    /// Run a result's query again, filtered by the condition typed for it, or sorted by
+    /// column `sort` (ascending, descending, then not, as clicks go).
+    fn filter_result(&mut self, doc: usize, result: usize, sort: Option<usize>) {
+        let dialect = self.dialect_of(self.docs[doc].profile.as_deref());
+        let d = &mut self.docs[doc];
+        let (Some(r), Some(profile)) = (
+            d.output.as_ref().and_then(|o| o.results.get(result)),
+            d.profile.clone(),
+        ) else {
+            return;
+        };
+        let column = sort.and_then(|c| r.columns.get(c)).map(|c| c.name.clone());
+        let sql = r.sql.clone();
+        let f = d.filter.get_or_insert_with(Default::default);
+        if f.base.is_empty() || f.wrapped != sql {
+            f.base = sql;
+        }
+        if let Some(col) = column {
+            f.order = match f.order.take() {
+                Some((c, false)) if c == col => Some((col, true)),
+                Some((c, true)) if c == col => None,
+                _ => Some((col, false)),
+            };
+        } else {
+            f.applied = f.text.trim().to_owned();
+        }
+        let wrapped = if f.applied.is_empty() && f.order.is_none() {
+            f.base.clone()
+        } else {
+            sql::filtered(
+                &f.base,
+                &f.applied,
+                f.order.as_ref().map(|(c, desc)| (c.as_str(), *desc)),
+                dialect,
+            )
+        };
+        f.wrapped = wrapped.clone();
+        let command = Command::Query {
+            profile,
+            sql: wrapped,
+            session: Some(d.session()),
+            max_rows: Some(self.settings.max_rows),
+        };
+        self.start(doc, command, ResultView::Results);
+    }
+
+    fn clear_filter(&mut self, doc: usize) {
+        if let Some(f) = &mut self.docs[doc].filter {
+            f.text.clear();
+            f.order = None;
+        }
+        let result = self.docs[doc].grid.result.unwrap_or(0);
+        self.filter_result(doc, result, None);
     }
 
     /// Show the SQL that saves a result's edits.
@@ -1736,7 +1796,8 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     // Keep the pane's size whatever it shows.
                     ui.set_min_size(ui.available_size());
-                    match results::results_ui(ui, &mut self.docs[i]) {
+                    let dialect = self.dialect_of(self.docs[i].profile.as_deref());
+                    match results::results_ui(ui, &mut self.docs[i], dialect) {
                         ResultsAction::Stop => {
                             if let Some(t) = &self.docs[i].running {
                                 t.cancel();
@@ -1745,6 +1806,9 @@ impl eframe::App for App {
                         ResultsAction::Export(r) => self.export_result(i, r),
                         ResultsAction::CheckEditable(r) => self.check_editable(i, r),
                         ResultsAction::Review(r) => self.review_edits(i, r),
+                        ResultsAction::Filter(r) => self.filter_result(i, r, None),
+                        ResultsAction::Sort(r, col) => self.filter_result(i, r, Some(col)),
+                        ResultsAction::ClearFilter => self.clear_filter(i),
                         ResultsAction::None => {}
                     }
                 });

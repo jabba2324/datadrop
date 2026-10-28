@@ -570,3 +570,65 @@ fn browses_keys_indexes_and_ddl() {
     assert!(doc.text.contains("CREATE INDEX pets_name"), "{}", doc.text);
     assert!(!doc.dirty());
 }
+
+#[test]
+fn sorts_and_filters_results() {
+    let dir = tempfile::tempdir().unwrap();
+    sqlite_profile(dir.path());
+    let mut h = app(dir.path());
+    until(&mut h, "the profiles", |a| !a.profiles.is_empty());
+    run_tab(
+        &mut h,
+        "create table nums (id integer primary key, n int, label text); \
+         insert into nums (n, label) values (10, 'ten'), (2, 'two'), (33, 'thirty-three'), \
+           (NULL, 'none')",
+    );
+    run_tab(&mut h, "select * from nums");
+    h.run_steps(3);
+
+    // Click a header: sorted here, numbers as numbers, NULLs last.
+    h.get_by_label("n").click();
+    h.run_steps(3);
+    assert_eq!(h.state().docs[0].grid.sort, Some((1, false)));
+    let shown = |h: &Harness<'static, App>| -> Vec<String> {
+        let doc = &h.state().docs[0];
+        let rows = &doc.output.as_ref().unwrap().results[0].rows;
+        let order = crate::grid_edit::sort_order(rows, 1, false);
+        order
+            .iter()
+            .map(|&i| rows[i][2].clone().unwrap_or_default())
+            .collect()
+    };
+    assert_eq!(shown(&h), ["two", "ten", "thirty-three", "none"]);
+    let caret = format!("n {}", egui_phosphor::regular::CARET_UP);
+    h.get_by_label(&caret);
+
+    // A filter runs the query again on the server.
+    h.state_mut().docs[0].filter.as_mut().unwrap().text = "n > 5".into();
+    h.get_by_label("Apply").click();
+    until(&mut h, "the filtered rows", |a| {
+        a.docs[0].running.is_none()
+            && a.docs[0]
+                .output
+                .as_ref()
+                .is_some_and(|o| o.results[0].rows.len() == 2)
+    });
+    let doc = &h.state().docs[0];
+    assert!(
+        doc.output.as_ref().unwrap().results[0]
+            .sql
+            .contains("WHERE n > 5")
+    );
+    // Still editable: the rows are the table's.
+    until(&mut h, "editability", |a| a.docs[0].grid.is_editable());
+
+    // Clear: back to the query as written.
+    h.get_by_label_contains("Clear").click();
+    until(&mut h, "all the rows again", |a| {
+        a.docs[0].running.is_none()
+            && a.docs[0]
+                .output
+                .as_ref()
+                .is_some_and(|o| o.results[0].rows.len() == 4)
+    });
+}

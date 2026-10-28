@@ -29,7 +29,9 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
   stop at the first error. MySQL scripts can change the `DELIMITER`.
 - **Stop** a running query: it's cancelled on the server, not just abandoned.
 - **Results grid** for every result set, with NULLs marked, copy as text, and
-  **export** to CSV, TSV or JSON (every row, not just those shown).
+  **export** to CSV, TSV or JSON (every row, not just those shown). Click a header
+  to sort; type a `WHERE` condition to filter. Both run on the server when the
+  result was cut short, so they cover every row.
 - **Edit data in the grid**: double-click a cell, set NULL, add or delete rows. The
   `UPDATE`/`INSERT`/`DELETE` statements are shown before they run, in one transaction.
 - **Explain** (`Ctrl+E`) and **Explain analyze** (`Ctrl+Shift+E`): the query plan as a

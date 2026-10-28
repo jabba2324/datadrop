@@ -1,5 +1,6 @@
 //! The results pane under the editor.
 
+use datadrop_core::sql::{self, Dialect};
 use datadrop_core::{QueryOutput, StatementResult};
 use egui::RichText;
 use egui_extras::{Column, TableBuilder};
@@ -20,9 +21,15 @@ pub enum ResultsAction {
     CheckEditable(usize),
     /// Show the SQL that would save the edits.
     Review(usize),
+    /// Run the query again with the filter typed for it.
+    Filter(usize),
+    /// Run the query as written again.
+    ClearFilter,
+    /// Sort by this column on the server (all the rows, not only those shown).
+    Sort(usize, usize),
 }
 
-pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
+pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document, dialect: Dialect) -> ResultsAction {
     if let Some(task) = &doc.running {
         let secs = doc.run_started.map_or(0.0, |t| t.elapsed().as_secs_f32());
         let mut action = ResultsAction::None;
@@ -181,9 +188,72 @@ pub fn results_ui(ui: &mut egui::Ui, doc: &mut Document) -> ResultsAction {
                 _ => {}
             }
         });
+        let r = &out.results[i];
+        // A filter is for the query it ran (or, before it's applied, for any).
+        let stale = doc
+            .filter
+            .as_ref()
+            .is_some_and(|f| !f.wrapped.is_empty() && f.wrapped != r.sql);
+        if stale {
+            doc.filter = None;
+        }
+        let filtered = doc.filter.as_ref().is_some_and(|f| f.wrapped == r.sql);
+        if (filtered || sql::is_query(&r.sql, dialect))
+            && let Some(a) = filter_bar(ui, doc, i)
+        {
+            action = a;
+        }
         ui.separator();
-        table(ui, &out.results[i], doc.id, &mut doc.grid);
+        let Some(out) = &doc.output else {
+            return action;
+        };
+        let r = &out.results[i];
+        let server_order = doc
+            .filter
+            .as_ref()
+            .filter(|f| f.wrapped == r.sql)
+            .and_then(|f| f.order.clone());
+        let sort_on_server = r.truncated || server_order.is_some();
+        if let Some(col) = table(ui, r, doc.id, &mut doc.grid, server_order.as_ref()) {
+            if sort_on_server {
+                action = ResultsAction::Sort(i, col);
+            } else {
+                doc.grid.cycle_sort(col);
+            }
+        }
     }
+    action
+}
+
+/// `WHERE [condition]`: filter the result's rows on the server.
+fn filter_bar(ui: &mut egui::Ui, doc: &mut Document, result: usize) -> Option<ResultsAction> {
+    let mut action = None;
+    let f = doc.filter.get_or_insert_with(Default::default);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icon::FUNNEL).weak())
+            .on_hover_text("Filter the rows: the query runs again with this condition");
+        ui.label(RichText::new("WHERE").monospace().weak());
+        let has_clear = !f.applied.is_empty() || f.order.is_some();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut f.text)
+                .id_salt(("filter", doc.id))
+                .hint_text("a condition, e.g. total > 100 AND status = 'open'")
+                .font(egui::TextStyle::Monospace)
+                .desired_width(ui.available_width() - if has_clear { 110.0 } else { 60.0 }),
+        );
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.small_button("Apply").clicked() || enter {
+            action = Some(ResultsAction::Filter(result));
+        }
+        if has_clear
+            && ui
+                .small_button(format!("{} Clear", icon::X))
+                .on_hover_text("Show the query's rows as written")
+                .clicked()
+        {
+            action = Some(ResultsAction::ClearFilter);
+        }
+    });
     action
 }
 
@@ -284,10 +354,20 @@ fn shorten(s: &str, max: usize) -> (String, bool) {
     (out, true)
 }
 
-fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64, grid: &mut GridEdit) {
+/// The grid. Returns the column whose header was clicked.
+fn table(
+    ui: &mut egui::Ui,
+    r: &StatementResult,
+    doc_id: u64,
+    grid: &mut GridEdit,
+    server_order: Option<&(String, bool)>,
+) -> Option<usize> {
     if r.columns.is_empty() {
-        return;
+        return None;
     }
+    let mut clicked = None;
+    // Display position to row of the result.
+    let order: Vec<usize> = (0..r.rows.len()).map(|d| grid.row_at(&r.rows, d)).collect();
     let editable = grid.is_editable();
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
     let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -348,15 +428,34 @@ fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64, grid: &mut GridEdi
             }
             t.header(row_height + 2.0, |mut h| {
                 h.col(|_| {});
-                for c in &r.columns {
+                for (k, c) in r.columns.iter().enumerate() {
                     h.col(|ui| {
-                        ui.strong(&c.name).on_hover_text(&c.type_name);
+                        let arrow = match (grid.sort, server_order) {
+                            (Some((col, desc)), _) if col == k => Some(desc),
+                            (_, Some((name, desc))) if *name == c.name => Some(*desc),
+                            _ => None,
+                        };
+                        let text = match arrow {
+                            Some(false) => format!("{} {}", c.name, icon::CARET_UP),
+                            Some(true) => format!("{} {}", c.name, icon::CARET_DOWN),
+                            None => c.name.clone(),
+                        };
+                        let resp = ui
+                            .add(
+                                egui::Label::new(RichText::new(text).strong())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(format!("{}\nClick to sort", c.type_name));
+                        if resp.clicked() {
+                            clicked = Some(k);
+                        }
                     });
                 }
             })
             .body(|body| {
                 body.rows(row_height, total, |mut row| {
-                    let i = row.index();
+                    let shown = row.index();
+                    let i = order.get(shown).copied().unwrap_or(shown);
                     let is_new = i >= n;
                     let deleted = grid.edits.deleted.contains(&i);
                     let original = r.rows.get(i);
@@ -369,7 +468,7 @@ fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64, grid: &mut GridEdi
                         let label = if is_new {
                             "new".to_owned()
                         } else {
-                            (i + 1).to_string()
+                            (shown + 1).to_string()
                         };
                         let resp = ui.add(
                             egui::Label::new(RichText::new(label).weak())
@@ -535,6 +634,7 @@ fn table(ui: &mut egui::Ui, r: &StatementResult, doc_id: u64, grid: &mut GridEdi
     {
         grid.edits.deleted.insert(row);
     }
+    clicked
 }
 
 fn tsv_field(v: &Option<String>) -> String {
