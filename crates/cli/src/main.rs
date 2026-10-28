@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use datadrop_core::{
-    Client, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, Profile, QueryOutput,
-    SshAuth, SshTunnel, SslMode, StatementResult,
+    Client, Command, ConfigDir, CoreError, Driver, ExportFormat, Output, PasswordStorage, Profile,
+    QueryOutput, SshAuth, SshTunnel, SslMode, StatementResult,
 };
 
 mod render;
@@ -83,6 +83,8 @@ enum Cmd {
     /// Queries run before, from the app and the command line.
     #[command(subcommand)]
     History(HistoryCmd),
+    /// Whether passwords can be kept in the OS keychain here.
+    Keychain,
     /// Run a command given as JSON (see the docs for the shape), printing JSON.
     Exec { command: String },
 }
@@ -182,7 +184,7 @@ struct ProfileFields {
     create_if_missing: bool,
     #[arg(long, short)]
     user: Option<String>,
-    /// Ask for the password (it's saved in the profile file, readable only by you).
+    /// Ask for the password.
     #[arg(long, conflicts_with = "password_stdin")]
     ask_password: bool,
     /// Read the password from standard input.
@@ -209,6 +211,10 @@ struct ProfileFields {
     /// Stop using an SSH tunnel.
     #[arg(long, conflicts_with = "ssh")]
     no_ssh: bool,
+    /// Where to keep the passwords: keychain (the OS keychain) or file (the profile
+    /// file, as plain text). New profiles use the keychain when there is one.
+    #[arg(long)]
+    passwords: Option<PasswordStorage>,
 }
 
 impl ProfileFields {
@@ -289,6 +295,9 @@ impl ProfileFields {
         }
         if self.no_ssh {
             p.ssh = None;
+        }
+        if let Some(storage) = self.passwords {
+            p.passwords = storage;
         }
         if self.ask_password {
             p.password = Some(rpassword::prompt_password("Password: ")?);
@@ -425,6 +434,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::History(HistoryCmd::Clear { profile }) => {
             (Command::HistoryClear { profile }, Format::Table)
         }
+        Cmd::Keychain => (Command::KeychainStatus, Format::Table),
         Cmd::Exec { command } => {
             let cmd: Command =
                 serde_json::from_str(&command).context("parsing the JSON command")?;
@@ -547,11 +557,22 @@ fn profile_command(client: &Client, cmd: ProfileCmd) -> Result<Command> {
             fields,
             force,
         } => {
+            let explicit = fields.passwords.is_some();
             let mut p = Profile {
                 name,
                 ..Profile::default()
             };
             fields.apply(&mut p)?;
+            if !explicit {
+                match client.store().keychain().check() {
+                    Ok(()) => p.passwords = PasswordStorage::Keychain,
+                    Err(why) => {
+                        if p.has_secrets() {
+                            eprintln!("Note: the passwords are saved in the profile file: {why}.");
+                        }
+                    }
+                }
+            }
             Command::ProfileSave {
                 profile: p,
                 previous_name: None,
@@ -712,6 +733,18 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
                 if *removed == 1 { "y" } else { "ies" }
             )
         }
+        Output::Keychain {
+            name,
+            available,
+            error,
+        } => match error {
+            None if *available => writeln!(stdout, "Passwords can be kept in {name}.")?,
+            _ => writeln!(
+                stdout,
+                "Passwords can't be kept in a keychain: {}.",
+                error.as_deref().unwrap_or("unknown reason")
+            )?,
+        },
     }
     Ok(())
 }

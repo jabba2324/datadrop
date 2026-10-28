@@ -11,7 +11,8 @@ It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
 
 - **Connections** saved as profiles: host and port, or a connection URL, user,
   password, SSL mode and an optional CA certificate; or a SQLite file. Test before
-  saving.
+  saving. Passwords go in the OS keychain (macOS Keychain, Windows Credential
+  Manager, or the Secret Service on Linux), or in the profile file if you prefer.
 - **SSH tunnels**: reach a database through an SSH server, signing in with your SSH
   agent, a key file or a password. Host keys are checked (unknown ones show their
   fingerprint to confirm).
@@ -55,7 +56,8 @@ On macOS the app isn't notarised yet; the first time, right-click it and choose 
 ## Command line
 
 ```sh
-# Save a connection (the password is asked for, not typed on the command line)
+# Save a connection (the password is asked for, not typed on the command line, and
+# kept in the OS keychain; --passwords file keeps it in the profile file instead)
 datadrop profile add shop --url postgres://alice@db.example.com/shop --ask-password
 datadrop profile add local --driver mysql --host 127.0.0.1 --user root --database app --ask-password
 datadrop profile add notes --driver sqlite --database ./notes.db --create-if-missing
@@ -108,11 +110,17 @@ Everything lives in `~/.datadrop` (set `DATADROP_HOME` to use another folder):
   read).
 - `gui.json`: the desktop app's settings and open files.
 
-**Passwords (database and SSH) and key passphrases are stored in the profile files as
-plain text.** The files and folder are
-created readable only by you (mode 0600/0700 on macOS and Linux; on Windows they're
-in your user profile). Don't keep production credentials on a shared machine, and
-prefer a read-only database user for browsing.
+Passwords (database and SSH) and key passphrases are kept in the OS keychain, under
+"DataDrop": the macOS Keychain, Windows Credential Manager, or the Secret Service on
+Linux (GNOME Keyring, KWallet). `datadrop keychain` says whether there's one to use.
+Without one (a server with no desktop session, say), or if you choose
+`--passwords file` / "In the profile file", **they're stored in the profile file as
+plain text**. Move an existing profile with
+`datadrop profile edit <name> --passwords keychain`.
+
+The files and folder are created readable only by you (mode 0600/0700 on macOS and
+Linux; on Windows they're in your user profile). Prefer a read-only database user for
+browsing.
 
 ## Building from source
 

@@ -1,13 +1,23 @@
 //! UI tests: the real app in egui's test harness (no window or GPU needed).
 
-use datadrop_core::{Client, Command, ConfigDir, Driver, Profile};
+use datadrop_core::{Client, Command, ConfigDir, Driver, Keychain, Profile};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use crate::app::{App, ConfirmKind};
 
+/// The keychain the tests use: in memory, shared by every client in a test process.
+fn keychain() -> Keychain {
+    static K: std::sync::OnceLock<Keychain> = std::sync::OnceLock::new();
+    K.get_or_init(Keychain::memory).clone()
+}
+
+fn config(dir: &std::path::Path) -> ConfigDir {
+    ConfigDir::new(dir).with_keychain(keychain())
+}
+
 fn app(dir: &std::path::Path) -> Harness<'static, App> {
-    let config = ConfigDir::new(dir);
+    let config = config(dir);
     Harness::builder()
         .with_size(egui::vec2(1200.0, 760.0))
         .build_eframe(move |cc| App::new(&cc.egui_ctx, config))
@@ -27,7 +37,7 @@ fn until(h: &mut Harness<'static, App>, what: &str, done: impl Fn(&App) -> bool)
 
 fn save_profile(dir: &std::path::Path, profile: Profile) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let client = Client::new(&ConfigDir::new(dir));
+    let client = Client::new(&config(dir));
     rt.block_on(client.execute(Command::ProfileSave {
         profile,
         previous_name: None,
@@ -53,7 +63,7 @@ fn the_form_saves_a_profile() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = app(dir.path());
     h.run_steps(3);
-    h.state_mut().form = Some(crate::profile_form::ProfileForm::new());
+    h.state_mut().form = Some(crate::profile_form::ProfileForm::new(Ok(())));
     h.run_steps(3);
     // The name field has focus when the form opens.
     h.get_by_label("Name").type_text("Shop");
@@ -74,13 +84,17 @@ fn the_form_saves_a_profile() {
     until(&mut h, "the profile to save", |a| {
         a.form.is_none() && a.profiles.iter().any(|p| p.name == "Shop")
     });
-    let saved = Client::new(&ConfigDir::new(dir.path()))
+    let saved = Client::new(&config(dir.path()))
         .store()
         .get("Shop")
         .unwrap();
     assert_eq!(saved.host, "db.internal");
     assert_eq!(saved.port, Some(6543));
     assert_eq!(saved.password.as_deref(), Some("pw"));
+    // The password went in the keychain, not the file.
+    assert_eq!(saved.passwords, datadrop_core::PasswordStorage::Keychain);
+    let file = std::fs::read_to_string(dir.path().join("profiles/Shop.json")).unwrap();
+    assert!(!file.contains("\"pw\""), "{file}");
     // New tabs use it.
     assert_eq!(h.state().docs[0].profile.as_deref(), Some("Shop"));
 }

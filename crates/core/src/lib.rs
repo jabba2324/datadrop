@@ -13,6 +13,7 @@ pub mod edit;
 pub mod error;
 pub mod export;
 pub mod history;
+pub mod keychain;
 pub mod plan;
 pub mod profile;
 pub mod sql;
@@ -25,6 +26,9 @@ pub use db::{CatalogTable, Column, ColumnInfo, StatementResult, TableInfo, Table
 pub use error::{CoreError, Result};
 pub use export::ExportFormat;
 pub use history::HistoryEntry;
+pub use keychain::Keychain;
 pub use plan::{Plan, PlanNode};
-pub use profile::{Driver, Profile, ProfileStore, ProfileSummary, SshAuth, SshTunnel, SslMode};
+pub use profile::{
+    Driver, PasswordStorage, Profile, ProfileStore, ProfileSummary, SshAuth, SshTunnel, SslMode,
+};
 pub use tokio_util::sync::CancellationToken;

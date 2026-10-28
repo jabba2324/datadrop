@@ -8,10 +8,11 @@ before the details are made public.
 
 Worth knowing about DataDrop's design:
 
-- Connection profiles, **including database and SSH passwords and key passphrases,
-  are stored as plain text** in `~/.datadrop/profiles`, readable only by your user
-  account. Anyone (or anything) that
-  can read your files can read them. See [Where things are kept](README.md#where-things-are-kept).
+- Database and SSH passwords and key passphrases are kept in the OS keychain when
+  there is one. Profiles set to keep them in the file (or saved where there's no
+  keychain) **store them as plain text** in `~/.datadrop/profiles`, readable only by
+  your user account: anyone (or anything) that can read your files can read them.
+  See [Where things are kept](README.md#where-things-are-kept).
 - Connections use TLS when the server offers it (`prefer`), without checking the
   certificate. Use `verify-full` (with a CA certificate if the server's isn't publicly
   trusted) to be protected from someone intercepting the connection.

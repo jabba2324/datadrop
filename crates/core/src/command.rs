@@ -136,6 +136,8 @@ pub enum Command {
         #[serde(default)]
         profile: Option<String>,
     },
+    /// Whether the OS keychain can be used for passwords here.
+    KeychainStatus,
 }
 
 pub const DEFAULT_MAX_ROWS: usize = 10_000;
@@ -189,6 +191,14 @@ pub enum Output {
     },
     HistoryCleared {
         removed: usize,
+    },
+    Keychain {
+        /// What it's called here ("the macOS Keychain", ...).
+        name: String,
+        available: bool,
+        /// Why it isn't.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 

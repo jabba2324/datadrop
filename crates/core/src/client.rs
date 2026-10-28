@@ -12,6 +12,7 @@ use crate::db::{MetaPool, Session};
 use crate::error::{CoreError, Result};
 use crate::export::{ExportFormat, ExportWriter};
 use crate::history::{self, History, HistoryEntry};
+use crate::keychain::Keychain;
 use crate::plan::Plan;
 use crate::profile::SshTunnel;
 use crate::profile::{Driver, Profile, ProfileStore};
@@ -22,11 +23,26 @@ use crate::tunnel::{self, Tunnel};
 #[derive(Debug, Clone)]
 pub struct ConfigDir {
     root: PathBuf,
+    /// Instead of the system's keychain (for tests).
+    keychain: Option<Keychain>,
 }
 
 impl ConfigDir {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            keychain: None,
+        }
+    }
+
+    /// Keep passwords in this keychain rather than the system's.
+    pub fn with_keychain(mut self, keychain: Keychain) -> Self {
+        self.keychain = Some(keychain);
+        self
+    }
+
+    pub fn keychain(&self) -> Keychain {
+        self.keychain.clone().unwrap_or_else(Keychain::system)
     }
 
     pub fn default_location() -> Result<Self> {
@@ -77,7 +93,7 @@ pub struct Client {
 impl Client {
     pub fn new(config: &ConfigDir) -> Self {
         Self {
-            store: ProfileStore::new(config.profiles()),
+            store: ProfileStore::with_keychain(config.profiles(), config.keychain()),
             history: History::new(config.history()),
             known_hosts: config.known_hosts(),
             tunnels: Default::default(),
@@ -109,10 +125,13 @@ impl Client {
                 name,
                 show_password,
             } => {
-                let p = self.store.get(&name)?;
-                Ok(Output::Profile {
-                    profile: if show_password { p } else { p.masked() },
-                })
+                // Without the passwords, there's no need to ask the keychain.
+                let profile = if show_password {
+                    self.store.get(&name)?
+                } else {
+                    self.store.get_without_secrets(&name)?.masked()
+                };
+                Ok(Output::Profile { profile })
             }
             Command::ProfileSave {
                 profile,
@@ -137,6 +156,17 @@ impl Client {
                 self.test(&p, cancel).await
             }
             Command::ConnectionTest { profile } => self.test(&profile, cancel).await,
+            Command::KeychainStatus => {
+                let keychain = self.store.keychain().clone();
+                let status = tokio::task::spawn_blocking(move || keychain.check())
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                Ok(Output::Keychain {
+                    name: crate::Keychain::name().into(),
+                    available: status.is_ok(),
+                    error: status.err(),
+                })
+            }
             Command::Schemas { profile } => {
                 let pool = self.pool(&profile).await?;
                 Ok(Output::Schemas {

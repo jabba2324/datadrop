@@ -156,6 +156,11 @@ impl App {
         app
     }
 
+    /// Whether passwords can go in the keychain (checked once).
+    fn keychain(&self) -> Result<(), String> {
+        self.backend.client.store().keychain().check()
+    }
+
     pub fn refresh_profiles(&mut self) {
         self.profiles_task = Some(self.backend.run(Command::ProfileList));
     }
@@ -832,7 +837,7 @@ impl App {
             });
             ui.menu_button("Connections", |ui| {
                 if ui.button("Add a connection…").clicked() {
-                    self.form = Some(ProfileForm::new());
+                    self.form = Some(ProfileForm::new(self.keychain()));
                 }
                 if ui.button("Refresh").clicked() {
                     self.refresh_profiles();
@@ -1131,12 +1136,12 @@ impl App {
 
     fn browser_action(&mut self, action: BrowserAction) {
         match action {
-            BrowserAction::Add => self.form = Some(ProfileForm::new()),
+            BrowserAction::Add => self.form = Some(ProfileForm::new(self.keychain())),
             BrowserAction::NewTab(p) => {
                 self.new_tab(Some(p));
             }
             BrowserAction::Edit(name) => match self.backend.client.store().get(&name) {
-                Ok(p) => self.form = Some(ProfileForm::edit(&p)),
+                Ok(p) => self.form = Some(ProfileForm::edit(&p, self.keychain())),
                 Err(e) => {
                     self.toasts.error(e.to_string());
                 }

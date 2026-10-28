@@ -23,7 +23,15 @@ A profile has either fields (host, port, database) or a connection URL. With a U
 host, port and database win; `user` and `password` fill in what it leaves out. Writes
 go to a temporary file and are renamed into place, with mode 0600.
 
-Passwords are plain text for now. Moving them to the OS keychain is on the list below.
+A profile's `passwords` setting says where its secrets are: `keychain` (the default
+for new profiles when there's a keychain) or `file`. With the keychain
+(`crates/core/src/keychain.rs`, on keyring-core and the native stores: the macOS
+Keychain, Windows Credential Manager, the Secret Service over zbus), the database
+password is under the account `<profile>` and the SSH password or key passphrase under
+`<profile> (SSH)`, service `DataDrop`, and the file has none (a password in the URL
+moves to the keychain too). `ProfileStore::get` fills them back in; reads are cached
+per process, so the keychain is asked once. Renaming a profile moves its entries, and
+removing it (or moving it back to the file) deletes them.
 
 ## Running SQL
 
@@ -127,7 +135,5 @@ behind a Cargo feature would keep the OpenSSL dependency optional.
 
 ## Next
 
-- Passwords in the OS keychain (macOS Keychain, Windows Credential Manager, Secret
-  Service), with plain-text files as a fallback.
 - macOS `.app` bundle with notarisation; Windows installer; Linux packages.
 - SQL Server (see above).

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::keychain::Keychain;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -201,6 +202,37 @@ pub struct Profile {
     /// Connect through an SSH server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshTunnel>,
+    /// Where the passwords (and any key passphrase) are kept.
+    #[serde(skip_serializing_if = "PasswordStorage::is_file")]
+    pub passwords: PasswordStorage,
+}
+
+/// Where a profile's passwords are kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasswordStorage {
+    /// In the profile's file, as plain text.
+    #[default]
+    File,
+    /// In the OS keychain; the file has none.
+    Keychain,
+}
+
+impl PasswordStorage {
+    pub fn is_file(&self) -> bool {
+        *self == Self::File
+    }
+}
+
+impl std::str::FromStr for PasswordStorage {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "file" => Ok(Self::File),
+            "keychain" => Ok(Self::Keychain),
+            _ => Err(format!("unknown password storage '{s}' (keychain, file)")),
+        }
+    }
 }
 
 /// What a listing shows: no password.
@@ -278,6 +310,34 @@ impl Profile {
             Some(ssh) => format!("{target} via {}@{}", ssh.user, ssh.host),
             None => target,
         }
+    }
+
+    /// Whether the profile has any password or passphrase.
+    pub fn has_secrets(&self) -> bool {
+        let mut p = self.clone();
+        let (db, ssh) = p.take_secrets();
+        db.is_some() || ssh.is_some()
+    }
+
+    /// Remove the passwords (the database's, including one in the URL, and the SSH
+    /// password or key passphrase), returning them.
+    fn take_secrets(&mut self) -> (Option<String>, Option<String>) {
+        let mut db = self.password.take().filter(|p| !p.is_empty());
+        if let Some(u) = &self.url
+            && let Ok(mut url) = url::Url::parse(u)
+            && let Some(pw) = url.password()
+        {
+            // As when connecting, the URL's password wins.
+            db = Some(decode(pw));
+            let _ = url.set_password(None);
+            self.url = Some(url.to_string());
+        }
+        let ssh = self.ssh.as_mut().and_then(|ssh| match &mut ssh.auth {
+            SshAuth::Password { password } => Some(std::mem::take(password)),
+            SshAuth::Key { passphrase, .. } => passphrase.take(),
+            SshAuth::Agent => None,
+        });
+        (db, ssh.filter(|s| !s.is_empty()))
     }
 
     /// The same profile with the password (in the field and in any URL) replaced by
@@ -419,11 +479,32 @@ pub fn validate_name(name: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct ProfileStore {
     dir: PathBuf,
+    keychain: Keychain,
+}
+
+/// The keychain account names for a profile's secrets.
+fn db_account(name: &str) -> String {
+    name.to_owned()
+}
+
+fn ssh_account(name: &str) -> String {
+    format!("{name} (SSH)")
 }
 
 impl ProfileStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self::with_keychain(dir, Keychain::system())
+    }
+
+    pub fn with_keychain(dir: impl Into<PathBuf>, keychain: Keychain) -> Self {
+        Self {
+            dir: dir.into(),
+            keychain,
+        }
+    }
+
+    pub fn keychain(&self) -> &Keychain {
+        &self.keychain
     }
 
     pub fn dir(&self) -> &Path {
@@ -455,7 +536,29 @@ impl ProfileStore {
         Ok(out)
     }
 
+    /// A profile, with its passwords (from the keychain, if they're kept there).
     pub fn get(&self, name: &str) -> Result<Profile> {
+        let mut p = self.get_file(name)?;
+        if p.passwords == PasswordStorage::Keychain {
+            p.password = self.keychain.get(&db_account(name))?;
+            if let Some(ssh) = &mut p.ssh {
+                let secret = || self.keychain.get(&ssh_account(name));
+                match &mut ssh.auth {
+                    SshAuth::Password { password } => *password = secret()?.unwrap_or_default(),
+                    SshAuth::Key { passphrase, .. } => *passphrase = secret()?,
+                    SshAuth::Agent => {}
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// A profile as its file has it (without passwords kept in the keychain).
+    pub fn get_without_secrets(&self, name: &str) -> Result<Profile> {
+        self.get_file(name)
+    }
+
+    fn get_file(&self, name: &str) -> Result<Profile> {
         validate_name(name).map_err(|_| CoreError::ProfileNotFound(name.to_owned()))?;
         let path = self.path(name);
         if !path.exists() {
@@ -488,23 +591,58 @@ impl ProfileStore {
         {
             return Err(CoreError::ProfileNotFound(old.to_owned()));
         }
+        let before = previous_name
+            .or(Some(profile.name.as_str()))
+            .and_then(|n| self.get_file(n).ok());
+        let mut file = profile.clone();
+        if profile.passwords == PasswordStorage::Keychain {
+            // Into the keychain first: if that fails, nothing has changed.
+            let (db, ssh) = file.take_secrets();
+            self.keychain
+                .set(&db_account(&profile.name), db.as_deref())?;
+            self.keychain
+                .set(&ssh_account(&profile.name), ssh.as_deref())?;
+        }
         fs::create_dir_all(&self.dir)
             .map_err(|e| CoreError::io(format!("creating {}", self.dir.display()), e))?;
         restrict_dir(&self.dir);
-        let json = serde_json::to_vec_pretty(profile).expect("profile serialises");
+        let json = serde_json::to_vec_pretty(&file).expect("profile serialises");
         write_private(&self.path(&profile.name), &json)?;
         if renaming && let Some(old) = previous_name {
             let _ = fs::remove_file(self.path(old));
         }
+        // Tidy up the keychain entries a rename or a move to the file left behind.
+        if let Some(before) = before
+            && before.passwords == PasswordStorage::Keychain
+            && (renaming || profile.passwords == PasswordStorage::File)
+        {
+            self.forget_secrets(&before.name);
+        }
         Ok(())
+    }
+
+    fn forget_secrets(&self, name: &str) {
+        for account in [db_account(name), ssh_account(name)] {
+            if let Err(e) = self.keychain.delete(&account) {
+                tracing::warn!("{e}");
+            }
+        }
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
         if !self.exists(name) {
             return Err(CoreError::ProfileNotFound(name.to_owned()));
         }
+        let keychain = self
+            .get_file(name)
+            .is_ok_and(|p| p.passwords == PasswordStorage::Keychain);
         let path = self.path(name);
-        fs::remove_file(&path).map_err(|e| CoreError::io(format!("removing {}", path.display()), e))
+        fs::remove_file(&path)
+            .map_err(|e| CoreError::io(format!("removing {}", path.display()), e))?;
+        if keychain {
+            self.forget_secrets(name);
+        }
+        Ok(())
     }
 }
 
@@ -608,6 +746,73 @@ mod tests {
         store.save(&pg("c"), Some("a"), false).unwrap();
         assert!(!store.exists("a"));
         assert!(store.exists("c"));
+    }
+
+    #[test]
+    fn passwords_in_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::memory();
+        let store = ProfileStore::with_keychain(dir.path(), keychain.clone());
+        let mut p = pg("shop");
+        p.url = Some("postgres://alice:url%20pw@db/shop".into());
+        p.passwords = PasswordStorage::Keychain;
+        p.ssh = Some(SshTunnel {
+            host: "bastion".into(),
+            user: "ops".into(),
+            auth: SshAuth::Key {
+                path: "/k".into(),
+                passphrase: Some("pp".into()),
+            },
+            ..SshTunnel::default()
+        });
+        store.save(&p, None, false).unwrap();
+
+        // None of them are in the file...
+        let file = fs::read_to_string(dir.path().join("shop.json")).unwrap();
+        for secret in ["s3cret", "url%20pw", "\"pp\""] {
+            assert!(!file.contains(secret), "{secret} is in the file: {file}");
+        }
+        assert!(file.contains("\"passwords\": \"keychain\""), "{file}");
+        // ...they're in the keychain, and come back with the profile.
+        assert_eq!(keychain.get("shop").unwrap().as_deref(), Some("url pw"));
+        let got = store.get("shop").unwrap();
+        assert_eq!(got.password.as_deref(), Some("url pw"));
+        assert_eq!(got.url.as_deref(), Some("postgres://alice@db/shop"));
+        let Some(SshTunnel {
+            auth: SshAuth::Key { passphrase, .. },
+            ..
+        }) = &got.ssh
+        else {
+            panic!()
+        };
+        assert_eq!(passphrase.as_deref(), Some("pp"));
+
+        // Renamed: the keychain entries move with it.
+        store.save(&got, Some("shop"), false).unwrap();
+        let mut renamed = got.clone();
+        renamed.name = "store".into();
+        store.save(&renamed, Some("shop"), false).unwrap();
+        assert_eq!(keychain.get("shop").unwrap(), None);
+        assert_eq!(keychain.get("store").unwrap().as_deref(), Some("url pw"));
+        assert_eq!(keychain.get("store (SSH)").unwrap().as_deref(), Some("pp"));
+
+        // Moved back to the file: the keychain is tidied up.
+        let mut back = store.get("store").unwrap();
+        back.passwords = PasswordStorage::File;
+        store.save(&back, Some("store"), false).unwrap();
+        assert_eq!(keychain.get("store").unwrap(), None);
+        assert_eq!(
+            store.get("store").unwrap().password.as_deref(),
+            Some("url pw")
+        );
+
+        // Removing a keychain profile removes its entries.
+        back.passwords = PasswordStorage::Keychain;
+        store.save(&back, Some("store"), false).unwrap();
+        assert!(keychain.get("store").unwrap().is_some());
+        store.remove("store").unwrap();
+        assert_eq!(keychain.get("store").unwrap(), None);
+        assert_eq!(keychain.get("store (SSH)").unwrap(), None);
     }
 
     #[cfg(unix)]

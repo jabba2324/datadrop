@@ -1,6 +1,9 @@
 //! Adding or editing a connection profile.
 
-use datadrop_core::{Command, CoreError, Driver, Output, Profile, SshAuth, SshTunnel, SslMode};
+use datadrop_core::{
+    Command, CoreError, Driver, Keychain, Output, PasswordStorage, Profile, SshAuth, SshTunnel,
+    SslMode,
+};
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
@@ -29,6 +32,9 @@ pub struct ProfileForm {
     pub ssh_password: String,
     pub ssh_key: String,
     pub ssh_passphrase: String,
+    pub passwords: PasswordStorage,
+    /// Whether the keychain can be used (and why not).
+    keychain: Result<(), String>,
     show_password: bool,
     test: Option<Task>,
     test_result: Option<Result<String, String>>,
@@ -89,12 +95,20 @@ pub enum FormDone {
 }
 
 impl ProfileForm {
-    pub fn new() -> Self {
-        Self::from_profile(None, &Profile::default())
+    /// A new profile: its passwords go in the keychain if there is one.
+    pub fn new(keychain: Result<(), String>) -> Self {
+        let mut f = Self::from_profile(None, &Profile::default());
+        if keychain.is_ok() {
+            f.passwords = PasswordStorage::Keychain;
+        }
+        f.keychain = keychain;
+        f
     }
 
-    pub fn edit(p: &Profile) -> Self {
-        Self::from_profile(Some(p.name.clone()), p)
+    pub fn edit(p: &Profile, keychain: Result<(), String>) -> Self {
+        let mut f = Self::from_profile(Some(p.name.clone()), p);
+        f.keychain = keychain;
+        f
     }
 
     fn from_profile(previous: Option<String>, p: &Profile) -> Self {
@@ -145,6 +159,8 @@ impl ProfileForm {
                 }) => pp.clone(),
                 _ => String::new(),
             },
+            passwords: p.passwords,
+            keychain: Ok(()),
             show_password: false,
             test: None,
             test_result: None,
@@ -173,6 +189,7 @@ impl ProfileForm {
             driver: self.driver,
             user: self.user.trim().to_owned(),
             password: (!self.password.is_empty()).then(|| self.password.clone()),
+            passwords: self.passwords,
             ssl_mode: self.ssl_mode,
             ssl_root_cert: (!self.ssl_root_cert.trim().is_empty())
                 .then(|| self.ssl_root_cert.trim().into()),
@@ -441,6 +458,7 @@ impl ProfileForm {
                     }
                 });
                 ui.end_row();
+                self.storage_field(ui);
                 ui.label("SSL");
                 egui::ComboBox::from_id_salt("ssl-mode")
                     .selected_text(self.ssl_mode.as_str())
@@ -549,6 +567,44 @@ impl ProfileForm {
 }
 
 impl ProfileForm {
+    /// Where the passwords are kept.
+    fn storage_field(&mut self, ui: &mut egui::Ui) {
+        ui.label("Keep passwords");
+        let text = |s: PasswordStorage| match s {
+            PasswordStorage::Keychain => "In the keychain",
+            PasswordStorage::File => "In the profile file",
+        };
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("password-storage")
+                .selected_text(text(self.passwords))
+                .show_ui(ui, |ui| {
+                    ui.add_enabled_ui(self.keychain.is_ok(), |ui| {
+                        ui.selectable_value(
+                            &mut self.passwords,
+                            PasswordStorage::Keychain,
+                            text(PasswordStorage::Keychain),
+                        )
+                    });
+                    ui.selectable_value(
+                        &mut self.passwords,
+                        PasswordStorage::File,
+                        text(PasswordStorage::File),
+                    );
+                })
+                .response
+                .on_hover_text(format!(
+                    "The keychain is {}. The profile file is plain text, readable only by \
+                     your user account.",
+                    Keychain::name()
+                ));
+            if let Err(why) = &self.keychain {
+                ui.label(RichText::new(icon::WARNING).color(ui.visuals().warn_fg_color))
+                    .on_hover_text(why);
+            }
+        });
+        ui.end_row();
+    }
+
     fn file_fields(&mut self, ui: &mut egui::Ui) {
         let l = ui.label("File");
         ui.horizontal(|ui| {
@@ -597,7 +653,7 @@ mod tests {
 
     #[test]
     fn builds_profiles() {
-        let mut f = ProfileForm::new();
+        let mut f = ProfileForm::new(Ok(()));
         f.name = "shop".into();
         f.host = "db".into();
         f.port = "6543".into();
@@ -619,7 +675,7 @@ mod tests {
         assert!(p.host.is_empty(), "host fields aren't saved with a URL");
 
         // Through SSH, with a key.
-        let mut t = ProfileForm::new();
+        let mut t = ProfileForm::new(Ok(()));
         t.name = "tunnelled".into();
         t.host = "10.0.0.5".into();
         t.use_ssh = true;
@@ -639,10 +695,10 @@ mod tests {
                 passphrase: Some("pp".into())
             }
         );
-        assert_eq!(ProfileForm::edit(&p).build().unwrap(), p);
+        assert_eq!(ProfileForm::edit(&p, Ok(())).build().unwrap(), p);
 
         // SQLite needs only the file.
-        let mut lite = ProfileForm::new();
+        let mut lite = ProfileForm::new(Ok(()));
         lite.name = "local".into();
         lite.driver = Driver::Sqlite;
         assert!(lite.build().is_err());
@@ -654,7 +710,7 @@ mod tests {
         assert!(l.create_if_missing && l.password.is_none());
 
         // Editing round-trips.
-        let again = ProfileForm::edit(&p).build().unwrap();
+        let again = ProfileForm::edit(&p, Ok(())).build().unwrap();
         assert_eq!(again, p);
     }
 }

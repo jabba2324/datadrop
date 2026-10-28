@@ -48,6 +48,8 @@ pub enum CoreError {
         fingerprint: String,
         file: String,
     },
+    #[error("keychain: {0}")]
+    Keychain(String),
 }
 
 impl CoreError {
@@ -71,6 +73,7 @@ impl CoreError {
             Self::Ssh(_) => "ssh",
             Self::UnknownHostKey { .. } => "unknown_host_key",
             Self::HostKeyChanged { .. } => "host_key_changed",
+            Self::Keychain(_) => "keychain",
         }
     }
 }
