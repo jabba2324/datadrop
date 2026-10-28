@@ -417,6 +417,33 @@ fn edits_rows_in_the_grid() {
         ]
     );
 
+    // Running another query with an edit not saved asks first.
+    until(&mut h, "the grid to become editable", |a| {
+        a.docs[0].grid.is_editable()
+    });
+    {
+        let a = h.state_mut();
+        let rows = a.docs[0].output.as_ref().unwrap().results[0].rows.clone();
+        a.docs[0].grid.set(0, 1, Some("Max".into()), &rows);
+        a.docs[0].text = "select 1".into();
+        let ctx = h.ctx.clone();
+        h.state_mut().run(&ctx, true);
+    }
+    h.run_steps(2);
+    assert!(h.state().docs[0].running.is_none());
+    h.get_by_label("Discard your edits?");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(h.state().docs[0].grid.edits.count(), 1);
+    let ctx = h.ctx.clone();
+    h.state_mut().run(&ctx, true);
+    h.run_steps(2);
+    h.get_by_label("Discard").click();
+    h.run_steps(1);
+    assert!(h.state().docs[0].running.is_some());
+    until(&mut h, "the query", |a| a.docs[0].running.is_none());
+    assert_eq!(h.state().docs[0].grid.edits.count(), 0);
+
     // A join isn't editable.
     run_tab(
         &mut h,

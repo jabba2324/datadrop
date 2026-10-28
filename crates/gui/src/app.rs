@@ -27,6 +27,13 @@ pub enum ConfirmKind {
     Quit,
     DeleteProfile(String),
     ClearHistory,
+    /// The tab has grid edits that weren't saved; then do this.
+    DiscardEdits(u64, AfterDiscard),
+}
+
+pub enum AfterDiscard {
+    Run(Box<Command>, ResultView),
+    Close,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -272,7 +279,20 @@ impl App {
 
     pub fn request_close_tab(&mut self, i: usize) {
         let doc = &self.docs[i];
-        if doc.dirty() {
+        let edits = doc.grid.edits.count();
+        if edits > 0 {
+            self.active = i;
+            self.confirm = Some(Confirm {
+                kind: ConfirmKind::DiscardEdits(doc.id, AfterDiscard::Close),
+                title: "Discard your edits?".into(),
+                text: format!(
+                    "{} to the results in {} {} not saved yet.",
+                    plural(edits, "change"),
+                    doc.title(),
+                    if edits == 1 { "is" } else { "are" },
+                ),
+            });
+        } else if doc.dirty() {
             self.active = i;
             self.confirm = Some(Confirm {
                 kind: ConfirmKind::CloseTab(doc.id),
@@ -308,7 +328,6 @@ impl App {
             .into()
     }
 
-    /// Run the selection or the statement under the cursor (or the whole tab).
     /// The tab's connection and the SQL to run: the whole tab, the selection, or the
     /// statement at the cursor. `None` (after saying why) if there's nothing to run.
     fn sql_to_run(&mut self, ctx: &egui::Context, whole: bool) -> Option<(String, String)> {
@@ -344,15 +363,14 @@ impl App {
         let Some((profile, sql)) = self.sql_to_run(ctx, whole) else {
             return;
         };
-        let doc = &mut self.docs[self.active];
-        doc.running = Some(self.backend.run(Command::Query {
+        let doc = &self.docs[self.active];
+        let command = Command::Query {
             profile,
             sql,
             session: Some(doc.session()),
             max_rows: Some(self.settings.max_rows),
-        }));
-        doc.run_started = Some(Instant::now());
-        doc.view = ResultView::Results;
+        };
+        self.start(self.active, command, ResultView::Results);
     }
 
     /// Show the plan for the selection or the statement under the cursor.
@@ -360,16 +378,39 @@ impl App {
         let Some((profile, sql)) = self.sql_to_run(ctx, false) else {
             return;
         };
-        let doc = &mut self.docs[self.active];
-        doc.running = Some(self.backend.run(Command::Explain {
+        let doc = &self.docs[self.active];
+        let command = Command::Explain {
             profile,
             sql,
             analyze,
             session: Some(doc.session()),
-        }));
+        };
+        self.start(self.active, command, ResultView::Plan);
+    }
+
+    /// Run a command in tab `i`, first asking about grid edits it would throw away.
+    fn start(&mut self, i: usize, command: Command, view: ResultView) {
+        let doc = &mut self.docs[i];
+        let edits = doc.grid.edits.count();
+        if edits > 0 {
+            self.confirm = Some(Confirm {
+                kind: ConfirmKind::DiscardEdits(doc.id, AfterDiscard::Run(Box::new(command), view)),
+                title: "Discard your edits?".into(),
+                text: format!(
+                    "{} to the results {} not saved yet. Running another query throws {} away.",
+                    plural(edits, "change"),
+                    if edits == 1 { "is" } else { "are" },
+                    if edits == 1 { "it" } else { "them" },
+                ),
+            });
+            return;
+        }
+        doc.running = Some(self.backend.run(command));
         doc.run_started = Some(Instant::now());
-        doc.view = ResultView::Plan;
-        doc.plan_error = None;
+        if view == ResultView::Plan {
+            doc.plan_error = None;
+        }
+        doc.view = view;
     }
 
     /// The catalog for autocompletion on `profile`, loading it if needed (empty until
@@ -717,8 +758,14 @@ impl App {
         let unsaved: Vec<String> = self
             .docs
             .iter()
-            .filter(|d| d.dirty())
-            .map(|d| d.title())
+            .filter(|d| d.dirty() || d.grid.edits.count() > 0)
+            .map(|d| {
+                if d.grid.edits.count() > 0 {
+                    format!("{} (unsaved edits to its results)", d.title())
+                } else {
+                    d.title()
+                }
+            })
             .collect();
         if unsaved.is_empty() {
             self.quitting = true;
@@ -1505,6 +1552,20 @@ impl App {
                         choice = Some("cancel");
                     }
                 }
+                ConfirmKind::DiscardEdits(..) => {
+                    if ui.button("Review and save").clicked() {
+                        choice = Some("review");
+                    }
+                    if ui
+                        .button(RichText::new("Discard").color(ui.visuals().error_fg_color))
+                        .clicked()
+                    {
+                        choice = Some("discard");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some("cancel");
+                    }
+                }
                 ConfirmKind::DeleteProfile(_) => {
                     if ui
                         .button(RichText::new("Delete").color(ui.visuals().error_fg_color))
@@ -1541,6 +1602,22 @@ impl App {
                 self.backend.fire(Command::HistoryClear { profile: None });
                 self.history.entries.clear();
                 self.history.stale = true;
+            }
+            (ConfirmKind::DiscardEdits(id, _), "review") => {
+                if let Some(i) = self.docs.iter().position(|d| d.id == id) {
+                    self.active = i;
+                    let result = self.docs[i].grid.result.unwrap_or(0);
+                    self.review_edits(i, result);
+                }
+            }
+            (ConfirmKind::DiscardEdits(id, then), "discard") => {
+                if let Some(i) = self.docs.iter().position(|d| d.id == id) {
+                    self.docs[i].grid = Default::default();
+                    match then {
+                        AfterDiscard::Run(command, view) => self.start(i, *command, view),
+                        AfterDiscard::Close => self.request_close_tab(i),
+                    }
+                }
             }
             (ConfirmKind::DeleteProfile(name), "delete") => {
                 self.delete_task = Some(self.backend.run(Command::ProfileRemove { name }));
@@ -1659,5 +1736,14 @@ impl eframe::App for App {
         self.remember_open_files();
         self.save_settings_if_changed();
         self.backend.shutdown();
+    }
+}
+
+/// "1 change", "3 changes".
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
     }
 }
