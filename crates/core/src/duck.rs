@@ -331,9 +331,10 @@ impl DuckConn {
     }
 
     pub async fn plan_json(&mut self, sql: &str, analyze: bool) -> Result<String> {
+        // The option list form: `EXPLAIN ANALYZE (FORMAT JSON)` is a syntax error before 2.0.
         let text = format!(
-            "EXPLAIN {}(FORMAT JSON) {sql}",
-            if analyze { "ANALYZE " } else { "" }
+            "EXPLAIN ({}FORMAT JSON) {sql}",
+            if analyze { "ANALYZE, " } else { "" }
         );
         with(&self.conn, move |c| {
             let mut stmt = c.prepare(&text).map_err(err)?;

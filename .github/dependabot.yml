@@ -22,6 +22,12 @@ updates:
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "eframe"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # DuckDB 2.0 (crate 1.20000) changed how static extensions link and breaks the
+      # aarch64 Linux build; stay on 1.5 until that's sorted.
+      - dependency-name: "duckdb"
+        versions: [">= 1.10600"]
+      - dependency-name: "libduckdb-sys"
+        versions: [">= 1.10600"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
