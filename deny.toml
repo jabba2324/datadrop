@@ -13,13 +13,6 @@ ignore = [
     # attack over the network; Ed25519 keys don't use it at all. No fixed rsa
     # release yet.
     { id = "RUSTSEC-2023-0071", reason = "RSA only signs once per SSH connection; no decryption" },
-    # zip 6 (extraction can keep setuid bits, or write through symlinks): a build dependency
-    # of libduckdb-sys 1.5, used only to unpack a prebuilt libduckdb when
-    # DUCKDB_DOWNLOAD_LIB=1. DataDrop builds DuckDB from source (`bundled`), so it never
-    # extracts anything, and zip isn't in the shipped binaries. Remove with DuckDB 2.
-    { id = "RUSTSEC-2026-0367", reason = "zip is a build dependency that never runs in a bundled build" },
-    { id = "RUSTSEC-2026-0368", reason = "zip is a build dependency that never runs in a bundled build" },
-    { id = "RUSTSEC-2026-0369", reason = "zip is a build dependency that never runs in a bundled build" },
     # zvariant, zvariant_derive and zbus_names: unmaintained as standalone crates since they merged into
     # zbus 6 (no vulnerability). Used by the GUI's screen-reader support (accesskit) and
     # Linux file dialogs (rfd -> ashpd) through zbus 5. Remove when those move to zbus 6.
