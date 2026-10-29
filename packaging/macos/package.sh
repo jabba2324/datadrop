@@ -15,12 +15,12 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/datadrop-gui" "$bin/datadrop" "$app/Contents/MacOS/"
 sed "s/__VERSION__/${version#v}/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 
-# The icon, from the 512 px PNG.
+# The icon, from the 1024 px PNG.
 iconset="$work/DataDrop.iconset"
 mkdir "$iconset"
 for s in 16 32 128 256 512; do
   sips -z $s $s "$here/../icon.png" --out "$iconset/icon_${s}x${s}.png" >/dev/null
-  d=$((s * 2)); [ $d -le 512 ] && sips -z $d $d "$here/../icon.png" --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null
+  d=$((s * 2)); sips -z $d $d "$here/../icon.png" --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/DataDrop.icns"
 

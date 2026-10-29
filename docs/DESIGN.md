@@ -206,8 +206,10 @@ profile; the schema model from `duckdb_tables()`, `duckdb_constraints()` and fri
 
 ## Packaging
 
-`packaging/`: the icon (SVG, and PNG/ICO made from it), `macos/package.sh` (the `.app`
-and `.dmg`, signed with a Developer ID and notarised when the `APPLE_*` secrets are
-set, ad hoc otherwise), `windows/datadrop.iss` (Inno Setup: per-user or all-users,
-Start menu, optional PATH entry, "Open with" for `.sql`) and `linux/package.sh` (`.deb`
-and `.rpm` from the same files, with a desktop entry). The release workflow runs them.
+`packaging/`: the icon (`make-icon.py` draws it with photocraft-cli and writes `icon.png`,
+`icon.ico` and the `icons/` sizes; the window icon embeds `icons/256.png`),
+`macos/package.sh` (the `.app` and `.dmg`, signed with a Developer ID and notarised when
+the `APPLE_*` secrets are set, ad hoc otherwise), `windows/datadrop.iss` (Inno Setup:
+per-user or all-users, Start menu, optional PATH entry, "Open with" for `.sql`) and
+`linux/package.sh` (`.deb` and `.rpm` from the same files, with a desktop entry). The
+release workflow runs them.

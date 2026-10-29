@@ -66,38 +66,8 @@ pub fn match_bg(current: bool, dark: bool) -> Color32 {
     }
 }
 
-/// The window icon: a blue drop, drawn rather than shipped as a file.
+/// The window icon (packaging/make-icon.py draws it).
 pub fn icon() -> egui::IconData {
-    const N: u32 = 64;
-    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
-    let n = N as f32;
-    for y in 0..N {
-        for x in 0..N {
-            // A circle for the bottom of the drop, narrowing to a point at the top.
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let (cx, cy, r) = (n / 2.0, n * 0.62, n * 0.30);
-            let in_circle = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() - r;
-            let t = ((cy - fy) / (cy - n * 0.06)).clamp(0.0, 1.0);
-            let half = r * (1.0 - t).powf(1.3);
-            let in_cone = if fy < cy {
-                (fx - cx).abs() - half
-            } else {
-                f32::MAX
-            };
-            let d = in_circle.min(in_cone);
-            let alpha = (0.5 - d).clamp(0.0, 1.0);
-            let shade = 1.0 - 0.25 * ((fx + fy) / (2.0 * n));
-            rgba.extend_from_slice(&[
-                (ACCENT.r() as f32 * shade) as u8,
-                (ACCENT.g() as f32 * shade) as u8,
-                (ACCENT.b() as f32 * shade) as u8,
-                (alpha * 255.0) as u8,
-            ]);
-        }
-    }
-    egui::IconData {
-        rgba,
-        width: N,
-        height: N,
-    }
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../packaging/icons/256.png"))
+        .expect("the icon is a valid PNG")
 }

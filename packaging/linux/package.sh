@@ -18,8 +18,9 @@ stage="$(mktemp -d)"
 install -Dm755 "$bin/datadrop" "$stage/usr/bin/datadrop"
 install -Dm755 "$bin/datadrop-gui" "$stage/usr/bin/datadrop-gui"
 install -Dm644 "$here/datadrop.desktop" "$stage/usr/share/applications/datadrop.desktop"
-install -Dm644 "$here/../icon.png" "$stage/usr/share/icons/hicolor/512x512/apps/datadrop.png"
-install -Dm644 "$here/../icon.svg" "$stage/usr/share/icons/hicolor/scalable/apps/datadrop.svg"
+for s in 16 24 32 48 64 128 256 512; do
+  install -Dm644 "$here/../icons/$s.png" "$stage/usr/share/icons/hicolor/${s}x${s}/apps/datadrop.png"
+done
 install -Dm644 "$root/LICENSE" "$stage/usr/share/doc/datadrop/copyright"
 install -Dm644 "$root/README.md" "$stage/usr/share/doc/datadrop/README.md"
 
