@@ -1,162 +1,152 @@
 # DataDrop
 
-A fast, open-source SQL client for **PostgreSQL**, **MySQL**, **SQLite**, **SQL
-Server**, **ClickHouse** and **DuckDB**: a desktop
-app with a schema browser, a highlighted SQL editor with autocompletion and a results
-grid you can edit, plus a command line that can do everything the app can.
+**A fast, open-source SQL client for the desktop and the terminal.**
 
-CockroachDB works through the PostgreSQL driver (browsing and query plans included).
+DataDrop is one native app for PostgreSQL, MySQL, SQLite, SQL Server, ClickHouse and
+DuckDB. You get a schema browser, an editor that knows your tables, a results grid you
+can edit, query plans, ER diagrams and schema diffs. A command line does everything the
+app does, for scripts and servers.
 
-It runs on Windows, macOS (Apple Silicon) and Linux, and is written in Rust with
-[egui](https://github.com/emilk/egui).
+It's written in Rust and runs on Windows, macOS and Linux. There's no account and no
+telemetry. Passwords go in your OS keychain,
+and SSH tunnels are built in.
 
-## Features
+![DataDrop: the explorer, a query and its results](docs/screenshots/workspace-dark.png)
 
-- **Connections** saved as profiles: host and port, or a connection URL, user,
-  password, SSL mode and an optional CA certificate; or a SQLite file. Test before
-  saving. Passwords go in the OS keychain (macOS Keychain, Windows Credential
-  Manager, or the Secret Service on Linux), or in the profile file if you prefer.
-- **SSH tunnels**: reach a database through an SSH server, signing in with your SSH
-  agent, a key file or a password. Host keys are checked (unknown ones show their
-  fingerprint to confirm).
-- **Schema browser**: schemas (databases on MySQL); tables with their columns, keys,
-  foreign keys, indexes and triggers; views, functions and procedures, sequences.
-  Double-click a table to see its rows; right-click for its DDL (or the whole
-  schema's).
-- **SQL editor** with syntax highlighting, line numbers and tabs. Open, save and close
-  `.sql` files; open files come back next time.
-- **Autocompletion** of tables, columns (of the tables the statement uses, or after
-  `alias.`), schemas and keywords, as you type or with `Ctrl+Space`.
-- **Run** the selection or the statement under the cursor (`Ctrl+Enter`, `⌘↩` on a
-  Mac), or the whole tab (`Ctrl+Shift+Enter`). Scripts run statement by statement and
-  stop at the first error. MySQL scripts can change the `DELIMITER`.
-- **Stop** a running query: it's cancelled on the server, not just abandoned.
+**[Download the latest release](https://github.com/jabba2324/datadrop/releases/latest)**:
+a `.dmg` for macOS, a setup `.exe` for Windows, `.deb` and `.rpm` packages for Linux.
+See [Install](#install).
+
+## What it does
+
+- **Connect** with a host and port or a URL, over SSL with an optional CA certificate.
+  Go through an SSH server if you need to, signing in with your agent, a key file or a
+  password. Test a connection before saving it.
+- **Browse** schemas, tables and their columns, keys, foreign keys, indexes and
+  triggers, plus views, functions, procedures and sequences. Double-click a table to
+  see its rows; right-click for its DDL, or the whole schema's.
+- **Write SQL** with syntax highlighting, tabs and autocompletion of tables, columns
+  (including after `alias.`), schemas and keywords. **Format** it (`Ctrl+Shift+F`).
+  **Find and replace** (`Ctrl+F`).
+- **Run** the statement at the cursor or the selection (`Ctrl+Enter`, `⌘↩` on a Mac),
+  or the whole tab (`Ctrl+Shift+Enter`). Each statement gets its own result. **Stop**
+  cancels the query on the server, not just in the app.
 - **Parameters**: write `:name` (or `?`, or `$1` on PostgreSQL) and you're asked for
-  the values when it runs; the last ones are remembered per tab.
-- **Results grid** for every result set, with NULLs marked, copy as text, and
-  **export** to CSV, TSV or JSON (every row, not just those shown). Click a header
-  to sort; type a `WHERE` condition to filter. Both run on the server when the
-  result was cut short, so they cover every row.
-- **Table editor**: create a table, or change one (columns, primary key, indexes,
-  foreign keys, checks) from a form, with the `CREATE`/`ALTER` statements shown before
-  they run. On SQLite, changes it can't make in place rebuild the table and copy its
-  rows.
-- **Diagrams**: a schema's tables and their foreign keys, laid out by how they refer to
-  each other; drag, pan and zoom, save as SVG or copy as Mermaid.
-- **Schema diff**: compare two schemas (on two servers, or one) and get the SQL that
-  makes one like the other, in a tab to look over and run.
-- **Import** a CSV, TSV or JSON file into a table (right-click it in the browser):
-  match the file's columns to the table's, see the first rows, and import in one
-  transaction (all or nothing).
-- **Edit data in the grid**: double-click a cell, set NULL, add or delete rows. The
-  `UPDATE`/`INSERT`/`DELETE` statements are shown before they run, in one transaction.
-- **Explain** (`Ctrl+E`) and **Explain analyze** (`Ctrl+Shift+E`): the query plan as a
-  tree, with each step's estimated and actual rows and its share of the time.
-- **Query history** of everything run, searchable, from the app and the command line.
-- **Find and replace** (`Ctrl+F`, `Ctrl+R`), with match case.
-- **Format SQL** (`Ctrl+Shift+F`): the selection or the whole tab, clauses on their
-  own lines and keywords in capitals; only whitespace and keyword case change.
-- Each tab keeps its own connection, so `SET`, temporary tables and transactions carry
-  over between runs, as in `psql`.
-- **Transactions**: turn off **Auto-commit** for a tab and what you run stays in a
-  transaction until you **Commit** or **Roll back**; the tab is flagged while one is
-  open (also when you begin one yourself), and closing it asks first.
+  the values. Each tab remembers the last ones.
+- **Work with results**: sort, filter with a `WHERE` condition (both run on the server
+  when not every row was fetched), copy, and **export** every row to CSV, TSV or JSON.
+- **Edit data in the grid**: change cells, set NULL, add and delete rows. The
+  statements are shown before they run, and they run in one transaction.
+- **Transactions**: switch a tab to **Manual** and what you run stays in a transaction
+  until you **Commit** or **Roll back**.
+- **Change tables** from a form: columns, primary key, indexes, foreign keys and checks.
+  The `CREATE`/`ALTER` statements are shown before they run.
+- **Explain** and **Explain analyze**: the query plan as a tree, with estimated and
+  actual rows. Slow steps and far-off estimates are highlighted.
+- **Diagrams** of a schema's tables and their foreign keys. Save them as SVG or copy
+  them as Mermaid.
+- **Compare schemas**, on two servers or one, and get the SQL that makes one like the
+  other.
+- **Import** a CSV, TSV or JSON file into a table, in one transaction.
+- **History** of every query, from the app and the command line, searchable.
+
+| | |
+|---|---|
+| ![Editing rows in the grid](docs/screenshots/editing.png) | ![The table editor](docs/screenshots/table-editor.png) |
+| Edit rows in the grid, then review the SQL and save | Create and change tables from a form |
+| ![A new connection](docs/screenshots/connection.png) | ![An ER diagram](docs/screenshots/diagram.png) |
+| Six databases, SSH tunnels, passwords in the keychain | ER diagrams, as SVG or Mermaid |
+
+It comes in light and dark, and follows your system's theme:
+
+![The light theme](docs/screenshots/workspace-light.png)
+
+## How it's built
+
+DataDrop is three Rust crates. All the work happens in one library, and the desktop
+app and the command line are thin layers over it:
+
+```
+ datadrop-gui (desktop app)      datadrop (command line)
+              \                       /
+               Command  →  Output
+                         |
+                   datadrop-core
+     drivers · SSH tunnels · schema, DDL and diffs · plans
+     import/export · history · profiles and the keychain
+```
+
+- **`datadrop-core`** does everything: it connects to the databases, runs SQL statement
+  by statement, reads schemas and writes DDL, diffs schemas, parses query plans,
+  imports and exports, and keeps the history and the connection profiles. Every action
+  is a `Command` given to `Client::execute`, which returns an `Output`.
+- **`datadrop`** (`crates/cli`) is the command line. It turns arguments into `Command`s
+  and prints the `Output` as a table, CSV or JSON. `datadrop exec` takes a `Command` as
+  JSON. See [docs/CLI.md](docs/CLI.md).
+- **`datadrop-gui`** (`crates/gui`) is the desktop app, built with
+  [egui](https://github.com/emilk/egui). It sends the same `Command`s and draws the
+  results.
+
+So anything the app can do, the command line can do too. [docs/DESIGN.md](docs/DESIGN.md)
+explains how the pieces fit.
+
+## Supported databases
+
+| Database | Tested with | Connection handled by |
+|---|---|---|
+| PostgreSQL | 17 | [`sqlx`](https://crates.io/crates/sqlx) 0.9 (`postgres`), TLS with rustls |
+| MySQL | 8.4 | [`sqlx`](https://crates.io/crates/sqlx) 0.9 (`mysql`) |
+| SQLite | the SQLite bundled with `sqlx` | [`sqlx`](https://crates.io/crates/sqlx) 0.9 (`sqlite`) |
+| SQL Server | 2022 | [`mssql-tds`](https://crates.io/crates/mssql-tds) 0.3, the native TDS protocol |
+| ClickHouse | latest | DataDrop's own client, over the HTTP interface with [`ureq`](https://crates.io/crates/ureq) 3 |
+| DuckDB | 1.5 | [`duckdb`](https://crates.io/crates/duckdb) (duckdb-rs), with the engine compiled in |
+| CockroachDB | latest | the PostgreSQL driver |
+
+PostgreSQL, MySQL, SQL Server and ClickHouse are tested against real servers on every
+change, in CI; SQLite and DuckDB need no server.
+
+All of the above work everywhere, except that ClickHouse results are read-only in the
+grid (it has no keys to match rows on) and ClickHouse has no transactions. SSH tunnels
+use [`russh`](https://crates.io/crates/russh). Passwords go through
+[`keyring-core`](https://crates.io/crates/keyring-core): the macOS Keychain, Windows
+Credential Manager or the Secret Service on Linux.
+
+Other databases that speak the PostgreSQL or MySQL protocol (MariaDB, TiDB, Neon,
+Supabase…) may well work, but they haven't been tested.
 
 ## Install
 
 Download from the [releases page](https://github.com/jabba2324/datadrop/releases):
 
-- **Windows**: `DataDrop-…-setup.exe` installs the app (with a Start menu entry, and
-  optionally the `datadrop` command on your PATH), for you or for everyone.
 - **macOS** (Apple Silicon): `DataDrop-….dmg`; drag DataDrop to Applications. Until
   releases are notarised, open it the first time with right-click → Open.
+- **Windows**: `DataDrop-…-setup.exe` installs the app (with a Start menu entry, and
+  optionally the `datadrop` command on your PATH), for you or for everyone.
 - **Linux**: `datadrop_…_amd64.deb` / `_arm64.deb` (Debian, Ubuntu) or
   `datadrop-….x86_64.rpm` / `.aarch64.rpm` (Fedora, RHEL, openSUSE), with a desktop
-  entry; or the plain binaries in the `.tar.gz`.
+  entry.
 
-The archives (`datadrop-gui-…` is the desktop app, `datadrop-…` the command line) are
-there for every platform too. Each release has a `SHA256SUMS` file signed with
-[minisign](https://jedisct1.github.io/minisign/) (when signing is set up for that
-release):
+There are plain archives for every platform too: `datadrop-gui-…` is the desktop app
+and `datadrop-…` the command line. Each release has a `SHA256SUMS` file signed with
+[minisign](https://jedisct1.github.io/minisign/):
 
 ```sh
 minisign -Vm SHA256SUMS -p minisign.pub
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-## Command line
+## The command line
 
 ```sh
-# Save a connection (the password is asked for, not typed on the command line, and
-# kept in the OS keychain; --passwords file keeps it in the profile file instead)
 datadrop profile add shop --url postgres://alice@db.example.com/shop --ask-password
-datadrop profile add local --driver mysql --host 127.0.0.1 --user root --database app --ask-password
-datadrop profile add notes --driver sqlite --database ./notes.db --create-if-missing
-datadrop profile add erp --url sqlserver://sa@erp.example.com:1433/sales --ask-password
-datadrop profile add logs --url clickhouse://default@ch.example.com:8443/logs --ssl-mode require
-datadrop profile add lake --driver duckdb --database ./lake.duckdb --create-if-missing
-datadrop profile list
-datadrop profile test shop
-
-# Through an SSH server (agent by default; or --ssh-key FILE, --ssh-ask-password)
-datadrop profile add prod --url postgres://app@10.0.0.5/app --ask-password --ssh ops@bastion.example.com
-datadrop profile trust-host prod      # shows the server's key fingerprint to confirm
-
-# Look around
-datadrop schemas shop
 datadrop tables shop --schema public
-datadrop columns shop orders
-datadrop catalog shop                 # every table with its columns
-datadrop schema shop                  # tables with keys, indexes, triggers; routines...
-datadrop ddl shop orders              # the SQL that creates it (--routine, --sequence)
-datadrop ddl shop --all > schema.sql  # everything in the schema, in an order that runs
-
-# Run SQL: an argument, a file, or standard input
 datadrop query shop "select id, total from orders order by id desc limit 5"
 datadrop query shop -f report.sql --format csv
-echo "select now()" | datadrop query shop --format json
-
-# Placeholders: :name, ? (MySQL, SQLite) or $1 (PostgreSQL)
-datadrop query shop "select * from orders where customer_id = :id" --param id=42
-datadrop query shop "select * from orders where placed > :since" \
-  --param-sql since="now() - interval '1 day'"
-
-# Export every row to a file (format from the extension)
-datadrop query shop "select * from orders" -o orders.csv
-
-# An ER diagram, as Mermaid (for Markdown) or Graphviz
-datadrop diagram shop > schema.mmd
-datadrop diagram shop --format dot | dot -Tsvg > schema.svg
-
-# The SQL that makes staging's schema like dev's (--apply runs it)
+datadrop query shop "select * from orders" -o orders.csv   # every row
 datadrop diff dev staging --source-schema public --target-schema public
-
-# Import a file into a table (columns matched by the header's names)
-datadrop import shop customers customers.csv
-datadrop import shop customers dump.csv --no-header --columns id,name,-,email
-datadrop import shop customers customers.csv --preview   # just show what's in it
-
-# Query plans
-datadrop explain shop "select * from orders where customer_id = 42"
-datadrop explain shop --analyze "select * from orders where customer_id = 42"
-
-# Format SQL (no connection needed)
-datadrop format report.sql --driver mysql
-datadrop format -i report.sql          # rewrite the file
-
-# History
-datadrop history list --search orders
-datadrop history clear
 ```
 
-Every command takes `--json` for machine-readable output, and `datadrop exec` runs a
-command given as JSON, exactly as the desktop app sends it:
-
-```sh
-datadrop exec '{"command": "tables", "profile": "shop", "schema": "public"}'
-```
-
-`Ctrl+C` during a query cancels it on the server.
+Every command takes `--json`. The full reference is in [docs/CLI.md](docs/CLI.md).
 
 ## Where things are kept
 
@@ -169,63 +159,93 @@ Everything lives in `~/.datadrop` (set `DATADROP_HOME` to use another folder):
 - `gui.json`: the desktop app's settings and open files.
 
 Passwords (database and SSH) and key passphrases are kept in the OS keychain, under
-"DataDrop": the macOS Keychain, Windows Credential Manager, or the Secret Service on
-Linux (GNOME Keyring, KWallet). `datadrop keychain` says whether there's one to use.
-Without one (a server with no desktop session, say), or if you choose
-`--passwords file` / "In the profile file", **they're stored in the profile file as
-plain text**. Move an existing profile with
-`datadrop profile edit <name> --passwords keychain`.
+"DataDrop". `datadrop keychain` says whether there's one to use. Without one (a server
+with no desktop session, say), or if you choose `--passwords file` / "In the profile
+file", **they're stored in the profile file as plain text**. Move an existing profile
+with `datadrop profile edit <name> --passwords keychain`.
 
 The files and folder are created readable only by you (mode 0600/0700 on macOS and
 Linux; on Windows they're in your user profile). Prefer a read-only database user for
 browsing.
 
-## Building from source
+## Developing locally
 
-You need Rust (stable). On Linux, the desktop app also needs the usual X11/Wayland
-development headers (`libxkbcommon`, `libwayland`, `libgl`), and SQL Server support
-builds OpenSSL from source (it needs `perl` and `make`); leave it out with
-`cargo build --no-default-features`. DuckDB is compiled in with `--features duckdb`
-(the release builds have it; it's a long C++ build).
+### Prerequisites
 
-```sh
-cargo build --release
-./target/release/datadrop --help
-./target/release/datadrop-gui
-```
+- **Rust** 1.94 or newer (the 2024 edition): `rustup update stable`.
+- **On Linux**, the desktop app needs the X11/Wayland development headers:
+  `libxkbcommon`, `libwayland` and `libgl` (on Debian or Ubuntu:
+  `sudo apt install libxkbcommon-dev libwayland-dev libgl1-mesa-dev`). SQL Server
+  support builds OpenSSL from source there, which needs `perl` and `make`.
+- **Docker**, to run the database tests against real servers (optional).
 
-Tests:
+### Build and run
 
 ```sh
-cargo test --workspace
+cargo run -p datadrop-gui                   # the desktop app
+cargo run -p datadrop-cli -- --help         # the command line
+cargo build --release                       # both, in target/release
 ```
 
-SQLite tests always run. The PostgreSQL, MySQL and SQL Server tests run when these
-point at servers you can create schemas and databases on (they're skipped otherwise):
+Two features choose what's compiled in:
+
+- `sqlserver` (on by default): SQL Server. Leave it out with `--no-default-features`.
+- `duckdb` (off by default; the releases have it): DuckDB, built from its C++ source,
+  which takes a while. `cargo run -p datadrop-gui --features duckdb`.
+
+### Tests
+
+```sh
+cargo test --workspace --all-features
+```
+
+That runs everything that needs no server: the core's tests, SQLite and DuckDB, the
+command line, and the desktop app's UI tests (with
+[egui_kittest](https://crates.io/crates/egui_kittest), no window needed).
+
+The PostgreSQL, MySQL, SQL Server and ClickHouse tests run when these variables point at
+servers you can create schemas and databases on; they're skipped otherwise:
 
 ```sh
 docker run -d --rm -p 5432:5432 -e POSTGRES_PASSWORD=test postgres:17
 docker run -d --rm -p 3306:3306 -e MYSQL_ROOT_PASSWORD=test mysql:8.4
-export DATADROP_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:5432/postgres
-export DATADROP_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:3306/mysql
 docker run -d --rm -p 1433:1433 -e ACCEPT_EULA=Y -e 'MSSQL_SA_PASSWORD=Test_pw_1234' \
   mcr.microsoft.com/mssql/server:2022-latest
+docker run -d --rm -p 8123:8123 -e CLICKHOUSE_PASSWORD=test clickhouse/clickhouse-server
+
+export DATADROP_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:5432/postgres
+export DATADROP_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:3306/mysql
 export DATADROP_TEST_MSSQL_URL='sqlserver://sa:Test_pw_1234@127.0.0.1:1433/master'
-cargo test --workspace
+export DATADROP_TEST_CLICKHOUSE_URL=clickhouse://default:test@127.0.0.1:8123/default
+cargo test --workspace --all-features
 ```
 
 The SSH tunnel tests need an SSH server in front of PostgreSQL: see
-`crates/core/tests/ssh.rs` for the variables, and the CI workflow for a setup.
+`crates/core/tests/ssh.rs` for their variables, and `.github/ssh-test/` and the CI
+workflow for a server to run.
 
-## Layout
+### Before a pull request
 
-| Crate | What it is |
-|---|---|
-| `crates/core` | Profiles, connections and SSH tunnels, running SQL, schema queries, plans, history, export, autocompletion, and the SQL lexer. Every action is a `Command`. |
-| `crates/cli` | The `datadrop` command line. |
-| `crates/gui` | The `datadrop-gui` desktop app (egui). |
+CI runs these on Linux, macOS and Windows, so run them first:
 
-See [docs/DESIGN.md](docs/DESIGN.md) for how it fits together and what's next.
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo deny --all-features check     # licences, advisories and sources
+```
+
+### Packaging, the icon and the designs
+
+- `packaging/` makes the installers: `macos/package.sh` (the `.app` and `.dmg`),
+  `windows/datadrop.iss` (Inno Setup) and `linux/package.sh` (`.deb` and `.rpm`). The
+  release workflow runs them when a `v*` tag is pushed.
+- `packaging/make-icon.py` draws the app icon with
+  [photocraft-cli](https://github.com/storytold/photocraft) and writes every size.
+- `design/0.3/` has mockups of every screen, made with
+  [FigCraft](https://github.com/storytold/figcraft) from `screens.py`; its README says how
+  to regenerate them.
+- The desktop app's fonts (Inter and JetBrains Mono) are in `crates/gui/assets/fonts`,
+  with their licences.
 
 ## Licence
 
