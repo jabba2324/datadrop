@@ -72,8 +72,7 @@ cp -a $stage/. %{buildroot}/
 /usr/bin/datadrop
 /usr/bin/datadrop-gui
 /usr/share/applications/datadrop.desktop
-/usr/share/icons/hicolor/512x512/apps/datadrop.png
-/usr/share/icons/hicolor/scalable/apps/datadrop.svg
+/usr/share/icons/hicolor/*/apps/datadrop.png
 %license /usr/share/doc/datadrop/copyright
 %doc /usr/share/doc/datadrop/README.md
 SPEC
