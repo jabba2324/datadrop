@@ -162,6 +162,16 @@ stays cheap. Results use `egui_extras::TableBuilder`, which only lays out visibl
 egui-phosphor (icons) and egui-notify (toasts) each target one egui version, so the
 egui crates move together, when those do (Dependabot is set up to hold them back).
 
+The look follows `design/0.3`. `theme.rs` holds the design's colour tokens for dark and
+light (`Palette`), sets them on egui's `Visuals` (fills, borders, radii, shadows,
+spacing and text styles), and loads the fonts: Inter (Regular, Medium and SemiBold, the
+last two as named families) for the interface, JetBrains Mono for SQL and values.
+Both are subset to drop their Private Use Area glyphs, which would otherwise win over
+the Phosphor icons there. `kit.rs` has the parts the screens share: primary, ghost and
+danger buttons, pills, driver badges, the two-way switch, banners, cards, and the
+header, footer and backdrop of a dialog. Labels don't change in a reskin, so the UI
+tests, which find widgets by label, keep working.
+
 ## SQL Server
 
 Through Microsoft's `mssql-tds` (behind the `sqlserver` feature, on by default; on

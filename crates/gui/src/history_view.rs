@@ -6,6 +6,7 @@ use egui::RichText;
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
+use crate::{kit, theme};
 
 #[derive(Default)]
 pub struct HistoryView {
@@ -49,35 +50,43 @@ impl HistoryView {
             self.reload(backend);
         }
         let mut action = None;
+        let p = theme::colors(ui);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            let l = ui.label(icon::MAGNIFYING_GLASS);
+            let l = ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(p.faint));
             let field = ui
                 .add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Search history")
-                        .desired_width(ui.available_width() - 30.0),
+                        // Room for the icon before it and the button after it.
+                        .desired_width(ui.available_width() - 64.0),
                 )
                 .labelled_by(l.id);
             if field.changed() {
                 self.stale = true;
             }
             if ui
-                .small_button(icon::TRASH)
+                .add(kit::ghost(ui, icon::TRASH))
                 .on_hover_text("Clear the history")
                 .clicked()
             {
                 action = Some(HistoryAction::Clear);
             }
         });
-        ui.separator();
+        ui.add_space(6.0);
         if self.entries.is_empty() {
-            ui.add_space(8.0);
-            ui.weak(if self.loaded && self.search.is_empty() {
-                "Queries you run appear here."
-            } else if self.loaded {
-                "No queries match."
-            } else {
-                "Loading…"
+            ui.add_space(32.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(if self.loaded && self.search.is_empty() {
+                        "Queries you run appear here."
+                    } else if self.loaded {
+                        "No queries match."
+                    } else {
+                        "Loading…"
+                    })
+                    .color(p.muted),
+                );
             });
             return action;
         }
@@ -85,15 +94,15 @@ impl HistoryView {
         let mono = egui::TextStyle::Monospace.resolve(ui.style());
         egui::ScrollArea::vertical()
             .id_salt("history")
-            .auto_shrink(false)
+            .auto_shrink([true, false])
             .show(ui, |ui| {
                 for (i, e) in self.entries.iter().enumerate() {
                     let selected = self.selected == Some(i);
                     let frame = egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(6, 4))
-                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .corner_radius(8)
                         .fill(if selected {
-                            ui.visuals().selection.bg_fill
+                            p.accent_soft
                         } else {
                             egui::Color32::TRANSPARENT
                         });
@@ -111,21 +120,40 @@ impl HistoryView {
                             {
                                 meta.push_str(&format!(" · {n} rows"));
                             }
-                            ui.horizontal(|ui| {
-                                if e.error.is_some() {
-                                    ui.label(
-                                        RichText::new(icon::WARNING_CIRCLE)
-                                            .color(ui.visuals().error_fg_color),
-                                    );
-                                }
-                                ui.weak(RichText::new(meta).small());
-                            });
                             let preview: String =
                                 e.sql.lines().take(2).collect::<Vec<_>>().join("\n");
-                            ui.add(
-                                egui::Label::new(RichText::new(preview).font(mono.clone()))
-                                    .truncate(),
+                            // The state as a dot before the SQL, in one label so it truncates.
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(
+                                "● ",
+                                0.0,
+                                egui::TextFormat::simple(
+                                    egui::FontId::proportional(10.0),
+                                    if e.error.is_some() { p.bad } else { p.ok },
+                                ),
                             );
+                            job.append(
+                                &preview,
+                                0.0,
+                                egui::TextFormat::simple(mono.clone(), p.text),
+                            );
+                            // A job keeps its own wrapping: cut it to the panel, one line.
+                            job.wrap = egui::text::TextWrapping {
+                                max_width: ui.available_width(),
+                                max_rows: 1,
+                                break_anywhere: true,
+                                overflow_character: Some('…'),
+                            };
+                            ui.add(egui::Label::new(job));
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0);
+                                if e.error.is_some() {
+                                    ui.label(
+                                        RichText::new(icon::WARNING_CIRCLE).size(11.0).color(p.bad),
+                                    );
+                                }
+                                ui.label(RichText::new(meta).size(11.0).color(p.faint));
+                            });
                         })
                         .response
                         .interact(egui::Sense::click());

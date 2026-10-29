@@ -5,6 +5,7 @@ use datadrop_core::{Command, Output, ProfileSummary};
 use egui::RichText;
 
 use crate::backend::{Backend, Task, poll};
+use crate::kit::{self, ModalExt};
 
 pub struct DiffDialog {
     pub source_profile: String,
@@ -95,61 +96,64 @@ impl DiffDialog {
                 Err(e) => self.error = Some(e.to_string()),
             }
         }
-        egui::Modal::new(egui::Id::new("schema-diff")).show(ctx, |ui| {
-            ui.set_width(520.0);
-            ui.heading("Compare schemas");
-            ui.weak("The SQL that makes the target like the source opens in a tab.");
-            ui.add_space(8.0);
-            egui::Grid::new("diff-sides")
-                .num_columns(3)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    side_ui(
-                        ui,
-                        "Source",
-                        "diff-source",
-                        profiles,
-                        &mut self.source_profile,
-                        &mut self.source_schema,
-                        &self.source_schemas.1,
-                    );
-                    side_ui(
-                        ui,
-                        "Target",
-                        "diff-target",
-                        profiles,
-                        &mut self.target_profile,
-                        &mut self.target_schema,
-                        &self.target_schemas.1,
-                    );
-                });
-            if let Some(e) = &self.error {
-                ui.add_space(6.0);
-                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let ready = !self.source_schema.is_empty() && !self.target_schema.is_empty();
-                ui.add_enabled_ui(ready && self.comparing.is_none(), |ui| {
-                    if ui.button(RichText::new("Compare").strong()).clicked() {
-                        self.error = None;
-                        self.comparing = Some(backend.run(Command::SchemaDiff {
-                            source_profile: self.source_profile.clone(),
-                            source_schema: Some(self.source_schema.clone()),
-                            target_profile: self.target_profile.clone(),
-                            target_schema: Some(self.target_schema.clone()),
-                            apply: false,
-                        }));
+        egui::Modal::new(egui::Id::new("schema-diff"))
+            .styled(ctx)
+            .show(ctx, |ui| {
+                ui.set_width(560.0);
+                kit::sheet_header(
+                    ui,
+                    "Compare schemas",
+                    Some("The SQL that makes the target like the source opens in a tab."),
+                );
+                egui::Grid::new("diff-sides")
+                    .num_columns(3)
+                    .spacing([12.0, 10.0])
+                    .show(ui, |ui| {
+                        side_ui(
+                            ui,
+                            "Source",
+                            "diff-source",
+                            profiles,
+                            &mut self.source_profile,
+                            &mut self.source_schema,
+                            &self.source_schemas.1,
+                        );
+                        side_ui(
+                            ui,
+                            "Target",
+                            "diff-target",
+                            profiles,
+                            &mut self.target_profile,
+                            &mut self.target_schema,
+                            &self.target_schemas.1,
+                        );
+                    });
+                if let Some(e) = &self.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                }
+                kit::sheet_footer(ui, |ui| {
+                    let ready = !self.source_schema.is_empty() && !self.target_schema.is_empty();
+                    ui.add_enabled_ui(ready && self.comparing.is_none(), |ui| {
+                        if ui.add(kit::primary(ui, "Compare")).clicked() {
+                            self.error = None;
+                            self.comparing = Some(backend.run(Command::SchemaDiff {
+                                source_profile: self.source_profile.clone(),
+                                source_schema: Some(self.source_schema.clone()),
+                                target_profile: self.target_profile.clone(),
+                                target_schema: Some(self.target_schema.clone()),
+                                apply: false,
+                            }));
+                        }
+                    });
+                    if self.comparing.is_some() {
+                        ui.spinner();
+                    }
+                    if ui.add(kit::ghost(ui, "Cancel")).clicked() {
+                        done = Some(DiffDone::Cancelled);
                     }
                 });
-                if self.comparing.is_some() {
-                    ui.spinner();
-                }
-                if ui.button("Cancel").clicked() {
-                    done = Some(DiffDone::Cancelled);
-                }
             });
-        });
         done
     }
 }
@@ -163,10 +167,10 @@ fn side_ui(
     schema: &mut String,
     schemas: &[String],
 ) {
-    ui.label(label);
+    ui.label(RichText::new(label).color(crate::theme::colors(ui).muted));
     egui::ComboBox::from_id_salt((id, "profile"))
         .selected_text(profile.as_str())
-        .width(180.0)
+        .width(200.0)
         .show_ui(ui, |ui| {
             for p in profiles {
                 ui.selectable_value(profile, p.name.clone(), &p.name);
@@ -178,7 +182,7 @@ fn side_ui(
         } else {
             schema.as_str()
         })
-        .width(180.0)
+        .width(200.0)
         .show_ui(ui, |ui| {
             for s in schemas {
                 ui.selectable_value(schema, s.clone(), s);

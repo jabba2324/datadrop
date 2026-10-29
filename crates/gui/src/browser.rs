@@ -10,11 +10,45 @@ use datadrop_core::schema::{ConstraintKind, RoutineKind};
 use datadrop_core::{
     Command, ObjectKind, Output, ProfileSummary, SchemaModel, TableKind, TableModel,
 };
-use egui::RichText;
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Color32, FontId, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
 use crate::profile_form::TrustPrompt;
+use crate::{kit, theme};
+
+/// `glyph  text`, the glyph in its own colour: one label, read as one string.
+fn item(ui: &egui::Ui, glyph: &str, glyph_color: Color32, text: &str, strong: bool) -> LayoutJob {
+    let p = theme::colors(ui);
+    let family = if strong {
+        theme::semibold()
+    } else {
+        egui::FontFamily::Proportional
+    };
+    let mut job = LayoutJob::default();
+    job.append(
+        glyph,
+        0.0,
+        TextFormat::simple(
+            FontId::new(13.0, egui::FontFamily::Proportional),
+            glyph_color,
+        ),
+    );
+    job.append(
+        &format!("  {text}"),
+        0.0,
+        TextFormat::simple(FontId::new(13.0, family), p.text),
+    );
+    job
+}
+
+/// A group's heading ("Tables (3)"), quieter than what's in it.
+fn group(ui: &egui::Ui, text: String) -> RichText {
+    RichText::new(text)
+        .font(FontId::new(12.5, theme::medium()))
+        .color(theme::colors(ui).muted)
+}
 
 enum Load<T> {
     Loading(Option<Task>),
@@ -130,16 +164,19 @@ impl Browser {
         backend: &Backend,
     ) -> Option<BrowserAction> {
         let mut action = None;
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.weak(match profiles.len() {
-                0 => String::new(),
-                1 => "1 connection".into(),
-                n => format!("{n} connections"),
-            });
+            kit::caps(
+                ui,
+                &match profiles.len() {
+                    0 => String::new(),
+                    1 => "1 connection".into(),
+                    n => format!("{n} connections"),
+                },
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button(icon::PLUS)
+                    .add(kit::ghost(ui, icon::PLUS))
                     .on_hover_text("Add a connection")
                     .clicked()
                 {
@@ -147,17 +184,19 @@ impl Browser {
                 }
             });
         });
-        ui.separator();
+        ui.add_space(2.0);
         if profiles.is_empty() {
-            ui.add_space(12.0);
-            ui.weak("No connections yet.");
-            ui.add_space(6.0);
-            if ui
-                .button(format!("{} Add a connection", icon::PLUS))
-                .clicked()
-            {
-                action = Some(BrowserAction::Add);
-            }
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("No connections yet.").color(theme::colors(ui).muted));
+                ui.add_space(8.0);
+                if ui
+                    .add(kit::primary(ui, format!("{} Add a connection", icon::PLUS)))
+                    .clicked()
+                {
+                    action = Some(BrowserAction::Add);
+                }
+            });
             return action;
         }
         egui::ScrollArea::both()
@@ -180,30 +219,29 @@ impl Browser {
         backend: &Backend,
     ) -> Option<BrowserAction> {
         let mut action = None;
-        let header = egui::CollapsingHeader::new(
-            RichText::new(format!("{}  {}", icon::DATABASE, p.name)).strong(),
-        )
-        .id_salt(("profile", &p.name))
-        .show(ui, |ui| {
-            let load = self.schemas.entry(p.name.clone()).or_insert_with(|| {
-                Load::Loading(Some(backend.run(Command::Schemas {
-                    profile: p.name.clone(),
-                })))
-            });
-            let schemas = match load {
-                Load::Loading(_) => return spinner(ui),
-                Load::Failed(e) => return failed(ui, e),
-                Load::Ready(s) => s.clone(),
-            };
-            if schemas.is_empty() {
-                ui.weak("No schemas you can see.");
-            }
-            for schema in schemas {
-                if let Some(a) = self.schema_ui(ui, p, &schema, backend) {
-                    action = Some(a);
+        let (color, _) = kit::driver_style(p.driver, ui.visuals().dark_mode);
+        let header = egui::CollapsingHeader::new(item(ui, icon::DATABASE, color, &p.name, true))
+            .id_salt(("profile", &p.name))
+            .show(ui, |ui| {
+                let load = self.schemas.entry(p.name.clone()).or_insert_with(|| {
+                    Load::Loading(Some(backend.run(Command::Schemas {
+                        profile: p.name.clone(),
+                    })))
+                });
+                let schemas = match load {
+                    Load::Loading(_) => return spinner(ui),
+                    Load::Failed(e) => return failed(ui, e),
+                    Load::Ready(s) => s.clone(),
+                };
+                if schemas.is_empty() {
+                    ui.weak("No schemas you can see.");
                 }
-            }
-        });
+                for schema in schemas {
+                    if let Some(a) = self.schema_ui(ui, p, &schema, backend) {
+                        action = Some(a);
+                    }
+                }
+            });
         header
             .header_response
             .on_hover_text(format!("{} · {}", p.driver.label(), p.target))
@@ -242,43 +280,48 @@ impl Browser {
         backend: &Backend,
     ) -> Option<BrowserAction> {
         let mut action = None;
-        let header = egui::CollapsingHeader::new(format!("{}  {schema}", icon::FOLDER_SIMPLE))
-            .id_salt(("schema", &p.name, schema))
-            .show(ui, |ui| {
-                let key = (p.name.clone(), schema.to_owned());
-                let load = self.models.entry(key).or_insert_with(|| {
-                    Load::Loading(Some(backend.run(Command::Schema {
-                        profile: p.name.clone(),
-                        schema: Some(schema.to_owned()),
-                    })))
-                });
-                let m = match load {
-                    Load::Loading(_) => return spinner(ui),
-                    Load::Failed(e) => return failed(ui, e),
-                    Load::Ready(m) => m.clone(),
-                };
-                let (views, tables): (Vec<&TableModel>, Vec<&TableModel>) =
-                    m.tables.iter().partition(|t| t.is_view());
-                if m.tables.is_empty() && m.routines.is_empty() && m.sequences.is_empty() {
-                    ui.weak("Nothing here yet.");
-                }
-                for (label, list) in [("Tables", &tables), ("Views", &views)] {
-                    if list.is_empty() {
-                        continue;
+        let faint = theme::colors(ui).faint;
+        let header =
+            egui::CollapsingHeader::new(item(ui, icon::FOLDER_SIMPLE, faint, schema, false))
+                .id_salt(("schema", &p.name, schema))
+                .show(ui, |ui| {
+                    let key = (p.name.clone(), schema.to_owned());
+                    let load = self.models.entry(key).or_insert_with(|| {
+                        Load::Loading(Some(backend.run(Command::Schema {
+                            profile: p.name.clone(),
+                            schema: Some(schema.to_owned()),
+                        })))
+                    });
+                    let m = match load {
+                        Load::Loading(_) => return spinner(ui),
+                        Load::Failed(e) => return failed(ui, e),
+                        Load::Ready(m) => m.clone(),
+                    };
+                    let (views, tables): (Vec<&TableModel>, Vec<&TableModel>) =
+                        m.tables.iter().partition(|t| t.is_view());
+                    if m.tables.is_empty() && m.routines.is_empty() && m.sequences.is_empty() {
+                        ui.weak("Nothing here yet.");
                     }
-                    egui::CollapsingHeader::new(format!("{label} ({})", list.len()))
-                        .id_salt(("group", &p.name, schema, label))
-                        .default_open(label == "Tables")
-                        .show(ui, |ui| {
-                            for t in list {
-                                if let Some(a) = table_ui(ui, p, schema, t) {
-                                    action = Some(a);
+                    for (label, list) in [("Tables", &tables), ("Views", &views)] {
+                        if list.is_empty() {
+                            continue;
+                        }
+                        egui::CollapsingHeader::new(group(ui, format!("{label} ({})", list.len())))
+                            .id_salt(("group", &p.name, schema, label))
+                            .default_open(label == "Tables")
+                            .show(ui, |ui| {
+                                for t in list {
+                                    if let Some(a) = table_ui(ui, p, schema, t) {
+                                        action = Some(a);
+                                    }
                                 }
-                            }
-                        });
-                }
-                if !m.routines.is_empty() {
-                    egui::CollapsingHeader::new(format!("Routines ({})", m.routines.len()))
+                            });
+                    }
+                    if !m.routines.is_empty() {
+                        egui::CollapsingHeader::new(group(
+                            ui,
+                            format!("Routines ({})", m.routines.len()),
+                        ))
                         .id_salt(("group", &p.name, schema, "routines"))
                         .show(ui, |ui| {
                             for r in &m.routines {
@@ -286,14 +329,15 @@ impl Browser {
                                     RoutineKind::Function => icon::FUNCTION,
                                     RoutineKind::Procedure => icon::GEAR,
                                 };
-                                let resp = ui.label(format!("{glyph}  {}", r.name)).on_hover_text(
-                                    match &r.returns {
+                                let amber = theme::colors(ui).amber;
+                                let resp = ui
+                                    .label(item(ui, glyph, amber, &r.name, false))
+                                    .on_hover_text(match &r.returns {
                                         Some(ret) => {
                                             format!("{}({}) → {ret}", r.name, r.arguments)
                                         }
                                         None => format!("{}({})", r.name, r.arguments),
-                                    },
-                                );
+                                    });
                                 resp.context_menu(|ui| {
                                     if ui.button(format!("{} Show DDL", icon::CODE)).clicked() {
                                         action = Some(BrowserAction::ShowDdl {
@@ -306,14 +350,18 @@ impl Browser {
                                 });
                             }
                         });
-                }
-                if !m.sequences.is_empty() {
-                    egui::CollapsingHeader::new(format!("Sequences ({})", m.sequences.len()))
+                    }
+                    if !m.sequences.is_empty() {
+                        egui::CollapsingHeader::new(group(
+                            ui,
+                            format!("Sequences ({})", m.sequences.len()),
+                        ))
                         .id_salt(("group", &p.name, schema, "sequences"))
                         .show(ui, |ui| {
                             for seq in &m.sequences {
+                                let teal = theme::colors(ui).teal;
                                 let resp =
-                                    ui.label(format!("{}  {}", icon::LIST_NUMBERS, seq.name));
+                                    ui.label(item(ui, icon::LIST_NUMBERS, teal, &seq.name, false));
                                 resp.context_menu(|ui| {
                                     if ui.button(format!("{} Show DDL", icon::CODE)).clicked() {
                                         action = Some(BrowserAction::ShowDdl {
@@ -326,8 +374,8 @@ impl Browser {
                                 });
                             }
                         });
-                }
-            });
+                    }
+                });
         header.header_response.context_menu(|ui| {
             if ui.button(format!("{} New table…", icon::PLUS)).clicked() {
                 action = Some(BrowserAction::EditTable {
@@ -380,26 +428,29 @@ fn table_ui(
     t: &TableModel,
 ) -> Option<BrowserAction> {
     let mut action = None;
-    let glyph = match t.kind {
-        TableKind::Table | TableKind::ForeignTable => icon::TABLE,
-        TableKind::View | TableKind::MaterializedView => icon::EYE,
+    let c = theme::colors(ui);
+    let (glyph, color) = match t.kind {
+        TableKind::Table | TableKind::ForeignTable => (icon::TABLE, c.accent),
+        TableKind::View | TableKind::MaterializedView => (icon::EYE, c.purple),
     };
     let pk: &[String] = t.primary_key().map_or(&[], |k| &k.columns);
     let fk_columns: Vec<&String> = t.foreign_keys().flat_map(|f| &f.columns).collect();
-    let header = egui::CollapsingHeader::new(format!("{glyph}  {}", t.name))
+    let header = egui::CollapsingHeader::new(item(ui, glyph, color, &t.name, false))
         .id_salt(("table", &p.name, schema, &t.name))
         .show(ui, |ui| {
             for c in &t.columns {
-                let mark = if pk.contains(&c.name) {
-                    icon::KEY
+                let p = theme::colors(ui);
+                let (mark, mark_color) = if pk.contains(&c.name) {
+                    (icon::KEY, p.amber)
                 } else if fk_columns.contains(&&c.name) {
-                    icon::LINK
+                    (icon::LINK, p.accent)
                 } else {
-                    " "
+                    (" ", p.faint)
                 };
                 let resp = ui.horizontal(|ui| {
-                    ui.label(format!("{mark} {}", c.name));
-                    ui.weak(&c.data_type);
+                    ui.label(RichText::new(mark).color(mark_color));
+                    ui.label(RichText::new(&c.name).color(p.text));
+                    ui.label(RichText::new(&c.data_type).size(11.5).color(p.faint));
                 });
                 let mut tip = format!(
                     "{} {}{}",
@@ -558,7 +609,7 @@ fn section(
     n: usize,
     body: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::CollapsingHeader::new(RichText::new(format!("{label} ({n})")).weak())
+    egui::CollapsingHeader::new(group(ui, format!("{label} ({n})")))
         .id_salt(id)
         .show(ui, body);
 }

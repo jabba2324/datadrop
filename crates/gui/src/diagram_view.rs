@@ -11,6 +11,7 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2, pos2, vec2};
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
+use crate::theme;
 
 const HEADER: f32 = 26.0;
 const ROW: f32 = 19.0;
@@ -250,16 +251,32 @@ impl DiagramView {
         let (zoom, origin) = (self.zoom, area.min.to_vec2() + self.pan);
         let to_screen = move |p: Pos2| -> Pos2 { (p.to_vec2() * zoom + origin).to_pos2() };
 
-        let v = ui.visuals();
-        let fill = v.extreme_bg_color;
-        let header = v.selection.bg_fill.gamma_multiply(0.35);
-        let border = v.widgets.noninteractive.bg_stroke.color;
-        let text = v.text_color();
-        let weak = v.weak_text_color();
-        let line = v.selection.stroke.color.gamma_multiply(0.8);
+        let p = theme::colors(ui);
+        let fill = p.panel;
+        let header = p.raised;
+        let border = p.border2;
+        let text = p.text;
+        let weak = p.faint;
+        let line = theme::alpha(p.accent, 0xAA);
         let font = egui::FontId::monospace(FONT * self.zoom);
-        let bold = egui::FontId::proportional((FONT + 1.0) * self.zoom);
+        let bold = egui::FontId::new((FONT + 1.0) * self.zoom, theme::semibold());
         let painter = painter.with_clip_rect(area);
+
+        // The canvas: the window colour, with a dot every 48 diagram units.
+        painter.rect_filled(area, 0.0, p.bg);
+        let step = 48.0 * self.zoom;
+        if step > 12.0 {
+            let first = |min: f32, origin: f32| origin + ((min - origin) / step).ceil() * step;
+            let mut x = first(area.min.x, origin.x);
+            while x < area.max.x {
+                let mut y = first(area.min.y, origin.y);
+                while y < area.max.y {
+                    painter.circle_filled(pos2(x, y), 1.0, p.border2);
+                    y += step;
+                }
+                x += step;
+            }
+        }
 
         // Lines first, under the boxes.
         for t in &m.tables {
@@ -330,12 +347,21 @@ impl DiagramView {
             if !rect.intersects(area) {
                 continue;
             }
-            let radius = 5.0 * self.zoom;
+            let radius = 9.0 * self.zoom;
+            painter.add(
+                egui::Shadow {
+                    offset: [0, 6],
+                    blur: 18,
+                    spread: 0,
+                    color: theme::alpha(Color32::BLACK, 0x50),
+                }
+                .as_shape(rect, radius),
+            );
             painter.rect(
                 rect,
                 radius,
                 fill,
-                Stroke::new(1.0, if t.is_view() { weak } else { border }),
+                Stroke::new(1.0, if t.is_view() { p.purple } else { border }),
                 egui::StrokeKind::Inside,
             );
             let head = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER * self.zoom));
@@ -349,11 +375,23 @@ impl DiagramView {
                 },
                 header,
             );
-            let glyph = if t.is_view() { icon::EYE } else { icon::TABLE };
+            painter.hline(head.x_range(), head.bottom(), Stroke::new(1.0, p.border));
+            let (glyph, glyph_color) = if t.is_view() {
+                (icon::EYE, p.purple)
+            } else {
+                (icon::TABLE, p.accent)
+            };
             painter.text(
-                head.left_center() + vec2(8.0 * self.zoom, 0.0),
+                head.left_center() + vec2(10.0 * self.zoom, 0.0),
                 egui::Align2::LEFT_CENTER,
-                format!("{glyph} {}", t.name),
+                glyph,
+                egui::FontId::proportional((FONT + 1.0) * self.zoom),
+                glyph_color,
+            );
+            painter.text(
+                head.left_center() + vec2(28.0 * self.zoom, 0.0),
+                egui::Align2::LEFT_CENTER,
+                &t.name,
                 bold.clone(),
                 text,
             );
@@ -362,20 +400,20 @@ impl DiagramView {
             for (i, c) in t.columns.iter().enumerate() {
                 let y = rect.min.y + (HEADER + (i as f32 + 0.5) * ROW) * self.zoom;
                 let mark = if pk.contains(&c.name) {
-                    Some(icon::KEY)
+                    Some((icon::KEY, p.amber))
                 } else if fks.contains(&&c.name) {
-                    Some(icon::LINK)
+                    Some((icon::LINK, p.accent))
                 } else {
                     None
                 };
                 // The icon font is only in the proportional family.
-                if let Some(mark) = mark {
+                if let Some((mark, color)) = mark {
                     painter.text(
                         pos2(rect.min.x + 6.0 * self.zoom, y),
                         egui::Align2::LEFT_CENTER,
                         mark,
                         egui::FontId::proportional(FONT * self.zoom),
-                        weak,
+                        color,
                     );
                 }
                 painter.text(

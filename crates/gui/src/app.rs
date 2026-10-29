@@ -9,7 +9,7 @@ use datadrop_core::{
     ProfileSummary, QueryOutput, StatementError, command::TransactionAction,
 };
 use datadrop_core::{edit, export};
-use egui::{Key, KeyboardShortcut, Modifiers, RichText};
+use egui::{FontId, Key, KeyboardShortcut, Margin, Modifiers, RichText, Stroke};
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
@@ -20,6 +20,7 @@ use crate::editor::{self, Document, Find, ResultView};
 use crate::grid_edit::{Editability, Review};
 use crate::history_view::{HistoryAction, HistoryView};
 use crate::import_dialog::{ImportDialog, ImportDone};
+use crate::kit::{self, ModalExt};
 use crate::params_dialog::{ParamPrompt, ParamsDone, Then};
 use crate::profile_form::{FormDone, ProfileForm, TrustPrompt};
 use crate::results::{self, ResultsAction};
@@ -94,6 +95,8 @@ pub struct App {
     trusting: Option<Task>,
     pub toasts: egui_notify::Toasts,
     quitting: bool,
+    /// The icon in the top bar, loaded the first time it's drawn.
+    logo: Option<egui::TextureHandle>,
 }
 
 const RUN_ALL: KeyboardShortcut =
@@ -166,6 +169,7 @@ impl App {
             trust: None,
             trusting: None,
             toasts: egui_notify::Toasts::default(),
+            logo: None,
             quitting: false,
         };
         app.refresh_profiles();
@@ -1061,54 +1065,111 @@ impl App {
     }
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
+        let p = theme::colors(ui);
         let mut close = None;
         let mut activate = None;
-        egui::ScrollArea::horizontal()
-            .id_salt("tabs")
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (i, d) in self.docs.iter().enumerate() {
-                        let mut title = if d.dirty() {
-                            format!("{} {}", d.title(), icon::DOT)
-                        } else {
-                            d.title()
-                        };
-                        if d.in_transaction {
-                            title = format!("{} {title}", icon::FLAG);
+        let height = 38.0;
+        egui::Frame::new().fill(p.panel).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::horizontal()
+                .id_salt("tabs")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_height(height);
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (i, d) in self.docs.iter().enumerate() {
+                            let active = i == self.active;
+                            let mut title = if d.dirty() {
+                                format!("{} {}", d.title(), icon::DOT)
+                            } else {
+                                d.title()
+                            };
+                            if d.in_transaction {
+                                title = format!("{} {title}", icon::FLAG);
+                            }
+                            let tip = d
+                                .path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "Not saved yet".into());
+                            let driver = d.profile.as_ref().and_then(|name| {
+                                self.profiles
+                                    .iter()
+                                    .find(|p| &p.name == name)
+                                    .map(|p| p.driver)
+                            });
+                            let tab = egui::Frame::new()
+                                .fill(if active { p.bg } else { p.panel })
+                                .inner_margin(Margin::symmetric(12, 0))
+                                .show(ui, |ui| {
+                                    ui.set_height(height);
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    if let Some(driver) = driver {
+                                        kit::driver_badge(ui, driver, 16.0);
+                                    }
+                                    let color = if active { p.text } else { p.muted };
+                                    let resp = ui
+                                        .add(
+                                            egui::Button::selectable(
+                                                active,
+                                                RichText::new(title).color(color),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .on_hover_text(tip);
+                                    if resp.clicked() {
+                                        activate = Some(i);
+                                    }
+                                    if resp.middle_clicked() {
+                                        close = Some(i);
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(icon::X).color(p.faint).size(12.0),
+                                            )
+                                            .frame_when_inactive(false),
+                                        )
+                                        .on_hover_text("Close tab")
+                                        .clicked()
+                                    {
+                                        close = Some(i);
+                                    }
+                                })
+                                .response;
+                            let r = tab.rect;
+                            if active {
+                                ui.painter().hline(
+                                    r.x_range(),
+                                    r.top() + 1.0,
+                                    Stroke::new(2.0, p.accent),
+                                );
+                            } else {
+                                ui.painter().vline(
+                                    r.right() - 0.5,
+                                    (r.top() + 10.0)..=(r.bottom() - 10.0),
+                                    Stroke::new(1.0, p.border),
+                                );
+                            }
                         }
-                        let tip = d
-                            .path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "Not saved yet".into());
-                        let resp = ui
-                            .add(egui::Button::selectable(i == self.active, title))
-                            .on_hover_text(tip);
-                        if resp.clicked() {
-                            activate = Some(i);
-                        }
-                        if resp.middle_clicked() {
-                            close = Some(i);
-                        }
+                        ui.add_space(6.0);
                         if ui
-                            .small_button(icon::X)
-                            .on_hover_text("Close tab")
+                            .add(
+                                egui::Button::new(RichText::new(icon::PLUS).color(p.faint))
+                                    .frame_when_inactive(false),
+                            )
+                            .on_hover_text("New tab")
                             .clicked()
                         {
-                            close = Some(i);
+                            self.new_tab(None);
                         }
-                        ui.add_space(4.0);
-                    }
-                    if ui
-                        .small_button(icon::PLUS)
-                        .on_hover_text("New tab")
-                        .clicked()
-                    {
-                        self.new_tab(None);
-                    }
+                    });
                 });
-            });
+        });
+        let r = ui.min_rect();
+        ui.painter()
+            .hline(r.x_range(), r.bottom(), Stroke::new(1.0, p.border));
         if let Some(i) = activate {
             self.active = i;
         }
@@ -1117,18 +1178,60 @@ impl App {
         }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    /// The top of the window: the app, its menus, and the active tab's connection and
+    /// actions.
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let p = theme::colors(ui);
         let i = self.active;
-        ui.horizontal(|ui| {
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let logo = self.logo.get_or_insert_with(|| {
+                let icon = theme::icon();
+                ui.ctx().load_texture(
+                    "logo",
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [icon.width as usize, icon.height as usize],
+                        &icon.rgba,
+                    ),
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                logo.id(),
+                egui::vec2(26.0, 26.0),
+            )));
+            ui.label(
+                RichText::new("DataDrop")
+                    .font(FontId::new(14.0, theme::semibold()))
+                    .color(p.text),
+            );
+            ui.add_space(4.0);
+            // The menu bar takes all the width it's given: give it what the menus need.
+            ui.allocate_ui_with_layout(
+                egui::vec2(300.0, 28.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| self.menu_bar(ui),
+            );
+            ui.add_space(12.0);
+
+            // The connection this tab runs on (each tab has its own).
+            ui.label(RichText::new("Runs on").color(p.faint));
             let current = self.docs[i].profile.clone();
+            if let Some(driver) = current
+                .as_ref()
+                .and_then(|n| self.profiles.iter().find(|p| &p.name == n))
+                .map(|p| p.driver)
+            {
+                kit::driver_badge(ui, driver, 18.0);
+            }
             let label = current
                 .clone()
                 .unwrap_or_else(|| "Choose a connection".into());
             let in_tx = self.docs[i].in_transaction;
             ui.add_enabled_ui(!in_tx, |ui| {
                 let resp = egui::ComboBox::from_id_salt(("tab-profile", self.docs[i].id))
-                    .selected_text(format!("{}  {label}", icon::DATABASE))
-                    .width(200.0)
+                    .selected_text(RichText::new(label).font(FontId::new(13.0, theme::medium())))
+                    .width(170.0)
                     .show_ui(ui, |ui| {
                         for p in &self.profiles {
                             ui.selectable_value(
@@ -1152,11 +1255,12 @@ impl App {
                     session: self.docs[i].session(),
                 });
             }
+            ui.add_space(12.0);
 
             let running = self.docs[i].running.is_some();
             ui.add_enabled_ui(!running, |ui| {
                 if ui
-                    .button(format!("{} Run", icon::PLAY))
+                    .add(kit::primary(ui, format!("{} Run", icon::PLAY)))
                     .on_hover_text(format!(
                         "Run the selection, or the statement at the cursor ({})",
                         ui.ctx().format_shortcut(&RUN)
@@ -1199,26 +1303,22 @@ impl App {
             });
             if running
                 && ui
-                    .button(format!("{} Stop", icon::STOP))
+                    .add(kit::danger(ui, format!("{} Stop", icon::STOP)))
                     .on_hover_text("Cancel the query on the server")
                     .clicked()
                 && let Some(t) = &self.docs[i].running
             {
                 t.cancel();
             }
-            ui.separator();
-            self.transaction_controls(ui, i);
-            ui.separator();
-            ui.label("Row limit");
-            ui.add(
-                egui::DragValue::new(&mut self.settings.max_rows)
-                    .range(1..=1_000_000)
-                    .speed(10.0),
-            )
-            .on_hover_text("Rows kept per result; the rest are left out");
+            ui.add_space(12.0);
+            self.commit_mode(ui, i);
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button(icon::MAGNIFYING_GLASS)
+                    .add(
+                        egui::Button::new(RichText::new(icon::MAGNIFYING_GLASS).color(p.muted))
+                            .frame_when_inactive(false),
+                    )
                     .on_hover_text(format!(
                         "Find and replace ({})",
                         ui.ctx().format_shortcut(&FIND)
@@ -1258,44 +1358,67 @@ impl App {
         doc.request_focus = true;
     }
 
-    /// Auto-commit on or off, and Commit / Roll back while a transaction is open.
-    fn transaction_controls(&mut self, ui: &mut egui::Ui, i: usize) {
+    /// Auto-commit on or off.
+    fn commit_mode(&mut self, ui: &mut egui::Ui, i: usize) {
         let doc = &mut self.docs[i];
-        let mut auto = !doc.manual_commit;
-        if ui
-            .checkbox(&mut auto, "Auto-commit")
-            .on_hover_text(
-                "Off: what you run stays in a transaction until you commit it (or roll it back)",
-            )
-            .changed()
-        {
+        // Manual: what runs stays in a transaction until it's committed (or rolled back).
+        let picked = kit::segmented(ui, !doc.manual_commit, ["Auto-commit", "Manual"]);
+        if let Some(auto) = picked {
             doc.manual_commit = !auto;
             self.backend.fire(Command::SessionAutocommit {
                 session: doc.session(),
                 autocommit: auto,
             });
         }
+    }
+
+    /// While a transaction is open: what that means, and Commit / Roll back.
+    fn transaction_bar(&mut self, ui: &mut egui::Ui) {
+        let i = self.active;
+        let doc = &self.docs[i];
         if !doc.in_transaction {
             return;
         }
         let busy = doc.tx_task.is_some() || doc.running.is_some();
-        ui.label(
-            RichText::new(format!("{} Transaction", icon::FLAG)).color(ui.visuals().warn_fg_color),
-        )
-        .on_hover_text(
-            "Changes made in this tab aren't saved (or seen by others) until you commit",
-        );
-        ui.add_enabled_ui(!busy, |ui| {
-            if ui.button(format!("{} Commit", icon::CHECK)).clicked() {
-                self.end_transaction(i, TransactionAction::Commit, false);
-            }
-            if ui
-                .button(format!("{} Roll back", icon::ARROW_U_UP_LEFT))
-                .clicked()
-            {
-                self.end_transaction(i, TransactionAction::Rollback, false);
-            }
-        });
+        let p = theme::colors(ui);
+        let mut action = None;
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                kit::banner(ui, p.warn, |ui| {
+                    ui.label(
+                        RichText::new("Transaction open")
+                            .font(FontId::new(13.0, theme::semibold()))
+                            .color(p.text),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Changes made in this tab aren't saved (or seen by others) until you \
+                             commit",
+                        )
+                        .color(p.muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if ui
+                                .add(kit::primary(ui, format!("{} Commit", icon::CHECK)))
+                                .clicked()
+                            {
+                                action = Some(TransactionAction::Commit);
+                            }
+                            if ui
+                                .button(format!("{} Roll back", icon::ARROW_U_UP_LEFT))
+                                .clicked()
+                            {
+                                action = Some(TransactionAction::Rollback);
+                            }
+                        });
+                    });
+                });
+            });
+        if let Some(a) = action {
+            self.end_transaction(i, a, false);
+        }
     }
 
     fn end_transaction(&mut self, i: usize, action: TransactionAction, close: bool) {
@@ -1322,90 +1445,100 @@ impl App {
         )
         .len();
         let mut step = None;
-        ui.horizontal(|ui| {
-            let l = ui.label(icon::MAGNIFYING_GLASS);
-            let field = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.find.query)
-                        .hint_text("Find")
-                        .desired_width(220.0),
-                )
-                .labelled_by(l.id);
-            if field.changed() {
-                self.find.current = None;
-            }
-            if self.find.focus {
-                field.request_focus();
-                self.find.focus = false;
-            }
-            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                step = Some(!ui.input(|i| i.modifiers.shift));
-                field.request_focus();
-            }
-            if ui
-                .selectable_label(self.find.match_case, "Aa")
-                .on_hover_text("Match case")
-                .clicked()
-            {
-                self.find.match_case = !self.find.match_case;
-                self.find.current = None;
-            }
-            if ui
-                .small_button(icon::ARROW_UP)
-                .on_hover_text("Previous (Shift+Enter)")
-                .clicked()
-            {
-                step = Some(false);
-            }
-            if ui
-                .small_button(icon::ARROW_DOWN)
-                .on_hover_text("Next (Enter)")
-                .clicked()
-            {
-                step = Some(true);
-            }
-            let status = match (count, self.find.current) {
-                (0, _) if !self.find.query.is_empty() => "No matches".to_owned(),
-                (0, _) => String::new(),
-                (n, Some(c)) if c < n => format!("{} of {n}", c + 1),
-                (n, _) => format!("{n} found"),
-            };
-            ui.weak(status);
-            if !self.find.replace
-                && ui
-                    .small_button(icon::CARET_DOWN)
-                    .on_hover_text("Replace")
-                    .clicked()
-            {
-                self.find.replace = true;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(icon::X)
-                    .on_hover_text("Close (Esc)")
-                    .clicked()
-                {
-                    self.find.open = false;
+        let p = theme::colors(ui);
+        egui::Frame::new()
+            .fill(p.panel)
+            .inner_margin(Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let l = ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(p.faint));
+                    let field = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.find.query)
+                                .hint_text("Find")
+                                .desired_width(220.0),
+                        )
+                        .labelled_by(l.id);
+                    if field.changed() {
+                        self.find.current = None;
+                    }
+                    if self.find.focus {
+                        field.request_focus();
+                        self.find.focus = false;
+                    }
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        step = Some(!ui.input(|i| i.modifiers.shift));
+                        field.request_focus();
+                    }
+                    if ui
+                        .selectable_label(self.find.match_case, "Aa")
+                        .on_hover_text("Match case")
+                        .clicked()
+                    {
+                        self.find.match_case = !self.find.match_case;
+                        self.find.current = None;
+                    }
+                    if ui
+                        .small_button(icon::ARROW_UP)
+                        .on_hover_text("Previous (Shift+Enter)")
+                        .clicked()
+                    {
+                        step = Some(false);
+                    }
+                    if ui
+                        .small_button(icon::ARROW_DOWN)
+                        .on_hover_text("Next (Enter)")
+                        .clicked()
+                    {
+                        step = Some(true);
+                    }
+                    let status = match (count, self.find.current) {
+                        (0, _) if !self.find.query.is_empty() => "No matches".to_owned(),
+                        (0, _) => String::new(),
+                        (n, Some(c)) if c < n => format!("{} of {n}", c + 1),
+                        (n, _) => format!("{n} found"),
+                    };
+                    ui.weak(status);
+                    if !self.find.replace
+                        && ui
+                            .small_button(icon::CARET_DOWN)
+                            .on_hover_text("Replace")
+                            .clicked()
+                    {
+                        self.find.replace = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(icon::X)
+                            .on_hover_text("Close (Esc)")
+                            .clicked()
+                        {
+                            self.find.open = false;
+                        }
+                    });
+                });
+                if self.find.replace {
+                    ui.horizontal(|ui| {
+                        let l = ui.label(RichText::new(icon::SWAP).color(p.faint));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.find.replacement)
+                                .hint_text("Replace with")
+                                .desired_width(220.0),
+                        )
+                        .labelled_by(l.id);
+                        if ui.button("Replace").clicked() {
+                            self.replace_one();
+                        }
+                        if ui.add(kit::ghost(ui, "Replace all")).clicked() {
+                            self.replace_all();
+                        }
+                    });
                 }
             });
-        });
-        if self.find.replace {
-            ui.horizontal(|ui| {
-                let l = ui.label(icon::SWAP);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.find.replacement)
-                        .hint_text("Replace with")
-                        .desired_width(220.0),
-                )
-                .labelled_by(l.id);
-                if ui.button("Replace").clicked() {
-                    self.replace_one();
-                }
-                if ui.button("Replace all").clicked() {
-                    self.replace_all();
-                }
-            });
-        }
+        let r = ui.min_rect();
+        ui.painter()
+            .hline(r.x_range(), r.bottom(), Stroke::new(1.0, p.border));
         if let Some(forward) = step {
             self.find_step(forward);
         }
@@ -1656,66 +1789,62 @@ impl App {
         }
         let mut close = false;
         let mut save = false;
-        egui::Modal::new(egui::Id::new("review-edits")).show(ctx, |ui| {
-            ui.set_width(620.0);
-            ui.heading("Save changes");
-            ui.add_space(4.0);
-            ui.label(format!(
-                "{} statement{} will run in one transaction. If any of them doesn't change \
-                 exactly one row, nothing is saved.",
-                review.statements.len(),
-                if review.statements.len() == 1 {
-                    ""
-                } else {
-                    "s"
+        egui::Modal::new(egui::Id::new("review-edits"))
+            .styled(ctx)
+            .show(ctx, |ui| {
+                ui.set_width(620.0);
+                kit::sheet_header(
+                    ui,
+                    "Save changes",
+                    Some(&format!(
+                        "{} statement{} will run in one transaction. If any of them doesn't \
+                     change exactly one row, nothing is saved.",
+                        review.statements.len(),
+                        if review.statements.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )),
+                );
+                let mut text = review
+                    .statements
+                    .iter()
+                    .map(|s| format!("{s};"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .interactive(true),
+                        );
+                    });
+                if let Some(e) = &review.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
                 }
-            ));
-            ui.add_space(6.0);
-            let mut text = review
-                .statements
-                .iter()
-                .map(|s| format!("{s};"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            egui::ScrollArea::vertical()
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut text)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .interactive(true),
-                    );
-                });
-            if let Some(e) = &review.error {
-                ui.add_space(6.0);
-                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button(format!("{} Copy SQL", icon::COPY)).clicked() {
-                    ui.ctx().copy_text(text.clone());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                kit::sheet_footer(ui, |ui| {
                     let saving = review.saving.is_some();
-                    if ui
-                        .add_enabled(!saving, egui::Button::new(RichText::new("Save").strong()))
-                        .clicked()
-                    {
+                    if ui.add_enabled(!saving, kit::primary(ui, "Save")).clicked() {
                         save = true;
                     }
-                    if ui
-                        .add_enabled(!saving, egui::Button::new("Cancel"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(!saving, kit::ghost(ui, "Cancel")).clicked() {
                         close = true;
                     }
                     if saving {
                         ui.spinner();
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui.button(format!("{} Copy SQL", icon::COPY)).clicked() {
+                            ui.ctx().copy_text(text.clone());
+                        }
+                    });
                 });
             });
-        });
         if save {
             review.error = None;
             review.saving = Some(self.backend.run(Command::ApplyEdits {
@@ -1863,32 +1992,37 @@ impl App {
     fn trust_dialog(&mut self, ctx: &egui::Context) {
         let Some(t) = self.trust.clone() else { return };
         let mut choice = None;
-        egui::Modal::new(egui::Id::new("trust-ssh")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.heading("Trust this SSH server?");
-            ui.add_space(6.0);
-            ui.label(format!(
-                "DataDrop hasn't connected to {}:{} before. Its key fingerprint is:",
-                t.host, t.port
-            ));
-            ui.add_space(4.0);
-            ui.monospace(&t.fingerprint);
-            ui.add_space(6.0);
-            ui.weak(
-                "Check it with the server's admin (or `ssh-keygen -lf` on the server) before \
+        egui::Modal::new(egui::Id::new("trust-ssh"))
+            .styled(ctx)
+            .show(ctx, |ui| {
+                ui.set_width(500.0);
+                kit::sheet_header(
+                    ui,
+                    "Trust this SSH server?",
+                    Some(&format!(
+                        "DataDrop hasn't connected to {}:{} before. Its key fingerprint is:",
+                        t.host, t.port
+                    )),
+                );
+                kit::card(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.monospace(&t.fingerprint);
+                });
+                ui.add_space(10.0);
+                ui.weak(
+                    "Check it with the server's admin (or `ssh-keygen -lf` on the server) before \
                  trusting it: a different fingerprint can mean someone is intercepting the \
                  connection.",
-            );
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("Trust").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(false);
-                }
+                );
+                kit::sheet_footer(ui, |ui| {
+                    if ui.add(kit::primary(ui, "Trust")).clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.add(kit::ghost(ui, "Cancel")).clicked() {
+                        choice = Some(false);
+                    }
+                });
             });
-        });
         match choice {
             Some(true) => {
                 self.trusting = Some(self.backend.run(t.command()));
@@ -1985,86 +2119,85 @@ impl App {
 
         let Some(c) = &self.confirm else { return };
         let mut choice: Option<&str> = None;
-        egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.heading(&c.title);
-            ui.add_space(6.0);
-            ui.label(&c.text);
-            ui.add_space(12.0);
-            ui.horizontal(|ui| match &c.kind {
-                ConfirmKind::CloseTab(_) => {
-                    if ui.button("Save").clicked() {
-                        choice = Some("save");
+        egui::Modal::new(egui::Id::new("confirm"))
+            .styled(ctx)
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                let danger = !matches!(c.kind, ConfirmKind::CloseTab(_));
+                let p = theme::colors(ui);
+                ui.horizontal_top(|ui| {
+                    let color = if danger { p.bad } else { p.accent };
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 10, theme::alpha(color, 0x24));
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if danger { "!" } else { "?" },
+                        FontId::new(17.0, theme::semibold()),
+                        color,
+                    );
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(&c.title)
+                                .font(FontId::new(15.0, theme::semibold()))
+                                .color(p.text),
+                        );
+                        ui.label(RichText::new(&c.text).color(p.muted));
+                    });
+                });
+                // The main action lands bottom right; Cancel on the left.
+                kit::sheet_footer(ui, |ui| {
+                    match &c.kind {
+                        ConfirmKind::CloseTab(_) => {
+                            if ui.add(kit::primary(ui, "Save")).clicked() {
+                                choice = Some("save");
+                            }
+                            if ui.add(kit::ghost(ui, "Don't save")).clicked() {
+                                choice = Some("discard");
+                            }
+                        }
+                        ConfirmKind::Quit => {
+                            if ui.add(kit::danger(ui, "Quit without saving")).clicked() {
+                                choice = Some("discard");
+                            }
+                        }
+                        ConfirmKind::ClearHistory => {
+                            if ui.add(kit::danger(ui, "Clear")).clicked() {
+                                choice = Some("delete");
+                            }
+                        }
+                        ConfirmKind::OpenTransaction(_) => {
+                            if ui.add(kit::danger(ui, "Roll back and close")).clicked() {
+                                choice = Some("rollback");
+                            }
+                            if ui.button("Commit and close").clicked() {
+                                choice = Some("commit");
+                            }
+                        }
+                        ConfirmKind::DiscardEdits(..) => {
+                            if ui.add(kit::danger(ui, "Discard")).clicked() {
+                                choice = Some("discard");
+                            }
+                            if ui.button("Review and save").clicked() {
+                                choice = Some("review");
+                            }
+                        }
+                        ConfirmKind::DeleteProfile(_) => {
+                            if ui.add(kit::danger(ui, "Delete")).clicked() {
+                                choice = Some("delete");
+                            }
+                        }
                     }
-                    if ui.button("Don't save").clicked() {
-                        choice = Some("discard");
-                    }
-                    if ui.button("Cancel").clicked() {
-                        choice = Some("cancel");
-                    }
-                }
-                ConfirmKind::Quit => {
-                    if ui.button("Quit without saving").clicked() {
-                        choice = Some("discard");
-                    }
-                    if ui.button("Cancel").clicked() {
-                        choice = Some("cancel");
-                    }
-                }
-                ConfirmKind::ClearHistory => {
-                    if ui
-                        .button(RichText::new("Clear").color(ui.visuals().error_fg_color))
-                        .clicked()
-                    {
-                        choice = Some("delete");
-                    }
-                    if ui.button("Cancel").clicked() {
-                        choice = Some("cancel");
-                    }
-                }
-                ConfirmKind::OpenTransaction(_) => {
-                    if ui.button("Commit and close").clicked() {
-                        choice = Some("commit");
-                    }
-                    if ui
-                        .button(
-                            RichText::new("Roll back and close").color(ui.visuals().error_fg_color),
-                        )
-                        .clicked()
-                    {
-                        choice = Some("rollback");
-                    }
-                    if ui.button("Cancel").clicked() {
-                        choice = Some("cancel");
-                    }
-                }
-                ConfirmKind::DiscardEdits(..) => {
-                    if ui.button("Review and save").clicked() {
-                        choice = Some("review");
-                    }
-                    if ui
-                        .button(RichText::new("Discard").color(ui.visuals().error_fg_color))
-                        .clicked()
-                    {
-                        choice = Some("discard");
-                    }
-                    if ui.button("Cancel").clicked() {
-                        choice = Some("cancel");
-                    }
-                }
-                ConfirmKind::DeleteProfile(_) => {
-                    if ui
-                        .button(RichText::new("Delete").color(ui.visuals().error_fg_color))
-                        .clicked()
-                    {
-                        choice = Some("delete");
-                    }
-                    if ui.button("Cancel").clicked() {
-                        choice = Some("cancel");
-                    }
-                }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui.add(kit::ghost(ui, "Cancel")).clicked() {
+                            choice = Some("cancel");
+                        }
+                    });
+                });
             });
-        });
         let Some(choice) = choice else { return };
         let c = self.confirm.take().expect("checked above");
         match (c.kind, choice) {
@@ -2149,17 +2282,36 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         self.handle_close(&ctx);
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
+        let p = theme::colors(ui);
+        egui::Panel::top("top")
+            .exact_size(48.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(Margin::symmetric(12, 0)),
+            )
+            .show(ui, |ui| self.top_bar(ui));
         egui::Panel::left("browser")
             .resizable(true)
-            .default_size(250.0)
-            .min_size(160.0)
+            .default_size(272.0)
+            .min_size(180.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(Margin::same(10)),
+            )
             .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.left, LeftView::Connections, "Connections");
-                    ui.selectable_value(&mut self.left, LeftView::History, "History");
-                });
+                if let Some(explorer) = kit::segmented(
+                    ui,
+                    self.left == LeftView::Connections,
+                    ["Explorer", "History"],
+                ) {
+                    self.left = if explorer {
+                        LeftView::Connections
+                    } else {
+                        LeftView::History
+                    };
+                }
                 match self.left {
                     LeftView::Connections => {
                         if let Some(a) = self.browser.ui(ui, &self.profiles, &self.backend) {
@@ -2173,49 +2325,61 @@ impl eframe::App for App {
                     }
                 }
             });
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            self.tab_strip(ui);
-            self.toolbar(ui);
-            self.find_bar(ui);
-            let i = self.active;
-            egui::Panel::bottom("results")
-                .resizable(true)
-                .default_size(280.0)
-                .min_size(80.0)
-                .show(ui, |ui| {
-                    // Keep the pane's size whatever it shows.
-                    ui.set_min_size(ui.available_size());
-                    let dialect = self.dialect_of(self.docs[i].profile.as_deref());
-                    match results::results_ui(ui, &mut self.docs[i], dialect) {
-                        ResultsAction::Stop => {
-                            if let Some(t) = &self.docs[i].running {
-                                t.cancel();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.bg))
+            .show(ui, |ui| {
+                self.tab_strip(ui);
+                self.transaction_bar(ui);
+                self.find_bar(ui);
+                let i = self.active;
+                egui::Panel::bottom("results")
+                    .resizable(true)
+                    .default_size(320.0)
+                    .min_size(80.0)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(p.panel)
+                            .inner_margin(Margin::symmetric(12, 8)),
+                    )
+                    .show(ui, |ui| {
+                        // Keep the pane's size whatever it shows.
+                        ui.set_min_size(ui.available_size());
+                        let dialect = self.dialect_of(self.docs[i].profile.as_deref());
+                        match results::results_ui(
+                            ui,
+                            &mut self.docs[i],
+                            dialect,
+                            &mut self.settings.max_rows,
+                        ) {
+                            ResultsAction::Stop => {
+                                if let Some(t) = &self.docs[i].running {
+                                    t.cancel();
+                                }
                             }
+                            ResultsAction::Export(r) => self.export_result(i, r),
+                            ResultsAction::CheckEditable(r) => self.check_editable(i, r),
+                            ResultsAction::Review(r) => self.review_edits(i, r),
+                            ResultsAction::Filter(r) => self.filter_result(i, r, None),
+                            ResultsAction::Sort(r, col) => self.filter_result(i, r, Some(col)),
+                            ResultsAction::ClearFilter => self.clear_filter(i),
+                            ResultsAction::None => {}
                         }
-                        ResultsAction::Export(r) => self.export_result(i, r),
-                        ResultsAction::CheckEditable(r) => self.check_editable(i, r),
-                        ResultsAction::Review(r) => self.review_edits(i, r),
-                        ResultsAction::Filter(r) => self.filter_result(i, r, None),
-                        ResultsAction::Sort(r, col) => self.filter_result(i, r, Some(col)),
-                        ResultsAction::ClearFilter => self.clear_filter(i),
-                        ResultsAction::None => {}
-                    }
-                });
-            let dialect = self.dialect_of(self.docs[i].profile.as_deref());
-            let matches = self.find.matches(&self.docs[i].text);
-            let current = self.find.current;
-            let size = self.settings.editor_font_size;
-            let catalog = self.catalog_for(self.docs[i].profile.clone());
-            editor::editor_ui(
-                ui,
-                &mut self.docs[i],
-                dialect,
-                &matches,
-                current,
-                size,
-                &catalog,
-            );
-        });
+                    });
+                let dialect = self.dialect_of(self.docs[i].profile.as_deref());
+                let matches = self.find.matches(&self.docs[i].text);
+                let current = self.find.current;
+                let size = self.settings.editor_font_size;
+                let catalog = self.catalog_for(self.docs[i].profile.clone());
+                editor::editor_ui(
+                    ui,
+                    &mut self.docs[i],
+                    dialect,
+                    &matches,
+                    current,
+                    size,
+                    &catalog,
+                );
+            });
 
         self.dialogs(&ctx);
         self.toasts.show(&ctx);

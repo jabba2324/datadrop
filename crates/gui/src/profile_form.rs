@@ -8,6 +8,11 @@ use egui::RichText;
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
+use crate::kit::{self, ModalExt};
+use crate::theme;
+
+/// The text fields' width, in the form's right-hand column.
+const FIELD_WIDTH: f32 = 380.0;
 
 pub struct ProfileForm {
     /// The profile being edited (`None` for a new one).
@@ -276,80 +281,73 @@ impl ProfileForm {
         } else {
             "New connection"
         };
-        egui::Modal::new(egui::Id::new("profile-form")).show(ctx, |ui| {
-            ui.set_width(480.0);
-            ui.heading(title);
-            ui.add_space(8.0);
-            let busy = self.saving.is_some();
-            ui.add_enabled_ui(!busy, |ui| self.fields(ui));
+        egui::Modal::new(egui::Id::new("profile-form"))
+            .styled(ctx)
+            .show(ctx, |ui| {
+                ui.set_width(760.0);
+                kit::sheet_header(ui, title, Some("Pick a database, then how to reach it."));
+                let busy = self.saving.is_some();
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| ui.add_enabled_ui(!busy, |ui| self.driver_list(ui)));
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(520.0);
+                        ui.add_enabled_ui(!busy, |ui| self.fields(ui));
 
-            if let Some(r) = &self.test_result {
-                ui.add_space(6.0);
-                match r {
-                    Ok(v) => ui.label(
-                        RichText::new(format!("{} Connected: {}", icon::CHECK_CIRCLE, short(v)))
-                            .color(egui::Color32::from_rgb(0x3C, 0xA0, 0x5A)),
-                    ),
-                    Err(e) => ui.label(
-                        RichText::new(format!("{} {e}", icon::WARNING_CIRCLE))
-                            .color(ui.visuals().error_fg_color),
-                    ),
-                };
-            }
-            if let Some(t) = self.untrusted.clone() {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("{} Key fingerprint:", icon::FINGERPRINT));
-                    ui.monospace(&t.fingerprint);
-                });
-                if ui
-                    .add_enabled(
-                        self.trusting.is_none(),
-                        egui::Button::new(format!(
-                            "{} Trust this server and connect",
-                            icon::SEAL_CHECK
-                        )),
-                    )
-                    .on_hover_text("Only if the fingerprint matches the server's real key")
-                    .clicked()
-                {
-                    self.trusting = Some(backend.run(t.command()));
-                }
-            }
-            if let Some(e) = &self.error {
-                ui.add_space(6.0);
-                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
-            }
-            ui.add_space(6.0);
-            if !self.driver.is_file() {
-                ui.weak(
+                        if let Some(r) = &self.test_result {
+                            ui.add_space(6.0);
+                            match r {
+                                Ok(v) => ui.label(
+                                    RichText::new(format!(
+                                        "{} Connected: {}",
+                                        icon::CHECK_CIRCLE,
+                                        short(v)
+                                    ))
+                                    .color(theme::colors(ui).ok),
+                                ),
+                                Err(e) => ui.label(
+                                    RichText::new(format!("{} {e}", icon::WARNING_CIRCLE))
+                                        .color(ui.visuals().error_fg_color),
+                                ),
+                            };
+                        }
+                        if let Some(t) = self.untrusted.clone() {
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("{} Key fingerprint:", icon::FINGERPRINT));
+                                ui.monospace(&t.fingerprint);
+                            });
+                            if ui
+                                .add_enabled(
+                                    self.trusting.is_none(),
+                                    egui::Button::new(format!(
+                                        "{} Trust this server and connect",
+                                        icon::SEAL_CHECK
+                                    )),
+                                )
+                                .on_hover_text(
+                                    "Only if the fingerprint matches the server's real key",
+                                )
+                                .clicked()
+                            {
+                                self.trusting = Some(backend.run(t.command()));
+                            }
+                        }
+                        if let Some(e) = &self.error {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                        }
+                        ui.add_space(6.0);
+                        if !self.driver.is_file() {
+                            ui.weak(
                 "Passwords are saved as plain text in your profile files (~/.datadrop/profiles), \
                  readable only by your user account.",
                 );
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let testing = self.test.is_some();
-                if ui
-                    .add_enabled(
-                        !testing && !busy,
-                        egui::Button::new(format!("{} Test", icon::PLUGS)),
-                    )
-                    .clicked()
-                {
-                    self.test_result = None;
-                    match self.build() {
-                        Ok(profile) => {
-                            self.test = Some(backend.run(Command::ConnectionTest { profile }))
                         }
-                        Err(e) => self.test_result = Some(Err(e)),
-                    }
-                }
-                if testing {
-                    ui.spinner();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("Save")).clicked() {
+                    });
+                });
+                kit::sheet_footer(ui, |ui| {
+                    if ui.add_enabled(!busy, kit::primary(ui, "Save")).clicked() {
                         self.error = None;
                         match self.build() {
                             Ok(profile) => {
@@ -362,16 +360,87 @@ impl ProfileForm {
                             Err(e) => self.error = Some(e),
                         }
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.add(kit::ghost(ui, "Cancel")).clicked() {
                         if let Some(t) = &self.test {
                             t.cancel();
                         }
                         done = Some(FormDone::Cancelled);
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let testing = self.test.is_some();
+                        if ui
+                            .add_enabled(
+                                !testing && !busy,
+                                egui::Button::new(format!("{} Test", icon::PLUGS)),
+                            )
+                            .clicked()
+                        {
+                            self.test_result = None;
+                            match self.build() {
+                                Ok(profile) => {
+                                    self.test =
+                                        Some(backend.run(Command::ConnectionTest { profile }))
+                                }
+                                Err(e) => self.test_result = Some(Err(e)),
+                            }
+                        }
+                        if testing {
+                            ui.spinner();
+                        }
+                    });
                 });
             });
-        });
         done
+    }
+
+    /// The databases, one per row with its badge: picking one is the driver.
+    fn driver_list(&mut self, ui: &mut egui::Ui) {
+        let p = theme::colors(ui);
+        egui::Frame::new()
+            .fill(p.bg)
+            .stroke(egui::Stroke::new(1.0, p.border))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.set_width(190.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for d in Driver::ALL {
+                    let on = self.driver == d;
+                    egui::Frame::new()
+                        .fill(if on {
+                            p.accent_soft
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                kit::driver_badge(ui, d, 20.0);
+                                let text = RichText::new(d.label())
+                                    .font(egui::FontId::new(13.0, theme::medium()))
+                                    .color(if on { p.text } else { p.muted });
+                                if ui
+                                    .add(egui::Button::selectable(on, text).frame(false))
+                                    .clicked()
+                                {
+                                    self.driver = d;
+                                }
+                                if d.is_file() {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new("file").size(11.0).color(p.faint),
+                                            )
+                                        },
+                                    );
+                                }
+                            });
+                        });
+                }
+            });
     }
 
     fn fields(&mut self, ui: &mut egui::Ui) {
@@ -381,7 +450,8 @@ impl ProfileForm {
                 .add(
                     egui::TextEdit::singleline(value)
                         .hint_text(hint)
-                        .desired_width(f32::INFINITY),
+                        .margin(egui::Margin::symmetric(8, 5))
+                        .desired_width(FIELD_WIDTH),
                 )
                 .labelled_by(l.id);
             ui.end_row();
@@ -397,13 +467,6 @@ impl ProfileForm {
                     name.request_focus();
                     self.focused = true;
                 }
-                ui.label("Database");
-                ui.horizontal(|ui| {
-                    for d in Driver::ALL {
-                        ui.radio_value(&mut self.driver, d, d.label());
-                    }
-                });
-                ui.end_row();
                 if self.driver.is_file() {
                     self.file_fields(ui);
                     return;
@@ -444,7 +507,8 @@ impl ProfileForm {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.password)
                             .password(!self.show_password)
-                            .desired_width(ui.available_width() - 34.0),
+                            .margin(egui::Margin::symmetric(8, 5))
+                            .desired_width(FIELD_WIDTH - 36.0),
                     )
                     .labelled_by(l.id);
                     let eye = if self.show_password {
@@ -481,7 +545,8 @@ impl ProfileForm {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.ssl_root_cert)
                             .hint_text("optional, a PEM file")
-                            .desired_width(ui.available_width() - 70.0),
+                            .margin(egui::Margin::symmetric(8, 5))
+                            .desired_width(FIELD_WIDTH - 90.0),
                     )
                     .labelled_by(l.id);
                     if ui.button("Browse…").clicked()
@@ -511,7 +576,8 @@ impl ProfileForm {
                     egui::TextEdit::singleline(value)
                         .hint_text(hint)
                         .password(secret)
-                        .desired_width(f32::INFINITY),
+                        .margin(egui::Margin::symmetric(8, 5))
+                        .desired_width(FIELD_WIDTH),
                 )
                 .labelled_by(l.id);
                 ui.end_row();
@@ -543,7 +609,8 @@ impl ProfileForm {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.ssh_key)
                             .hint_text("~/.ssh/id_ed25519")
-                            .desired_width(ui.available_width() - 70.0),
+                            .margin(egui::Margin::symmetric(8, 5))
+                            .desired_width(FIELD_WIDTH - 90.0),
                     )
                     .labelled_by(l.id);
                     if ui.button("Browse…").clicked() {
@@ -614,7 +681,8 @@ impl ProfileForm {
             ui.add(
                 egui::TextEdit::singleline(&mut self.database)
                     .hint_text("the database file")
-                    .desired_width(ui.available_width() - 70.0),
+                    .margin(egui::Margin::symmetric(8, 5))
+                    .desired_width(FIELD_WIDTH - 90.0),
             )
             .labelled_by(l.id);
             if ui.button("Browse…").clicked() {

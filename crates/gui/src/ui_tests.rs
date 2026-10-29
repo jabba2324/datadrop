@@ -675,7 +675,7 @@ fn manual_commit_mode() {
     let mut h = app(dir.path());
     until(&mut h, "the profiles", |a| !a.profiles.is_empty());
     run_tab(&mut h, "create table t (n int)");
-    h.get_by_label("Auto-commit").click();
+    h.get_by_label("Manual").click();
     h.run_steps(3);
     assert!(h.state().docs[0].manual_commit);
     run_tab(&mut h, "insert into t values (1)");

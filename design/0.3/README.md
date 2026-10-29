@@ -65,11 +65,10 @@ These appear in the designs, but the app doesn't have them yet:
 | Command palette (⌘K) | 09 | #2 |
 | Errors shown in the editor, Jump to line, "did you mean" | 04 | #3 |
 | Messages view with server notices | 04 | #4 |
-| Slowest plan step highlighted | 05 | #5 |
 | Find with regex and whole word | 06 | #6 |
 | Settings dialog | 19 | #7 |
 | Copy row as INSERT / CSV, filter by a value | 21 | #8 |
-| Remembered parameter values, the parameters hint | 08, 02 | #9 |
+| The parameters hint in the editor | 02 | #9 |
 | One-step database files, drag and drop | 12, 01 | #10 |
 | Row counts, connection dots, saved queries in the explorer | 02 | #11 |
 | History details and earlier runs | 10 | #12 |

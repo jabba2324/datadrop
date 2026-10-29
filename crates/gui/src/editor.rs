@@ -318,121 +318,125 @@ pub fn editor_ui(
     // the text changed, and where the cursor is on screen.
     let mut typed: Option<(Option<usize>, bool, egui::Rect)> = None;
     let outer = ui.available_size();
-    let bg = if dark {
-        egui::Color32::from_gray(24)
-    } else {
-        egui::Color32::from_gray(252)
-    };
-    egui::Frame::new().fill(bg).show(ui, |ui| {
-        ui.set_min_size(outer);
-        // Line numbers scroll up and down with the text, but stay put when a long
-        // line scrolls sideways.
-        egui::ScrollArea::vertical()
-            .id_salt(("editor-scroll", doc.id))
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let lines = doc.text.split('\n').count();
-                    let width = lines.to_string().len().max(2);
-                    let gutter: String = (1..=lines)
-                        .map(|n| format!("{n:>width$} "))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let gutter_color = ui.visuals().weak_text_color().gamma_multiply(0.8);
-                    ui.vertical(|ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(gutter)
-                                    .font(font.clone())
-                                    .color(gutter_color),
-                            )
-                            .selectable(false)
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                        );
-                    });
-                    ui.add_space(6.0);
+    let colors = crate::theme::palette(dark);
+    egui::Frame::new()
+        .fill(colors.bg)
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 0,
+            top: 10,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            ui.set_min_size(outer);
+            // Line numbers scroll up and down with the text, but stay put when a long
+            // line scrolls sideways.
+            egui::ScrollArea::vertical()
+                .id_salt(("editor-scroll", doc.id))
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let lines = doc.text.split('\n').count();
+                        let width = lines.to_string().len().max(2);
+                        let gutter: String = (1..=lines)
+                            .map(|n| format!("{n:>width$} "))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let gutter_color = colors.faint;
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(gutter)
+                                        .font(font.clone())
+                                        .color(gutter_color),
+                                )
+                                .selectable(false)
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        });
+                        ui.add_space(14.0);
 
-                    let Document {
-                        text,
-                        layout_cache,
-                        last_cursor,
-                        ..
-                    } = doc;
-                    let mut layouter = |ui: &egui::Ui, buf: &dyn TextBuffer, _wrap: f32| {
-                        let text = buf.as_str();
-                        let key = {
-                            let mut h = std::collections::hash_map::DefaultHasher::new();
-                            (text, dark, matches, current, font_size.to_bits()).hash(&mut h);
-                            h.finish()
-                        };
-                        if let Some((k, galley)) = layout_cache.as_ref()
-                            && *k == key
-                        {
-                            return galley.clone();
-                        }
-                        let job = highlight(text, dialect, matches, current, dark, &font);
-                        let galley = ui.fonts_mut(|f| f.layout_job(job));
-                        *layout_cache = Some((key, galley.clone()));
-                        galley
-                    };
-                    let width = ui.available_width().max(100.0);
-                    let height = (outer.y - 8.0).max(40.0);
-                    let request_focus = std::mem::take(&mut doc.request_focus);
-                    let scroll_to = doc.scroll_to.take();
-                    // The inner (sideways) scroll area swallows vertical scroll requests
-                    // too, so the rect to keep in view comes out and is asked for here.
-                    let keep_visible = egui::ScrollArea::horizontal()
-                        .id_salt(("editor-hscroll", doc.id))
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            let out = egui::TextEdit::multiline(text)
-                                .id(id)
-                                .code_editor()
-                                .font(font.clone())
-                                .frame(egui::Frame::NONE)
-                                .margin(egui::Margin::symmetric(2, 4))
-                                .lock_focus(true)
-                                .desired_width(width)
-                                .min_size(egui::vec2(width, height))
-                                .layouter(&mut layouter)
-                                .show(ui);
-                            if request_focus {
-                                out.response.response.request_focus();
-                            }
-                            let at = |ci: usize| {
-                                out.galley
-                                    .pos_from_cursor(CCursor::new(ci))
-                                    .translate(out.galley_pos.to_vec2())
+                        let Document {
+                            text,
+                            layout_cache,
+                            last_cursor,
+                            ..
+                        } = doc;
+                        let mut layouter = |ui: &egui::Ui, buf: &dyn TextBuffer, _wrap: f32| {
+                            let text = buf.as_str();
+                            let key = {
+                                let mut h = std::collections::hash_map::DefaultHasher::new();
+                                (text, dark, matches, current, font_size.to_bits()).hash(&mut h);
+                                h.finish()
                             };
-                            if let Some(b) = scroll_to {
-                                let rect = at(byte_to_char(text, b)).expand(24.0);
-                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                                return Some((rect, Some(egui::Align::Center)));
+                            if let Some((k, galley)) = layout_cache.as_ref()
+                                && *k == key
+                            {
+                                return galley.clone();
                             }
-                            let cursor = out.cursor_range.map(|r| r.primary.index.0);
-                            let moved = cursor != *last_cursor;
-                            *last_cursor = cursor;
-                            if out.response.response.has_focus() {
-                                let anchor = at(cursor.unwrap_or(0));
-                                typed = Some((cursor, out.response.response.changed(), anchor));
-                            }
-                            match cursor {
-                                Some(ci) if moved || out.response.response.changed() => {
-                                    let rect = at(ci).expand2(egui::vec2(8.0, 4.0));
-                                    ui.scroll_to_rect(rect, None);
-                                    Some((rect, None))
+                            let job = highlight(text, dialect, matches, current, dark, &font);
+                            let galley = ui.fonts_mut(|f| f.layout_job(job));
+                            *layout_cache = Some((key, galley.clone()));
+                            galley
+                        };
+                        let width = ui.available_width().max(100.0);
+                        let height = (outer.y - 8.0).max(40.0);
+                        let request_focus = std::mem::take(&mut doc.request_focus);
+                        let scroll_to = doc.scroll_to.take();
+                        // The inner (sideways) scroll area swallows vertical scroll requests
+                        // too, so the rect to keep in view comes out and is asked for here.
+                        let keep_visible = egui::ScrollArea::horizontal()
+                            .id_salt(("editor-hscroll", doc.id))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let out = egui::TextEdit::multiline(text)
+                                    .id(id)
+                                    .code_editor()
+                                    .font(font.clone())
+                                    .frame(egui::Frame::NONE)
+                                    .margin(egui::Margin::symmetric(2, 4))
+                                    .lock_focus(true)
+                                    .desired_width(width)
+                                    .min_size(egui::vec2(width, height))
+                                    .layouter(&mut layouter)
+                                    .show(ui);
+                                if request_focus {
+                                    out.response.response.request_focus();
                                 }
-                                _ => None,
-                            }
-                        })
-                        .inner;
-                    if let Some((rect, align)) = keep_visible {
-                        ui.scroll_to_rect(rect, align);
-                    }
+                                let at = |ci: usize| {
+                                    out.galley
+                                        .pos_from_cursor(CCursor::new(ci))
+                                        .translate(out.galley_pos.to_vec2())
+                                };
+                                if let Some(b) = scroll_to {
+                                    let rect = at(byte_to_char(text, b)).expand(24.0);
+                                    ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                    return Some((rect, Some(egui::Align::Center)));
+                                }
+                                let cursor = out.cursor_range.map(|r| r.primary.index.0);
+                                let moved = cursor != *last_cursor;
+                                *last_cursor = cursor;
+                                if out.response.response.has_focus() {
+                                    let anchor = at(cursor.unwrap_or(0));
+                                    typed = Some((cursor, out.response.response.changed(), anchor));
+                                }
+                                match cursor {
+                                    Some(ci) if moved || out.response.response.changed() => {
+                                        let rect = at(ci).expand2(egui::vec2(8.0, 4.0));
+                                        ui.scroll_to_rect(rect, None);
+                                        Some((rect, None))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .inner;
+                        if let Some((rect, align)) = keep_visible {
+                            ui.scroll_to_rect(rect, align);
+                        }
+                    });
                 });
-            });
-    });
+        });
 
     update_completion(ui.ctx(), doc, dialect, catalog, typed);
     completion_popup(ui.ctx(), doc);

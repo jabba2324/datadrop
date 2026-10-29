@@ -12,6 +12,8 @@ use egui::RichText;
 use egui_phosphor::regular as icon;
 
 use crate::backend::{Backend, Task, poll};
+use crate::kit::{self, ModalExt};
+use crate::theme;
 
 #[derive(Clone, Default)]
 struct ColumnRow {
@@ -505,117 +507,153 @@ impl TableEditor {
             }
         }
         let migration = self.migration();
-        egui::Modal::new(egui::Id::new("table-editor")).show(ctx, |ui| {
-            ui.set_width(820.0);
-            ui.heading(match &self.old {
-                None => "New table".to_owned(),
-                Some(t) => format!("Edit {}", t.name),
-            });
-            ui.add_space(6.0);
-            egui::Grid::new("table-head").num_columns(2).show(ui, |ui| {
-                let l = ui.label("Name");
-                let name = text(ui, &mut self.name, 300.0, "").labelled_by(l.id);
-                if std::mem::take(&mut self.focus) && self.old.is_none() {
-                    name.request_focus();
-                }
-                ui.end_row();
-                if self.dialect != Dialect::Sqlite {
-                    let l = ui.label("Comment");
-                    text(ui, &mut self.comment, 500.0, "optional").labelled_by(l.id);
-                    ui.end_row();
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (s, label) in [
-                    (
-                        Section::Columns,
-                        format!("Columns ({})", self.columns.len()),
-                    ),
-                    (
-                        Section::Indexes,
-                        format!("Indexes ({})", self.indexes.len()),
-                    ),
-                    (
-                        Section::ForeignKeys,
-                        format!("Foreign keys ({})", self.fks.len()),
-                    ),
-                    (Section::Checks, format!("Checks ({})", self.checks.len())),
-                ] {
-                    ui.selectable_value(&mut self.section, s, label);
-                }
-            });
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .id_salt("table-editor-body")
-                .max_height(260.0)
-                .show(ui, |ui| match self.section {
-                    Section::Columns => self.columns_ui(ui),
-                    Section::Indexes => self.indexes_ui(ui),
-                    Section::ForeignKeys => self.fks_ui(ui),
-                    Section::Checks => self.checks_ui(ui),
-                });
-            ui.separator();
-            ui.label(RichText::new("SQL").strong());
-            match &migration {
-                Err(e) => {
-                    ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
-                }
-                Ok(m) if m.statements.is_empty() => {
-                    ui.weak("No changes yet.");
-                }
-                Ok(m) => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("table-editor-sql")
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            let mut script = m.script();
-                            ui.add(
-                                egui::TextEdit::multiline(&mut script)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .interactive(false),
+        egui::Modal::new(egui::Id::new("table-editor"))
+            .styled(ctx)
+            .show(ctx, |ui| {
+                ui.set_width(860.0);
+                let p = theme::colors(ui);
+                let title = match &self.old {
+                    None => "New table".to_owned(),
+                    Some(t) => format!("Edit {}", t.name),
+                };
+                kit::sheet_header(
+                    ui,
+                    &title,
+                    Some(&format!("in {} on {}", self.schema, self.profile)),
+                );
+                egui::Grid::new("table-head")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        let l = ui.label("Name");
+                        let name = text(ui, &mut self.name, 300.0, "").labelled_by(l.id);
+                        if std::mem::take(&mut self.focus) && self.old.is_none() {
+                            name.request_focus();
+                        }
+                        ui.end_row();
+                        if self.dialect != Dialect::Sqlite {
+                            let l = ui.label("Comment");
+                            text(ui, &mut self.comment, 500.0, "optional").labelled_by(l.id);
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 18.0;
+                    for (s, label) in [
+                        (
+                            Section::Columns,
+                            format!("Columns ({})", self.columns.len()),
+                        ),
+                        (
+                            Section::Indexes,
+                            format!("Indexes ({})", self.indexes.len()),
+                        ),
+                        (
+                            Section::ForeignKeys,
+                            format!("Foreign keys ({})", self.fks.len()),
+                        ),
+                        (Section::Checks, format!("Checks ({})", self.checks.len())),
+                    ] {
+                        let on = self.section == s;
+                        let resp = ui.add(
+                            egui::Button::selectable(
+                                on,
+                                RichText::new(label)
+                                    .font(egui::FontId::new(13.0, theme::medium()))
+                                    .color(if on { p.text } else { p.muted }),
+                            )
+                            .frame(false),
+                        );
+                        if resp.clicked() {
+                            self.section = s;
+                        }
+                        if on {
+                            ui.painter().hline(
+                                resp.rect.x_range(),
+                                resp.rect.bottom() + 5.0,
+                                egui::Stroke::new(2.0, p.accent),
                             );
-                        });
-                }
-            }
-            if let Some(e) = &self.error {
-                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let ready = migration.as_ref().is_ok_and(|m| !m.statements.is_empty());
-                let busy = self.applying.is_some();
-                ui.add_enabled_ui(ready && !busy, |ui| {
-                    let label = if self.old.is_none() {
-                        "Create"
-                    } else {
-                        "Apply"
-                    };
-                    if ui.button(RichText::new(label).strong()).clicked()
-                        && let Ok(edit) = self.edit()
-                    {
-                        self.error = None;
-                        self.applying = Some(backend.run(Command::AlterTable {
-                            profile: self.profile.clone(),
-                            edit,
-                            apply: true,
-                        }));
+                        }
                     }
                 });
-                if ui.button(format!("{} Copy SQL", icon::COPY)).clicked()
-                    && let Ok(m) = &migration
-                {
-                    ui.ctx().copy_text(m.script());
+                ui.add_space(4.0);
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("table-editor-body")
+                    .max_height(260.0)
+                    .show(ui, |ui| match self.section {
+                        Section::Columns => self.columns_ui(ui),
+                        Section::Indexes => self.indexes_ui(ui),
+                        Section::ForeignKeys => self.fks_ui(ui),
+                        Section::Checks => self.checks_ui(ui),
+                    });
+                ui.add_space(8.0);
+                kit::caps(ui, "Pending changes");
+                ui.add_space(2.0);
+                match &migration {
+                    Err(e) => {
+                        ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
+                    }
+                    Ok(m) if m.statements.is_empty() => {
+                        ui.weak("No changes yet.");
+                    }
+                    Ok(m) => {
+                        kit::card(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("table-editor-sql")
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    let mut script = m.script();
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut script)
+                                            .font(egui::TextStyle::Monospace)
+                                            .frame(egui::Frame::NONE)
+                                            .desired_width(f32::INFINITY)
+                                            .interactive(false),
+                                    );
+                                });
+                        });
+                    }
                 }
-                if busy {
-                    ui.spinner();
+                if let Some(e) = &self.error {
+                    ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
                 }
-                if ui.button("Cancel").clicked() {
-                    done = Some(EditorDone::Cancelled);
-                }
+                kit::sheet_footer(ui, |ui| {
+                    let ready = migration.as_ref().is_ok_and(|m| !m.statements.is_empty());
+                    let busy = self.applying.is_some();
+                    ui.add_enabled_ui(ready && !busy, |ui| {
+                        let label = if self.old.is_none() {
+                            "Create"
+                        } else {
+                            "Apply"
+                        };
+                        if ui.add(kit::primary(ui, label)).clicked()
+                            && let Ok(edit) = self.edit()
+                        {
+                            self.error = None;
+                            self.applying = Some(backend.run(Command::AlterTable {
+                                profile: self.profile.clone(),
+                                edit,
+                                apply: true,
+                            }));
+                        }
+                    });
+                    if ui.add(kit::ghost(ui, "Cancel")).clicked() {
+                        done = Some(EditorDone::Cancelled);
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui.button(format!("{} Copy SQL", icon::COPY)).clicked()
+                            && let Ok(m) = &migration
+                        {
+                            ui.ctx().copy_text(m.script());
+                        }
+                    });
+                });
             });
-        });
         done
     }
 
