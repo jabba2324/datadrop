@@ -19,7 +19,6 @@ pub struct Settings {
     /// Files open when the app last closed, reopened at start.
     pub open_files: Vec<PathBuf>,
     pub recent_files: Vec<PathBuf>,
-    pub welcomed: bool,
     /// The profile new tabs use.
     pub last_profile: Option<String>,
     /// Rows kept per result.
@@ -33,7 +32,6 @@ impl Default for Settings {
         Self {
             open_files: vec![],
             recent_files: vec![],
-            welcomed: false,
             last_profile: None,
             max_rows: 1000,
             theme: Theme::System,

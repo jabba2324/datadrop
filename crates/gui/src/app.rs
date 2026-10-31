@@ -252,10 +252,6 @@ impl App {
     }
 
     pub fn user_new_tab(&mut self) {
-        if self.show_welcome() {
-            self.pass_welcome();
-            return;
-        }
         self.new_tab(None);
     }
 
@@ -270,13 +266,11 @@ impl App {
             .position(|d| d.path.as_deref() == Some(path))
         {
             self.active = i;
-            self.pass_welcome();
             return;
         }
         let id = self.next_doc_id();
         match Document::open(id, path, self.default_profile()) {
             Ok(doc) => {
-                self.pass_welcome();
                 // Opening into an empty, untouched tab replaces it.
                 if self
                     .docs
@@ -321,14 +315,9 @@ impl App {
         })
     }
 
-    fn pass_welcome(&mut self) {
-        self.settings.welcomed = true;
-    }
-
     pub fn show_welcome(&self) -> bool {
         self.profile_list == ProfileList::Ready
             && self.profiles.is_empty()
-            && !self.settings.welcomed
             && self.opening_file.is_none()
             && self.pending_db_files.is_empty()
             && self.docs.len() == 1
@@ -425,7 +414,6 @@ impl App {
     }
 
     fn finish_file_open(&mut self, name: String, path: PathBuf) {
-        self.pass_welcome();
         self.settings.last_profile = Some(name.clone());
         if let Some(doc) = self.docs.get_mut(self.active) {
             doc.profile = Some(name.clone());
@@ -544,7 +532,6 @@ impl App {
             Ok(()) => {
                 self.remember_open_files();
                 self.remember_recent(path);
-                self.pass_welcome();
                 true
             }
             Err(e) => {
@@ -813,9 +800,6 @@ impl App {
                 Ok(Output::Profiles { profiles }) => {
                     self.profile_list = ProfileList::Ready;
                     self.profiles = profiles;
-                    if !self.profiles.is_empty() {
-                        self.pass_welcome();
-                    }
                     // Tabs without a connection get one once there is one.
                     let default = self.default_profile();
                     for d in &mut self.docs {
@@ -2347,7 +2331,6 @@ impl App {
                 }
                 self.schema_changed(&name);
                 self.toasts.success(format!("Saved {name}"));
-                self.pass_welcome();
                 if self.settings.last_profile.is_none() {
                     self.settings.last_profile = Some(name.clone());
                 }

@@ -108,6 +108,13 @@ fn welcome_hides_after_the_first_connection() {
         a.profiles.iter().any(|p| p.name == "Shop")
     });
     assert!(!h.state().show_welcome());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(
+        Client::new(&config(dir.path())).execute(Command::ProfileRemove { name: "Shop".into() }),
+    )
+    .unwrap();
+    h.state_mut().refresh_profiles();
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
 }
 
 #[test]
@@ -159,7 +166,7 @@ fn saving_a_sql_file_leaves_the_welcome_screen() {
     assert!(!h.state().show_welcome());
     h.state_mut().request_close_tab(0);
     h.run_steps(2);
-    assert!(!h.state().show_welcome());
+    assert!(h.state().show_welcome());
     assert_eq!(h.state().docs.len(), 1);
     assert!(h.state().docs[0].is_pristine());
 }
@@ -189,11 +196,10 @@ fn new_tab_leaves_the_welcome_screen() {
     h.state_mut().user_new_tab();
     h.run_steps(2);
     assert!(!h.state().show_welcome());
-    assert_eq!(h.state().docs.len(), 1);
-    assert!(h.state().docs[0].is_pristine());
+    assert_eq!(h.state().docs.len(), 2);
     h.state_mut().request_close_tab(0);
     h.run_steps(2);
-    assert!(!h.state().show_welcome());
+    assert!(h.state().show_welcome());
     assert_eq!(h.state().docs.len(), 1);
 }
 
