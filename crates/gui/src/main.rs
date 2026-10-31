@@ -22,6 +22,7 @@ mod table_editor;
 mod theme;
 #[cfg(test)]
 mod ui_tests;
+mod welcome;
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()

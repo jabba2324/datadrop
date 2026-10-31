@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,6 +27,7 @@ use crate::results::{self, ResultsAction};
 use crate::settings::{Settings, Theme};
 use crate::table_editor::{EditorDone, TableEditor};
 use crate::theme;
+use crate::welcome::{self, WelcomeAction};
 
 pub enum ConfirmKind {
     CloseTab(u64),
@@ -50,6 +51,18 @@ pub enum LeftView {
     History,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileList {
+    Pending,
+    Ready,
+    Failed,
+}
+
+struct OpeningFile {
+    task: Option<Task>,
+    path: PathBuf,
+}
+
 enum CatalogState {
     Loading(Option<Task>),
     Ready(Arc<Catalog>),
@@ -68,6 +81,9 @@ pub struct App {
     saved_settings: Settings,
     pub profiles: Vec<ProfileSummary>,
     profiles_task: Option<Task>,
+    profile_list: ProfileList,
+    opening_file: Option<OpeningFile>,
+    pending_db_files: VecDeque<PathBuf>,
     pub docs: Vec<Document>,
     pub active: usize,
     next_id: u64,
@@ -148,6 +164,9 @@ impl App {
             settings,
             profiles: vec![],
             profiles_task: None,
+            profile_list: ProfileList::Pending,
+            opening_file: None,
+            pending_db_files: VecDeque::new(),
             docs: vec![],
             active: 0,
             next_id: 1,
@@ -232,18 +251,32 @@ impl App {
         self.active
     }
 
+    pub fn user_new_tab(&mut self) {
+        if self.show_welcome() {
+            self.pass_welcome();
+            return;
+        }
+        self.new_tab(None);
+    }
+
     pub fn open_path(&mut self, path: &std::path::Path) {
+        if welcome::is_database_file(path) {
+            self.open_database_path(path.to_path_buf());
+            return;
+        }
         if let Some(i) = self
             .docs
             .iter()
             .position(|d| d.path.as_deref() == Some(path))
         {
             self.active = i;
+            self.pass_welcome();
             return;
         }
         let id = self.next_doc_id();
         match Document::open(id, path, self.default_profile()) {
             Ok(doc) => {
+                self.pass_welcome();
                 // Opening into an empty, untouched tab replaces it.
                 if self
                     .docs
@@ -256,12 +289,208 @@ impl App {
                     self.active = self.docs.len() - 1;
                 }
                 self.remember_open_files();
+                self.remember_recent(path.to_path_buf());
             }
             Err(e) => {
                 self.toasts
                     .error(format!("Couldn't open {}: {e}", path.display()));
             }
         }
+    }
+
+    fn remember_recent(&mut self, path: PathBuf) {
+        if !path.is_file() {
+            return;
+        }
+        self.settings.recent_files.retain(|p| p != &path);
+        self.settings.recent_files.insert(0, path);
+        self.settings.recent_files.truncate(8);
+    }
+
+    fn logo_texture(&mut self, ctx: &egui::Context) -> &egui::TextureHandle {
+        self.logo.get_or_insert_with(|| {
+            let icon = theme::icon();
+            ctx.load_texture(
+                "logo",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                ),
+                egui::TextureOptions::LINEAR,
+            )
+        })
+    }
+
+    fn pass_welcome(&mut self) {
+        self.settings.welcomed = true;
+    }
+
+    pub fn show_welcome(&self) -> bool {
+        self.profile_list == ProfileList::Ready
+            && self.profiles.is_empty()
+            && !self.settings.welcomed
+            && self.opening_file.is_none()
+            && self.pending_db_files.is_empty()
+            && self.docs.len() == 1
+            && self.docs[0].is_pristine()
+    }
+
+    fn welcome_action(&mut self, action: WelcomeAction) {
+        match action {
+            WelcomeAction::AddConnection => {
+                self.form = Some(ProfileForm::new(self.keychain()));
+            }
+            WelcomeAction::OpenDatabaseFile => self.open_database_dialog(),
+            WelcomeAction::ConnectUrl => {
+                self.form = Some(ProfileForm::new_url(self.keychain()));
+            }
+            WelcomeAction::OpenRecent(path) => {
+                if welcome::is_database_file(&path) {
+                    self.open_database_path(path);
+                } else {
+                    self.open_path(&path);
+                }
+            }
+        }
+    }
+
+    fn open_database_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Database", &["db", "sqlite", "sqlite3", "duckdb", "ddb"]);
+        if let Some(dir) = self.current_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open_database_path(path);
+        }
+    }
+
+    pub fn open_database_path(&mut self, path: PathBuf) {
+        let path = match canonical_db_path(&path) {
+            Ok(path) if path.is_file() => path,
+            Ok(path) => {
+                self.toasts
+                    .error(format!("{} isn't a file", path.display()));
+                return;
+            }
+            Err(e) => {
+                self.toasts
+                    .error(format!("Couldn't open {}: {e}", path.display()));
+                return;
+            }
+        };
+        let driver = welcome::driver_for_path(&path);
+        if driver == Driver::DuckDb && !cfg!(feature = "duckdb") {
+            self.toasts.error("This build was compiled without DuckDB.");
+            return;
+        }
+        if self.profile_list == ProfileList::Ready
+            && let Some(name) = self.file_profile_named(&path)
+        {
+            self.finish_file_open(name, path);
+            return;
+        }
+        if self.profile_list == ProfileList::Pending || self.opening_file.is_some() {
+            if !self.pending_db_files.iter().any(|queued| queued == &path) {
+                self.pending_db_files.push_back(path);
+            }
+            return;
+        }
+        self.start_db_save(path, driver);
+    }
+
+    fn start_db_save(&mut self, path: PathBuf, driver: Driver) {
+        let name = self.unused_profile_name(&welcome::profile_name_from_path(&path));
+        let profile = datadrop_core::Profile {
+            name,
+            driver,
+            database: path.display().to_string(),
+            ..datadrop_core::Profile::default()
+        };
+        self.opening_file = Some(OpeningFile {
+            task: Some(self.backend.run(Command::ProfileSave {
+                profile,
+                previous_name: None,
+                overwrite: false,
+            })),
+            path,
+        });
+    }
+
+    fn file_profile_named(&self, path: &std::path::Path) -> Option<String> {
+        self.profiles
+            .iter()
+            .find(|p| p.driver.is_file() && same_db_file(&p.target, path))
+            .map(|p| p.name.clone())
+    }
+
+    fn finish_file_open(&mut self, name: String, path: PathBuf) {
+        self.pass_welcome();
+        self.settings.last_profile = Some(name.clone());
+        if let Some(doc) = self.docs.get_mut(self.active) {
+            doc.profile = Some(name.clone());
+        }
+        if !self.profiles.iter().any(|p| p.name == name) {
+            self.profiles.push(ProfileSummary {
+                name: name.clone(),
+                driver: welcome::driver_for_path(&path),
+                target: path.display().to_string(),
+            });
+        }
+        self.remember_recent(path);
+        self.left = LeftView::Connections;
+        self.browser.reveal(&name);
+    }
+
+    fn drain_pending_db_files(&mut self) {
+        if self.profile_list == ProfileList::Pending || self.opening_file.is_some() {
+            return;
+        }
+        while let Some(path) = self.pending_db_files.pop_front() {
+            if self.profile_list == ProfileList::Ready
+                && let Some(name) = self.file_profile_named(&path)
+            {
+                self.finish_file_open(name, path);
+                continue;
+            }
+            let driver = welcome::driver_for_path(&path);
+            self.start_db_save(path, driver);
+            return;
+        }
+    }
+
+    fn poll_opening_file(&mut self) {
+        let Some(opening) = &mut self.opening_file else {
+            return;
+        };
+        let Some(result) = poll(&mut opening.task) else {
+            return;
+        };
+        let path = opening.path.clone();
+        self.opening_file = None;
+        match result {
+            Ok(Output::ProfileSaved { name }) => {
+                self.finish_file_open(name.clone(), path);
+                self.refresh_profiles();
+                self.toasts.success(format!("Opened {name}"));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.toasts.error(e.to_string());
+            }
+        }
+        self.drain_pending_db_files();
+    }
+
+    fn unused_profile_name(&self, base: &str) -> String {
+        let store = self.backend.client.store();
+        if !store.exists(base) {
+            return base.to_owned();
+        }
+        (2..1000)
+            .map(|n| format!("{base} {n}"))
+            .find(|name| !store.exists(name))
+            .unwrap_or_else(|| format!("{base} copy"))
     }
 
     fn remember_open_files(&mut self) {
@@ -271,6 +500,7 @@ impl App {
     fn open_dialog(&mut self) {
         let mut dialog = rfd::FileDialog::new()
             .add_filter("SQL", &["sql"])
+            .add_filter("Database", &["db", "sqlite", "sqlite3", "duckdb", "ddb"])
             .add_filter("All files", &["*"]);
         if let Some(dir) = self.current_dir() {
             dialog = dialog.set_directory(dir);
@@ -313,6 +543,8 @@ impl App {
         match self.docs[i].save_to(&path) {
             Ok(()) => {
                 self.remember_open_files();
+                self.remember_recent(path);
+                self.pass_welcome();
                 true
             }
             Err(e) => {
@@ -579,7 +811,11 @@ impl App {
         if let Some(r) = poll(&mut self.profiles_task) {
             match r {
                 Ok(Output::Profiles { profiles }) => {
+                    self.profile_list = ProfileList::Ready;
                     self.profiles = profiles;
+                    if !self.profiles.is_empty() {
+                        self.pass_welcome();
+                    }
                     // Tabs without a connection get one once there is one.
                     let default = self.default_profile();
                     for d in &mut self.docs {
@@ -587,14 +823,25 @@ impl App {
                             d.profile = default.clone();
                         }
                     }
+                    self.drain_pending_db_files();
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    if self.profile_list != ProfileList::Ready {
+                        self.profile_list = ProfileList::Failed;
+                    }
+                    self.drain_pending_db_files();
+                }
                 Err(e) => {
+                    if self.profile_list != ProfileList::Ready {
+                        self.profile_list = ProfileList::Failed;
+                    }
                     self.toasts
                         .error(format!("Couldn't read the connections: {e}"));
+                    self.drain_pending_db_files();
                 }
             }
         }
+        self.poll_opening_file();
         if let Some(r) = poll(&mut self.delete_task) {
             match r {
                 Ok(Output::ProfileRemoved { name }) => {
@@ -795,9 +1042,7 @@ impl App {
                 self.save(self.active, false);
             }
             Some(Shortcut::Open) => self.open_dialog(),
-            Some(Shortcut::New) => {
-                self.new_tab(None);
-            }
+            Some(Shortcut::New) => self.user_new_tab(),
             Some(Shortcut::Close) => self.request_close_tab(self.active),
             Some(Shortcut::Find) => self.open_find(ctx, false),
             Some(Shortcut::Format) => self.format_sql(ctx),
@@ -928,7 +1173,7 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("New tab").clicked() {
-                    self.new_tab(None);
+                    self.user_new_tab();
                 }
                 if ui.button("Open…").clicked() {
                     self.open_dialog();
@@ -1030,7 +1275,10 @@ impl App {
             });
             ui.menu_button("Connections", |ui| {
                 if ui.button("Add a connection…").clicked() {
-                    self.form = Some(ProfileForm::new(self.keychain()));
+                    self.welcome_action(WelcomeAction::AddConnection);
+                }
+                if ui.button("Open a database file…").clicked() {
+                    self.open_database_dialog();
                 }
                 if ui.button("Refresh").clicked() {
                     self.refresh_profiles();
@@ -1162,7 +1410,7 @@ impl App {
                             .on_hover_text("New tab")
                             .clicked()
                         {
-                            self.new_tab(None);
+                            self.user_new_tab();
                         }
                     });
                 });
@@ -1185,17 +1433,7 @@ impl App {
         let i = self.active;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            let logo = self.logo.get_or_insert_with(|| {
-                let icon = theme::icon();
-                ui.ctx().load_texture(
-                    "logo",
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [icon.width as usize, icon.height as usize],
-                        &icon.rgba,
-                    ),
-                    egui::TextureOptions::LINEAR,
-                )
-            });
+            let logo = self.logo_texture(ui.ctx()).clone();
             ui.add(egui::Image::new(egui::load::SizedTexture::new(
                 logo.id(),
                 egui::vec2(26.0, 26.0),
@@ -1546,7 +1784,7 @@ impl App {
 
     fn browser_action(&mut self, action: BrowserAction) {
         match action {
-            BrowserAction::Add => self.form = Some(ProfileForm::new(self.keychain())),
+            BrowserAction::Add => self.welcome_action(WelcomeAction::AddConnection),
             BrowserAction::NewTab(p) => {
                 self.new_tab(Some(p));
             }
@@ -2109,8 +2347,15 @@ impl App {
                 }
                 self.schema_changed(&name);
                 self.toasts.success(format!("Saved {name}"));
+                self.pass_welcome();
                 if self.settings.last_profile.is_none() {
-                    self.settings.last_profile = Some(name);
+                    self.settings.last_profile = Some(name.clone());
+                }
+                if let Ok(p) = self.backend.client.store().get_without_secrets(&name)
+                    && p.driver.is_file()
+                    && !p.database.is_empty()
+                {
+                    self.remember_recent(PathBuf::from(p.database));
                 }
                 self.refresh_profiles();
             }
@@ -2328,6 +2573,13 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg))
             .show(ui, |ui| {
+                if self.show_welcome() {
+                    let logo = self.logo_texture(ui.ctx()).clone();
+                    if let Some(action) = welcome::ui(ui, &self.settings.recent_files, &logo) {
+                        self.welcome_action(action);
+                    }
+                    return;
+                }
                 self.tab_strip(ui);
                 self.transaction_bar(ui);
                 self.find_bar(ui);
@@ -2401,6 +2653,26 @@ impl eframe::App for App {
         self.save_settings_if_changed();
         self.backend.shutdown();
     }
+}
+
+fn canonical_db_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(path)
+}
+
+fn same_db_file(stored: &str, opened: &std::path::Path) -> bool {
+    let stored = std::path::Path::new(stored);
+    stored == opened || canonical_db_path(stored).is_ok_and(|path| path == opened)
 }
 
 /// "1 change", "3 changes".

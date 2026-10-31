@@ -61,7 +61,6 @@ These appear in the designs, but the app doesn't have them yet:
 
 | Feature | Screens | Issue |
 |---------|---------|-------|
-| Welcome screen and recent files | 01 | #1 |
 | Command palette (⌘K) | 09 | #2 |
 | Errors shown in the editor, Jump to line, "did you mean" | 04 | #3 |
 | Messages view with server notices | 04 | #4 |
