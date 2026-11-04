@@ -4,7 +4,7 @@ use datadrop_core::{Client, Command, ConfigDir, Driver, Keychain, Profile};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
-use crate::app::{App, ConfirmKind};
+use crate::app::{App, ConfirmKind, canonical_db_path};
 
 /// The keychain the tests use: in memory, shared by every client in a test process.
 fn keychain() -> Keychain {
@@ -87,8 +87,10 @@ fn welcome_opens_a_database_file() {
         .store()
         .get("shop")
         .unwrap();
-    let canonical = std::fs::canonicalize(&db).unwrap();
-    assert_eq!(std::path::Path::new(&saved.database), canonical.as_path());
+    assert_eq!(
+        std::path::Path::new(&saved.database),
+        canonical_db_path(&db).unwrap().as_path()
+    );
 }
 
 #[test]

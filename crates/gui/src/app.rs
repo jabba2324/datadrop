@@ -2638,7 +2638,7 @@ impl eframe::App for App {
     }
 }
 
-fn canonical_db_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
+pub(crate) fn canonical_db_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
     let path = std::fs::canonicalize(path)?;
     #[cfg(windows)]
     {
