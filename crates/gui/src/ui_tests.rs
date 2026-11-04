@@ -122,6 +122,38 @@ fn welcome_hides_after_the_first_connection() {
 }
 
 #[test]
+fn deleting_a_connection_clears_the_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    save_profile(
+        dir.path(),
+        Profile {
+            name: "Shop".into(),
+            driver: Driver::Postgres,
+            host: "db.internal".into(),
+            ..Profile::default()
+        },
+    );
+    let mut h = app(dir.path());
+    until(&mut h, "the profile", |a| {
+        a.profiles.iter().any(|p| p.name == "Shop")
+    });
+    assert_eq!(h.state().docs[0].profile.as_deref(), Some("Shop"));
+    h.state_mut().settings.last_profile = Some("Shop".into());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(
+        Client::new(&config(dir.path())).execute(Command::ProfileRemove {
+            name: "Shop".into(),
+        }),
+    )
+    .unwrap();
+    h.state_mut().refresh_profiles();
+    until(&mut h, "the connection to go", |a| {
+        a.profiles.is_empty() && a.docs[0].profile.is_none()
+    });
+    assert!(h.state().settings.last_profile.is_none());
+}
+
+#[test]
 fn duckdb_file_is_refused_without_the_feature() {
     if cfg!(feature = "duckdb") {
         return;

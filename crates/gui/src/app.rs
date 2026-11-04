@@ -238,7 +238,6 @@ impl App {
             .clone()
             .filter(known)
             .or_else(|| self.profiles.first().map(|p| p.name.clone()))
-            .or_else(|| self.settings.last_profile.clone())
     }
 
     pub fn new_tab(&mut self, profile: Option<String>) -> usize {
@@ -747,6 +746,31 @@ impl App {
         self.catalogs.remove(profile);
     }
 
+    fn drop_unknown_profiles(&mut self) {
+        let known: Vec<String> = self.profiles.iter().map(|p| p.name.clone()).collect();
+        if self
+            .settings
+            .last_profile
+            .as_deref()
+            .is_some_and(|n| !known.iter().any(|k| k == n))
+        {
+            self.settings.last_profile = None;
+        }
+        let mut sessions = Vec::new();
+        for d in &mut self.docs {
+            if d.profile
+                .as_deref()
+                .is_some_and(|n| !known.iter().any(|k| k == n))
+            {
+                d.profile = None;
+                sessions.push(d.session());
+            }
+        }
+        for session in sessions {
+            self.backend.fire(Command::SessionClose { session });
+        }
+    }
+
     fn poll_tasks(&mut self) {
         let mut close = vec![];
         for d in &mut self.docs {
@@ -800,6 +824,7 @@ impl App {
                 Ok(Output::Profiles { profiles }) => {
                     self.profile_list = ProfileList::Ready;
                     self.profiles = profiles;
+                    self.drop_unknown_profiles();
                     // Tabs without a connection get one once there is one.
                     let default = self.default_profile();
                     for d in &mut self.docs {
@@ -829,7 +854,9 @@ impl App {
         if let Some(r) = poll(&mut self.delete_task) {
             match r {
                 Ok(Output::ProfileRemoved { name }) => {
+                    self.profiles.retain(|p| p.name != name);
                     self.schema_changed(&name);
+                    self.drop_unknown_profiles();
                     self.toasts.success(format!("Deleted {name}"));
                 }
                 Ok(_) => {}
