@@ -110,7 +110,9 @@ fn welcome_hides_after_the_first_connection() {
     assert!(!h.state().show_welcome());
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(
-        Client::new(&config(dir.path())).execute(Command::ProfileRemove { name: "Shop".into() }),
+        Client::new(&config(dir.path())).execute(Command::ProfileRemove {
+            name: "Shop".into(),
+        }),
     )
     .unwrap();
     h.state_mut().refresh_profiles();
