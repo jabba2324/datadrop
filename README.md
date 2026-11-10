@@ -176,7 +176,8 @@ browsing.
 - **On Linux**, the desktop app needs the X11/Wayland development headers:
   `libxkbcommon`, `libwayland` and `libgl` (on Debian or Ubuntu:
   `sudo apt install libxkbcommon-dev libwayland-dev libgl1-mesa-dev`). SQL Server
-  support builds OpenSSL from source there, which needs `perl` and `make`.
+  support builds OpenSSL from source there, which needs `perl` and `make`. Fedora
+  splits Perl into small packages, so install them all: `sudo dnf install perl-core`.
 - **Docker**, to run the database tests against real servers (optional).
 
 ### Build and run
