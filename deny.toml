@@ -19,6 +19,11 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "merged into zbus 6; waiting on accesskit/ashpd" },
     { id = "RUSTSEC-2026-0371", reason = "merged into zbus 6; waiting on accesskit/ashpd" },
     { id = "RUSTSEC-2026-0372", reason = "merged into zbus 6; waiting on accesskit/ashpd" },
+    # libsqlite3-sys (SQLite before 3.54): a crafted database and `-wal` file pair can
+    # make queries return uninitialised memory. Local only: the user has to open the
+    # files. Fixed in libsqlite3-sys 0.39, but sqlx-sqlite 0.9.0 needs <0.38. Remove
+    # when sqlx allows 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "local, needs a crafted file pair; waiting on sqlx for libsqlite3-sys 0.39" },
 ]
 
 [licenses]
