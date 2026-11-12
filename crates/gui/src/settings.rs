@@ -18,6 +18,7 @@ pub enum Theme {
 pub struct Settings {
     /// Files open when the app last closed, reopened at start.
     pub open_files: Vec<PathBuf>,
+    /// Last files opened, shown on the welcome screen.
     pub recent_files: Vec<PathBuf>,
     /// The profile new tabs use.
     pub last_profile: Option<String>,

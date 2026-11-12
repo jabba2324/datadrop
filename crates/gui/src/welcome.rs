@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use datadrop_core::Driver;
@@ -341,24 +342,42 @@ pub fn profile_name_from_path(path: &Path) -> String {
     }
 }
 
-pub fn driver_for_path(path: &Path) -> Driver {
-    match path
-        .extension()
+fn extension(path: &Path) -> Option<String> {
+    path.extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase())
-        .as_deref()
-    {
+}
+
+pub fn driver_for_path(path: &Path) -> Driver {
+    match extension(path).as_deref() {
         Some("duckdb" | "ddb") => Driver::DuckDb,
         _ => Driver::Sqlite,
     }
 }
 
+pub fn driver_for_file(path: &Path) -> std::io::Result<Driver> {
+    match extension(path).as_deref() {
+        Some("duckdb" | "ddb") => Ok(Driver::DuckDb),
+        Some("db") => driver_from_header(path),
+        _ => Ok(Driver::Sqlite),
+    }
+}
+
+fn driver_from_header(path: &Path) -> std::io::Result<Driver> {
+    let mut buf = [0u8; 16];
+    let n = std::fs::File::open(path)?.read(&mut buf)?;
+    if n >= 16 && buf == *b"SQLite format 3\0" {
+        return Ok(Driver::Sqlite);
+    }
+    if n >= 4 && &buf[..4] == b"DUCK" {
+        return Ok(Driver::DuckDb);
+    }
+    Ok(Driver::Sqlite)
+}
+
 pub fn is_database_file(path: &Path) -> bool {
     matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref(),
+        extension(path).as_deref(),
         Some("db" | "sqlite" | "sqlite3" | "duckdb" | "ddb")
     )
 }
@@ -375,6 +394,24 @@ mod tests {
         assert_eq!(driver_for_path(Path::new("notes.duckdb")), Driver::DuckDb);
         assert_eq!(driver_for_path(Path::new("shop.db")), Driver::Sqlite);
         assert!(!is_database_file(Path::new("orders.sql")));
+    }
+
+    #[test]
+    fn driver_from_a_db_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = dir.path().join("shop.db");
+        let mut sqlite_bytes = b"SQLite format 3\0".to_vec();
+        sqlite_bytes.extend_from_slice(&[0; 8]);
+        std::fs::write(&sqlite, sqlite_bytes).unwrap();
+        assert_eq!(driver_for_file(&sqlite).unwrap(), Driver::Sqlite);
+
+        let duck = dir.path().join("notes.db");
+        std::fs::write(&duck, b"DUCK").unwrap();
+        assert_eq!(driver_for_file(&duck).unwrap(), Driver::DuckDb);
+
+        let empty = dir.path().join("new.db");
+        std::fs::write(&empty, "").unwrap();
+        assert_eq!(driver_for_file(&empty).unwrap(), Driver::Sqlite);
     }
 
     #[test]

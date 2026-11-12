@@ -225,11 +225,33 @@ fn opening_two_database_files_keeps_both() {
 }
 
 #[test]
+fn opening_a_file_keeps_a_busy_tab_on_its_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let shop = dir.path().join("shop.sqlite");
+    let other = dir.path().join("other.sqlite");
+    std::fs::write(&shop, "").unwrap();
+    std::fs::write(&other, "").unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.state_mut().open_database_path(shop);
+    until(&mut h, "shop", |a| {
+        a.profiles.iter().any(|p| p.name == "shop")
+    });
+    let i = h.state().active;
+    h.state_mut().docs[i].in_transaction = true;
+    h.state_mut().open_database_path(other);
+    until(&mut h, "other", |a| {
+        a.profiles.iter().any(|p| p.name == "other")
+    });
+    assert_eq!(h.state().docs[i].profile.as_deref(), Some("shop"));
+}
+
+#[test]
 fn new_tab_leaves_the_welcome_screen() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = app(dir.path());
     until(&mut h, "the welcome screen", |a| a.show_welcome());
-    h.state_mut().user_new_tab();
+    h.state_mut().new_tab(None);
     h.run_steps(2);
     assert!(!h.state().show_welcome());
     assert_eq!(h.state().docs.len(), 2);

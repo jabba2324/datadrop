@@ -250,10 +250,6 @@ impl App {
         self.active
     }
 
-    pub fn user_new_tab(&mut self) {
-        self.new_tab(None);
-    }
-
     pub fn open_path(&mut self, path: &std::path::Path) {
         if welcome::is_database_file(path) {
             self.open_database_path(path.to_path_buf());
@@ -367,7 +363,9 @@ impl App {
                 return;
             }
         };
-        let driver = welcome::driver_for_path(&path);
+        let Some(driver) = self.driver_for_db_file(&path) else {
+            return;
+        };
         if driver == Driver::DuckDb && !cfg!(feature = "duckdb") {
             self.toasts.error("This build was compiled without DuckDB.");
             return;
@@ -414,19 +412,37 @@ impl App {
 
     fn finish_file_open(&mut self, name: String, path: PathBuf) {
         self.settings.last_profile = Some(name.clone());
-        if let Some(doc) = self.docs.get_mut(self.active) {
-            doc.profile = Some(name.clone());
+        let reuse = self.docs.get(self.active).is_some_and(|d| {
+            d.is_pristine() && !d.in_transaction && d.profile.as_deref().is_none_or(|p| p == name)
+        });
+        if reuse {
+            self.docs[self.active].profile = Some(name.clone());
+        } else {
+            self.new_tab(Some(name.clone()));
         }
-        if !self.profiles.iter().any(|p| p.name == name) {
+        if !self.profiles.iter().any(|p| p.name == name)
+            && let Ok(driver) = welcome::driver_for_file(&path)
+        {
             self.profiles.push(ProfileSummary {
                 name: name.clone(),
-                driver: welcome::driver_for_path(&path),
+                driver,
                 target: path.display().to_string(),
             });
         }
         self.remember_recent(path);
         self.left = LeftView::Connections;
         self.browser.reveal(&name);
+    }
+
+    fn driver_for_db_file(&mut self, path: &std::path::Path) -> Option<Driver> {
+        match welcome::driver_for_file(path) {
+            Ok(driver) => Some(driver),
+            Err(e) => {
+                self.toasts
+                    .error(format!("Couldn't open {}: {e}", path.display()));
+                None
+            }
+        }
     }
 
     fn drain_pending_db_files(&mut self) {
@@ -440,7 +456,9 @@ impl App {
                 self.finish_file_open(name, path);
                 continue;
             }
-            let driver = welcome::driver_for_path(&path);
+            let Some(driver) = self.driver_for_db_file(&path) else {
+                continue;
+            };
             self.start_db_save(path, driver);
             return;
         }
@@ -1053,7 +1071,9 @@ impl App {
                 self.save(self.active, false);
             }
             Some(Shortcut::Open) => self.open_dialog(),
-            Some(Shortcut::New) => self.user_new_tab(),
+            Some(Shortcut::New) => {
+                self.new_tab(None);
+            }
             Some(Shortcut::Close) => self.request_close_tab(self.active),
             Some(Shortcut::Find) => self.open_find(ctx, false),
             Some(Shortcut::Format) => self.format_sql(ctx),
@@ -1184,7 +1204,7 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("New tab").clicked() {
-                    self.user_new_tab();
+                    self.new_tab(None);
                 }
                 if ui.button("Open…").clicked() {
                     self.open_dialog();
@@ -1286,7 +1306,7 @@ impl App {
             });
             ui.menu_button("Connections", |ui| {
                 if ui.button("Add a connection…").clicked() {
-                    self.welcome_action(WelcomeAction::AddConnection);
+                    self.form = Some(ProfileForm::new(self.keychain()));
                 }
                 if ui.button("Open a database file…").clicked() {
                     self.open_database_dialog();
@@ -1421,7 +1441,7 @@ impl App {
                             .on_hover_text("New tab")
                             .clicked()
                         {
-                            self.user_new_tab();
+                            self.new_tab(None);
                         }
                     });
                 });
@@ -1795,7 +1815,7 @@ impl App {
 
     fn browser_action(&mut self, action: BrowserAction) {
         match action {
-            BrowserAction::Add => self.welcome_action(WelcomeAction::AddConnection),
+            BrowserAction::Add => self.form = Some(ProfileForm::new(self.keychain())),
             BrowserAction::NewTab(p) => {
                 self.new_tab(Some(p));
             }
