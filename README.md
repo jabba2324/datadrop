@@ -187,6 +187,14 @@ cargo run -p datadrop-cli -- --help         # the command line
 cargo build --release                       # both, in target/release
 ```
 
+Install [cargo-watch](https://github.com/watchexec/cargo-watch) (`cargo install cargo-watch`) to rebuild and restart the window on save:
+
+```sh
+cargo watch -x 'run -p datadrop-gui'
+```
+
+Use `DATADROP_HOME=/tmp/datadrop-tmp` in front of either command to keep a trial config out of `~/.datadrop`.
+
 Two features choose what's compiled in:
 
 - `sqlserver` (on by default): SQL Server. Leave it out with `--no-default-features`.

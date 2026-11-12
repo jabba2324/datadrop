@@ -60,6 +60,7 @@ enum Load<T> {
 pub struct Browser {
     /// An SSH server whose key isn't known came up while loading.
     pub untrusted: Option<TrustPrompt>,
+    reveal: Option<String>,
     schemas: HashMap<String, Load<Vec<String>>>,
     models: HashMap<(String, String), Load<Arc<SchemaModel>>>,
 }
@@ -151,6 +152,10 @@ impl Browser {
         self.models.clear();
     }
 
+    pub fn reveal(&mut self, name: &str) {
+        self.reveal = Some(name.to_owned());
+    }
+
     /// Drop everything loaded for a profile, so it's read again when shown.
     pub fn forget(&mut self, profile: &str) {
         self.schemas.remove(profile);
@@ -164,32 +169,39 @@ impl Browser {
         backend: &Backend,
     ) -> Option<BrowserAction> {
         let mut action = None;
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            kit::caps(
-                ui,
-                &match profiles.len() {
-                    0 => String::new(),
-                    1 => "1 connection".into(),
-                    n => format!("{n} connections"),
-                },
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(kit::ghost(ui, icon::PLUS))
-                    .on_hover_text("Add a connection")
-                    .clicked()
-                {
-                    action = Some(BrowserAction::Add);
-                }
+        if !profiles.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                kit::caps(
+                    ui,
+                    &match profiles.len() {
+                        1 => "1 connection".into(),
+                        n => format!("{n} connections"),
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(kit::ghost(ui, icon::PLUS))
+                        .on_hover_text("Add a connection")
+                        .clicked()
+                    {
+                        action = Some(BrowserAction::Add);
+                    }
+                });
             });
-        });
-        ui.add_space(2.0);
+            ui.add_space(2.0);
+        }
         if profiles.is_empty() {
-            ui.add_space(40.0);
+            ui.add_space(80.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("No connections yet.").color(theme::colors(ui).muted));
-                ui.add_space(8.0);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Add one to browse its tables here.")
+                        .color(theme::colors(ui).faint)
+                        .size(12.0),
+                );
+                ui.add_space(12.0);
                 if ui
                     .add(kit::primary(ui, format!("{} Add a connection", icon::PLUS)))
                     .clicked()
@@ -220,8 +232,13 @@ impl Browser {
     ) -> Option<BrowserAction> {
         let mut action = None;
         let (color, _) = kit::driver_style(p.driver, ui.visuals().dark_mode);
+        let force_open = self.reveal.as_deref() == Some(p.name.as_str());
+        if force_open {
+            self.reveal = None;
+        }
         let header = egui::CollapsingHeader::new(item(ui, icon::DATABASE, color, &p.name, true))
             .id_salt(("profile", &p.name))
+            .open(force_open.then_some(true))
             .show(ui, |ui| {
                 let load = self.schemas.entry(p.name.clone()).or_insert_with(|| {
                     Load::Loading(Some(backend.run(Command::Schemas {

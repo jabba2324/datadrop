@@ -4,7 +4,7 @@ use datadrop_core::{Client, Command, ConfigDir, Driver, Keychain, Profile};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
-use crate::app::{App, ConfirmKind};
+use crate::app::{App, ConfirmKind, canonical_db_path};
 
 /// The keychain the tests use: in memory, shared by every client in a test process.
 fn keychain() -> Keychain {
@@ -50,12 +50,262 @@ fn save_profile(dir: &std::path::Path, profile: Profile) {
 fn first_run_offers_to_add_a_connection() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = app(dir.path());
-    h.run_steps(5);
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.get_by_label("Welcome to DataDrop");
     h.get_by_label("No connections yet.");
-    h.get_by_label_contains("Add a connection").click();
+    h.get_by_label("Add a connection").click();
     h.run_steps(3);
     assert!(h.state().form.is_some());
     h.get_by_label("New connection");
+}
+
+#[test]
+fn welcome_opens_the_form_for_a_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.get_by_label("Connect with a URL").click();
+    h.run_steps(3);
+    let form = h.state().form.as_ref().expect("URL card opens the form");
+    assert!(form.use_url);
+}
+
+#[test]
+fn welcome_opens_a_database_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("shop.sqlite");
+    std::fs::write(&db, "").unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.state_mut().open_database_path(db.clone());
+    until(&mut h, "the file profile", |a| {
+        a.profiles.iter().any(|p| p.name == "shop")
+    });
+    assert!(!h.state().show_welcome());
+    assert_eq!(h.state().docs[0].profile.as_deref(), Some("shop"));
+    let saved = Client::new(&config(dir.path()))
+        .store()
+        .get("shop")
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(&saved.database),
+        canonical_db_path(&db).unwrap().as_path()
+    );
+}
+
+#[test]
+fn welcome_hides_after_the_first_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    save_profile(
+        dir.path(),
+        Profile {
+            name: "Shop".into(),
+            driver: Driver::Postgres,
+            host: "db.internal".into(),
+            ..Profile::default()
+        },
+    );
+    let mut h = app(dir.path());
+    until(&mut h, "the profile", |a| {
+        a.profiles.iter().any(|p| p.name == "Shop")
+    });
+    assert!(!h.state().show_welcome());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(
+        Client::new(&config(dir.path())).execute(Command::ProfileRemove {
+            name: "Shop".into(),
+        }),
+    )
+    .unwrap();
+    h.state_mut().refresh_profiles();
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+}
+
+#[test]
+fn deleting_a_connection_clears_the_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    save_profile(
+        dir.path(),
+        Profile {
+            name: "Shop".into(),
+            driver: Driver::Postgres,
+            host: "db.internal".into(),
+            ..Profile::default()
+        },
+    );
+    let mut h = app(dir.path());
+    until(&mut h, "the profile", |a| {
+        a.profiles.iter().any(|p| p.name == "Shop")
+    });
+    assert_eq!(h.state().docs[0].profile.as_deref(), Some("Shop"));
+    h.state_mut().settings.last_profile = Some("Shop".into());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(
+        Client::new(&config(dir.path())).execute(Command::ProfileRemove {
+            name: "Shop".into(),
+        }),
+    )
+    .unwrap();
+    h.state_mut().refresh_profiles();
+    until(&mut h, "the connection to go", |a| {
+        a.profiles.is_empty() && a.docs[0].profile.is_none()
+    });
+    assert!(h.state().settings.last_profile.is_none());
+}
+
+#[test]
+fn duckdb_file_is_refused_without_the_feature() {
+    if cfg!(feature = "duckdb") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("notes.duckdb");
+    std::fs::write(&db, "").unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.state_mut().open_database_path(db);
+    h.run_steps(5);
+    assert!(h.state().profiles.is_empty());
+    assert!(h.state().show_welcome());
+}
+
+#[test]
+fn welcome_opens_a_recent_sql_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("orders.sql");
+    std::fs::write(&file, "select 1;\n").unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.state_mut().settings.recent_files = vec![file.clone()];
+    h.run_steps(2);
+    h.get_by_label("orders.sql").click();
+    h.run_steps(2);
+    assert_eq!(h.state().docs[0].path.as_deref(), Some(file.as_path()));
+    assert_eq!(h.state().docs[0].text, "select 1;\n");
+    assert!(!h.state().show_welcome());
+    assert_eq!(h.state().docs.len(), 1);
+}
+
+#[test]
+fn saving_a_sql_file_leaves_the_welcome_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("orders.sql");
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    {
+        let a = h.state_mut();
+        a.docs[0].text = "select 1;\n".into();
+        a.docs[0].path = Some(file);
+        assert!(a.save(0, false));
+    }
+    h.run_steps(2);
+    assert!(!h.state().show_welcome());
+    h.state_mut().request_close_tab(0);
+    h.run_steps(2);
+    assert!(h.state().show_welcome());
+    assert_eq!(h.state().docs.len(), 1);
+    assert!(h.state().docs[0].is_pristine());
+}
+
+#[test]
+fn opening_two_database_files_keeps_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = dir.path().join("alpha.sqlite");
+    let beta = dir.path().join("beta.sqlite");
+    std::fs::write(&alpha, "").unwrap();
+    std::fs::write(&beta, "").unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.state_mut().open_database_path(alpha);
+    h.state_mut().open_database_path(beta);
+    until(&mut h, "both files", |a| {
+        a.profiles.iter().any(|p| p.name == "alpha") && a.profiles.iter().any(|p| p.name == "beta")
+    });
+    assert!(!h.state().show_welcome());
+}
+
+#[test]
+fn opening_a_file_keeps_a_busy_tab_on_its_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let shop = dir.path().join("shop.sqlite");
+    let other = dir.path().join("other.sqlite");
+    std::fs::write(&shop, "").unwrap();
+    std::fs::write(&other, "").unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.state_mut().open_database_path(shop);
+    until(&mut h, "shop", |a| {
+        a.profiles.iter().any(|p| p.name == "shop")
+    });
+    let i = h.state().active;
+    h.state_mut().docs[i].in_transaction = true;
+    h.state_mut().open_database_path(other);
+    until(&mut h, "other", |a| {
+        a.profiles.iter().any(|p| p.name == "other")
+    });
+    assert_eq!(h.state().docs[i].profile.as_deref(), Some("shop"));
+}
+
+#[test]
+fn new_tab_leaves_the_welcome_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.state_mut().new_tab(None);
+    h.run_steps(2);
+    assert!(!h.state().show_welcome());
+    assert_eq!(h.state().docs.len(), 2);
+    h.state_mut().request_close_tab(0);
+    h.run_steps(2);
+    assert!(h.state().show_welcome());
+    assert_eq!(h.state().docs.len(), 1);
+}
+
+#[test]
+fn a_failed_profile_load_keeps_the_editor() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("profiles"), "not a directory").unwrap();
+    let mut h = app(dir.path());
+    for _ in 0..40 {
+        h.run_steps(1);
+        assert!(
+            !h.state().show_welcome(),
+            "a failed load opened the welcome screen"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    h.get_by_label("Untitled 1");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_same_database_file_is_one_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("shop.sqlite");
+    std::fs::write(&real, "").unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+    save_profile(
+        dir.path(),
+        Profile {
+            name: "shop".into(),
+            driver: Driver::Sqlite,
+            database: alias.join("shop.sqlite").display().to_string(),
+            ..Profile::default()
+        },
+    );
+    let mut h = app(dir.path());
+    until(&mut h, "the profile", |a| {
+        a.profiles.iter().any(|p| p.name == "shop")
+    });
+    h.state_mut().open_database_path(real);
+    for _ in 0..40 {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let names: Vec<_> = h.state().profiles.iter().map(|p| p.name.clone()).collect();
+    assert_eq!(names, vec!["shop".to_string()]);
+    assert_eq!(h.state().docs[0].profile.as_deref(), Some("shop"));
 }
 
 #[test]
@@ -84,6 +334,7 @@ fn the_form_saves_a_profile() {
     until(&mut h, "the profile to save", |a| {
         a.form.is_none() && a.profiles.iter().any(|p| p.name == "Shop")
     });
+    assert!(!h.state().show_welcome());
     let saved = Client::new(&config(dir.path()))
         .store()
         .get("Shop")
