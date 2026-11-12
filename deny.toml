@@ -19,6 +19,10 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "merged into zbus 6; waiting on accesskit/ashpd" },
     { id = "RUSTSEC-2026-0371", reason = "merged into zbus 6; waiting on accesskit/ashpd" },
     { id = "RUSTSEC-2026-0372", reason = "merged into zbus 6; waiting on accesskit/ashpd" },
+    # libsqlite3-sys: SQLite before 3.54.0 can leak page-cache memory from a crafted
+    # db + mismatched -wal. sqlx 0.9.0 (latest) pins libsqlite3-sys <0.38; 0.39 is the
+    # fix. Drop when sqlx allows 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "sqlx 0.9.0 pins libsqlite3-sys <0.38; no sqlx with 0.39 yet" },
 ]
 
 [licenses]
