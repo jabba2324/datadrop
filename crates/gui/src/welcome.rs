@@ -357,9 +357,8 @@ pub fn driver_for_path(path: &Path) -> Driver {
 
 pub fn driver_for_file(path: &Path) -> std::io::Result<Driver> {
     match extension(path).as_deref() {
-        Some("duckdb" | "ddb") => Ok(Driver::DuckDb),
         Some("db") => driver_from_header(path),
-        _ => Ok(Driver::Sqlite),
+        _ => Ok(driver_for_path(path)),
     }
 }
 
