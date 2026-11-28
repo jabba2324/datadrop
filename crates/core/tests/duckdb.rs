@@ -53,7 +53,10 @@ fn ok(q: QueryOutput) -> QueryOutput {
 async fn queries_edits_and_plans() {
     let dir = tempfile::tempdir().unwrap();
     let c = client(dir.path(), "duck");
-    let Output::Connected { server_version } = c
+    let Output::Connected {
+        server_version,
+        tables,
+    } = c
         .execute(Command::ProfileTest {
             name: "duck".into(),
         })
@@ -63,6 +66,7 @@ async fn queries_edits_and_plans() {
         panic!()
     };
     assert!(server_version.starts_with("DuckDB "), "{server_version}");
+    assert_eq!(tables, Some(0));
 
     // Values as DuckDB writes them.
     let q = ok(run(

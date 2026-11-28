@@ -533,9 +533,13 @@ impl Client {
             }
         };
         let server_version = s.server_version().await?;
+        let tables = s.table_count().await?;
         s.close().await;
         drop(tunnel);
-        Ok(Output::Connected { server_version })
+        Ok(Output::Connected {
+            server_version,
+            tables,
+        })
     }
 
     async fn pool(&self, name: &str) -> Result<MetaPool> {

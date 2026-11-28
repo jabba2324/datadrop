@@ -80,7 +80,7 @@ async fn queries_sessions_and_limits() {
         return;
     };
     let c = &db.client;
-    let Output::Connected { server_version } = c
+    let Output::Connected { server_version, .. } = c
         .execute(Command::ProfileTest {
             name: "test".into(),
         })

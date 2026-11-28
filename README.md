@@ -21,7 +21,8 @@ See [Install](#install).
 
 - **Connect** with a host and port or a URL, over SSL with an optional CA certificate.
   Go through an SSH server if you need to, signing in with your agent, a key file or a
-  password. Test a connection before saving it.
+  password. Test a connection before saving it. **Drop** a SQLite or DuckDB file on the
+  window to connect to it.
 - **Browse** schemas, tables and their columns, keys, foreign keys, indexes and
   triggers, plus views, functions, procedures and sequences. Double-click a table to
   see its rows; right-click for its DDL, or the whole schema's.

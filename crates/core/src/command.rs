@@ -253,6 +253,9 @@ pub enum Output {
     },
     Connected {
         server_version: String,
+        /// The number of tables, for a SQLite or DuckDB file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tables: Option<u64>,
     },
     Schemas {
         schemas: Vec<String>,

@@ -21,6 +21,7 @@ use crate::grid_edit::{Editability, Review};
 use crate::history_view::{HistoryAction, HistoryView};
 use crate::import_dialog::{ImportDialog, ImportDone};
 use crate::kit::{self, ModalExt};
+use crate::native_menu::MenuCommand;
 use crate::params_dialog::{ParamPrompt, ParamsDone, Then};
 use crate::profile_form::{FormDone, ProfileForm, TrustPrompt};
 use crate::results::{self, ResultsAction};
@@ -113,6 +114,9 @@ pub struct App {
     quitting: bool,
     /// The icon in the top bar, loaded the first time it's drawn.
     logo: Option<egui::TextureHandle>,
+    /// macOS: the menus in the system menu bar (the window then has none).
+    #[cfg(target_os = "macos")]
+    native_menu: Option<crate::native_menu::NativeMenu>,
 }
 
 const RUN_ALL: KeyboardShortcut =
@@ -190,6 +194,8 @@ impl App {
             toasts: egui_notify::Toasts::default(),
             logo: None,
             quitting: false,
+            #[cfg(target_os = "macos")]
+            native_menu: None,
         };
         app.refresh_profiles();
         for path in app.settings.open_files.clone() {
@@ -308,6 +314,113 @@ impl App {
                 egui::TextureOptions::LINEAR,
             )
         })
+    }
+
+    /// macOS: put the menus in the system menu bar. On the main thread, once.
+    #[cfg(target_os = "macos")]
+    pub fn install_native_menu(&mut self, ctx: &egui::Context) {
+        self.native_menu = Some(crate::native_menu::NativeMenu::install(ctx));
+    }
+
+    /// Whether the menus are in the system menu bar rather than the window.
+    fn has_native_menu(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        let native = self.native_menu.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let native = false;
+        native
+    }
+
+    /// The commands picked in the system menu bar since the last frame.
+    #[cfg(target_os = "macos")]
+    fn native_menu_commands(&mut self, ctx: &egui::Context) {
+        let has_schema = self.active_schema().is_some();
+        let running = self.docs[self.active].running.is_some();
+        let theme = self.settings.theme;
+        let Some(menu) = &mut self.native_menu else {
+            return;
+        };
+        menu.sync(has_schema, running, theme);
+        for cmd in menu.commands() {
+            self.menu_command(ctx, cmd);
+        }
+    }
+
+    /// A menu item picked, in the window's menus or the system menu bar.
+    fn menu_command(&mut self, ctx: &egui::Context, cmd: MenuCommand) {
+        if self.modal_open() && !cmd.works_over_dialogs() {
+            return;
+        }
+        match cmd {
+            MenuCommand::NewTab => {
+                self.new_tab(None);
+            }
+            MenuCommand::Open => self.open_dialog(),
+            MenuCommand::Save => {
+                self.save(self.active, false);
+            }
+            MenuCommand::SaveAs => {
+                self.save(self.active, true);
+            }
+            MenuCommand::CloseTab => self.request_close_tab(self.active),
+            MenuCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuCommand::Find => self.open_find(ctx, false),
+            MenuCommand::Replace => self.open_find(ctx, true),
+            MenuCommand::FormatSql => self.format_sql(ctx),
+            MenuCommand::Run => self.run(ctx, false),
+            MenuCommand::RunAll => self.run(ctx, true),
+            MenuCommand::Explain => self.explain(ctx, false),
+            MenuCommand::Analyze => self.explain(ctx, true),
+            MenuCommand::Stop => {
+                if let Some(t) = &self.docs[self.active].running {
+                    t.cancel();
+                }
+            }
+            MenuCommand::NewTable
+            | MenuCommand::Diagram
+            | MenuCommand::Compare
+            | MenuCommand::ShowDdl => {
+                let Some((profile, schema)) = self.active_schema() else {
+                    return;
+                };
+                self.browser_action(match cmd {
+                    MenuCommand::NewTable => BrowserAction::EditTable {
+                        profile,
+                        schema,
+                        table: None,
+                    },
+                    MenuCommand::Diagram => BrowserAction::Diagram { profile, schema },
+                    MenuCommand::Compare => BrowserAction::Compare { profile, schema },
+                    _ => BrowserAction::ShowDdl {
+                        profile,
+                        schema,
+                        kind: ObjectKind::Schema,
+                        name: String::new(),
+                    },
+                });
+            }
+            MenuCommand::AddConnection => {
+                self.form = Some(ProfileForm::new(self.keychain()));
+            }
+            MenuCommand::OpenDatabaseFile => self.open_database_dialog(),
+            MenuCommand::Refresh => {
+                self.refresh_profiles();
+                let names: Vec<_> = self.profiles.iter().map(|p| p.name.clone()).collect();
+                for n in names {
+                    self.schema_changed(&n);
+                }
+            }
+            MenuCommand::Theme(t) => {
+                self.settings.theme = t;
+                theme::apply_theme(ctx, t);
+            }
+            MenuCommand::LargerText => {
+                self.settings.editor_font_size = (self.settings.editor_font_size + 1.0).min(28.0);
+            }
+            MenuCommand::SmallerText => {
+                self.settings.editor_font_size = (self.settings.editor_font_size - 1.0).max(9.0);
+            }
+        }
     }
 
     pub fn show_welcome(&self) -> bool {
@@ -1026,16 +1139,88 @@ impl App {
         self.history.poll();
     }
 
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        let modal_open = self.form.is_some()
+    /// A dialog is up: the window's shortcuts and dropped files wait for it.
+    fn modal_open(&self) -> bool {
+        self.form.is_some()
             || self.confirm.is_some()
             || self.params.is_some()
             || self.import.is_some()
             || self.editor.is_some()
-            || self.diff.is_some();
-        if modal_open {
+            || self.diff.is_some()
+    }
+
+    /// Files dropped on the window: a database file becomes a connection, any other
+    /// file opens in a tab (as with "Open with" or the command line). With the
+    /// connection form up, the file goes to the form instead.
+    fn dropped_files(&mut self, ctx: &egui::Context) {
+        let paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        if paths.is_empty() {
             return;
         }
+        if let Some(form) = &mut self.form {
+            form.drop_files(&paths);
+            return;
+        }
+        if self.modal_open() {
+            return;
+        }
+        for path in paths {
+            if path.is_file() {
+                self.open_path(&path);
+            } else {
+                self.toasts
+                    .error(format!("{} isn't a file", path.display()));
+            }
+        }
+    }
+
+    /// While files are dragged over the window: say what dropping them does.
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        if self.modal_open() || ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let p = theme::palette(ctx.global_style().visuals.dark_mode);
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop-overlay"),
+        ));
+        painter.rect_filled(rect, 0, p.bg.gamma_multiply(0.85));
+        painter.rect_stroke(
+            rect.shrink(12.0),
+            12,
+            Stroke::new(2.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center() - egui::vec2(0.0, 12.0),
+            egui::Align2::CENTER_CENTER,
+            "Drop to open",
+            FontId::new(20.0, theme::semibold()),
+            p.text,
+        );
+        painter.text(
+            rect.center() + egui::vec2(0.0, 16.0),
+            egui::Align2::CENTER_CENTER,
+            "A SQLite or DuckDB file becomes a connection; a .sql file opens in a tab",
+            FontId::proportional(13.0),
+            p.muted,
+        );
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.modal_open() {
+            return;
+        }
+        // With the system menu bar, its items have these keys (and send commands).
+        let menu_keys = self.has_native_menu();
         let pressed = ctx.input_mut(|i| {
             // The Shift variants first: Ctrl+Enter also matches Ctrl+Shift+Enter.
             [
@@ -1056,6 +1241,13 @@ impl App {
                 (COMPLETE, Shortcut::Complete),
             ]
             .into_iter()
+            .filter(|(_, s)| {
+                !menu_keys
+                    || matches!(
+                        s,
+                        Shortcut::FindPrev | Shortcut::FindNext | Shortcut::Complete
+                    )
+            })
             .find(|(k, _)| i.consume_shortcut(k))
             .map(|(_, s)| s)
         });
@@ -1200,37 +1392,31 @@ impl App {
         }
     }
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+    /// The menus, in the window (on macOS they're in the system menu bar instead).
+    fn menu_bar(&mut self, ui: &mut egui::Ui) -> Option<MenuCommand> {
+        let cmd = std::cell::Cell::new(None);
+        let target = self.active_schema();
+        let theme = self.settings.theme;
+        let mut font_size = self.settings.editor_font_size;
         egui::MenuBar::new().ui(ui, |ui| {
+            let item = |ui: &mut egui::Ui, text: &str, c: MenuCommand| {
+                if ui.button(text).clicked() {
+                    cmd.set(Some(c));
+                }
+            };
             ui.menu_button("File", |ui| {
-                if ui.button("New tab").clicked() {
-                    self.new_tab(None);
-                }
-                if ui.button("Open…").clicked() {
-                    self.open_dialog();
-                }
+                item(ui, "New tab", MenuCommand::NewTab);
+                item(ui, "Open…", MenuCommand::Open);
                 ui.separator();
-                if ui.button("Save").clicked() {
-                    self.save(self.active, false);
-                }
-                if ui.button("Save as…").clicked() {
-                    self.save(self.active, true);
-                }
+                item(ui, "Save", MenuCommand::Save);
+                item(ui, "Save as…", MenuCommand::SaveAs);
                 ui.separator();
-                if ui.button("Close tab").clicked() {
-                    self.request_close_tab(self.active);
-                }
-                if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                item(ui, "Close tab", MenuCommand::CloseTab);
+                item(ui, "Quit", MenuCommand::Quit);
             });
             ui.menu_button("Edit", |ui| {
-                if ui.button("Find").clicked() {
-                    self.open_find(ui.ctx(), false);
-                }
-                if ui.button("Replace").clicked() {
-                    self.open_find(ui.ctx(), true);
-                }
+                item(ui, "Find", MenuCommand::Find);
+                item(ui, "Replace", MenuCommand::Replace);
                 ui.separator();
                 if ui
                     .add(
@@ -1240,62 +1426,38 @@ impl App {
                     .on_hover_text("The selection, or the whole tab")
                     .clicked()
                 {
-                    self.format_sql(ui.ctx());
+                    cmd.set(Some(MenuCommand::FormatSql));
                 }
             });
             ui.menu_button("Query", |ui| {
-                if ui.button("Run statement").clicked() {
-                    self.run(ui.ctx(), false);
-                }
-                if ui.button("Run all").clicked() {
-                    self.run(ui.ctx(), true);
-                }
-                if ui.button("Explain").clicked() {
-                    self.explain(ui.ctx(), false);
-                }
-                if ui.button("Explain analyze").clicked() {
-                    self.explain(ui.ctx(), true);
-                }
-                if ui.button("Stop").clicked()
-                    && let Some(t) = &self.docs[self.active].running
-                {
-                    t.cancel();
-                }
+                item(ui, "Run statement", MenuCommand::Run);
+                item(ui, "Run all", MenuCommand::RunAll);
+                item(ui, "Explain", MenuCommand::Explain);
+                item(ui, "Explain analyze", MenuCommand::Analyze);
+                item(ui, "Stop", MenuCommand::Stop);
             });
             ui.menu_button("Schema", |ui| {
-                let target = self.active_schema();
                 ui.add_enabled_ui(target.is_some(), |ui| {
-                    let (profile, schema) = target.clone().unwrap_or_default();
-                    if ui.button(format!("{} New table…", icon::PLUS)).clicked() {
-                        self.browser_action(BrowserAction::EditTable {
-                            profile: profile.clone(),
-                            schema: schema.clone(),
-                            table: None,
-                        });
-                    }
-                    if ui.button(format!("{} Diagram", icon::GRAPH)).clicked() {
-                        self.browser_action(BrowserAction::Diagram {
-                            profile: profile.clone(),
-                            schema: schema.clone(),
-                        });
-                    }
-                    if ui
-                        .button(format!("{} Compare with…", icon::ARROWS_LEFT_RIGHT))
-                        .clicked()
-                    {
-                        self.browser_action(BrowserAction::Compare {
-                            profile: profile.clone(),
-                            schema: schema.clone(),
-                        });
-                    }
-                    if ui.button(format!("{} Show DDL", icon::CODE)).clicked() {
-                        self.browser_action(BrowserAction::ShowDdl {
-                            profile,
-                            schema,
-                            kind: ObjectKind::Schema,
-                            name: String::new(),
-                        });
-                    }
+                    item(
+                        ui,
+                        &format!("{} New table…", icon::PLUS),
+                        MenuCommand::NewTable,
+                    );
+                    item(
+                        ui,
+                        &format!("{} Diagram", icon::GRAPH),
+                        MenuCommand::Diagram,
+                    );
+                    item(
+                        ui,
+                        &format!("{} Compare with…", icon::ARROWS_LEFT_RIGHT),
+                        MenuCommand::Compare,
+                    );
+                    item(
+                        ui,
+                        &format!("{} Show DDL", icon::CODE),
+                        MenuCommand::ShowDdl,
+                    );
                 })
                 .response
                 .on_disabled_hover_text("Choose a connection for this tab first");
@@ -1305,19 +1467,9 @@ impl App {
                 }
             });
             ui.menu_button("Connections", |ui| {
-                if ui.button("Add a connection…").clicked() {
-                    self.form = Some(ProfileForm::new(self.keychain()));
-                }
-                if ui.button("Open a database file…").clicked() {
-                    self.open_database_dialog();
-                }
-                if ui.button("Refresh").clicked() {
-                    self.refresh_profiles();
-                    let names: Vec<_> = self.profiles.iter().map(|p| p.name.clone()).collect();
-                    for n in names {
-                        self.schema_changed(&n);
-                    }
-                }
+                item(ui, "Add a connection…", MenuCommand::AddConnection);
+                item(ui, "Open a database file…", MenuCommand::OpenDatabaseFile);
+                item(ui, "Refresh", MenuCommand::Refresh);
             });
             ui.menu_button("View", |ui| {
                 for (t, label) in [
@@ -1325,22 +1477,23 @@ impl App {
                     (Theme::Light, "Theme: light"),
                     (Theme::Dark, "Theme: dark"),
                 ] {
-                    if ui.radio(self.settings.theme == t, label).clicked() {
-                        self.settings.theme = t;
-                        theme::apply_theme(ui.ctx(), t);
+                    if ui.radio(theme == t, label).clicked() {
+                        cmd.set(Some(MenuCommand::Theme(t)));
                     }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Editor text size");
                     ui.add(
-                        egui::DragValue::new(&mut self.settings.editor_font_size)
+                        egui::DragValue::new(&mut font_size)
                             .range(9.0..=28.0)
                             .speed(0.2),
                     );
                 });
             });
         });
+        self.settings.editor_font_size = font_size;
+        cmd.get()
     }
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
@@ -1475,12 +1628,19 @@ impl App {
                     .color(p.text),
             );
             ui.add_space(4.0);
-            // The menu bar takes all the width it's given: give it what the menus need.
-            ui.allocate_ui_with_layout(
-                egui::vec2(300.0, 28.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| self.menu_bar(ui),
-            );
+            if !self.has_native_menu() {
+                // The menu bar takes all the width it's given: give it what the menus need.
+                let cmd = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(300.0, 28.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| self.menu_bar(ui),
+                    )
+                    .inner;
+                if let Some(cmd) = cmd {
+                    self.menu_command(ui.ctx(), cmd);
+                }
+            }
             ui.add_space(12.0);
 
             // The connection this tab runs on (each tab has its own).
@@ -2554,6 +2714,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_tasks();
+        self.dropped_files(&ctx);
+        #[cfg(target_os = "macos")]
+        self.native_menu_commands(&ctx);
         self.shortcuts(&ctx);
         self.handle_close(&ctx);
 
@@ -2664,6 +2827,7 @@ impl eframe::App for App {
             });
 
         self.dialogs(&ctx);
+        self.drop_overlay(&ctx);
         self.toasts.show(&ctx);
         let title = format!(
             "{}{} — DataDrop",

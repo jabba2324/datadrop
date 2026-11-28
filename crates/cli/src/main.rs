@@ -784,7 +784,7 @@ async fn trust_host(client: &Client, name: &str, yes: bool) -> Result<ExitCode> 
                     name: name.to_owned(),
                 })
                 .await?;
-            if let Output::Connected { server_version } = out {
+            if let Output::Connected { server_version, .. } = out {
                 println!("{server_version}");
             }
             Ok(ExitCode::SUCCESS)
@@ -905,7 +905,7 @@ fn print_output(out: &Output, format: Format) -> Result<()> {
         }
         Output::ProfileSaved { name } => eprintln!("Saved profile '{name}'."),
         Output::ProfileRemoved { name } => eprintln!("Removed profile '{name}'."),
-        Output::Connected { server_version } => writeln!(stdout, "{server_version}")?,
+        Output::Connected { server_version, .. } => writeln!(stdout, "{server_version}")?,
         Output::Schemas { schemas } => {
             for s in schemas {
                 writeln!(stdout, "{s}")?;

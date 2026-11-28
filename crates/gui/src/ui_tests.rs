@@ -1127,3 +1127,115 @@ fn draws_a_diagram() {
     );
     assert!(svg.contains("<path d=\"M"), "{svg}");
 }
+
+/// A file dropped on the window, as the windowing backend hands it over.
+#[derive(Debug)]
+struct Dropped(std::path::PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+fn drop_file(h: &mut Harness<'static, App>, path: &std::path::Path) {
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(path.to_path_buf())));
+    h.run_steps(1);
+}
+
+/// A SQLite file with one table (made through a client of its own, so the app
+/// doesn't see a profile for it).
+fn sqlite_file_with_a_table(path: &std::path::Path) {
+    let other = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let client = Client::new(&config(other.path()));
+    rt.block_on(async {
+        client
+            .execute(Command::ProfileSave {
+                profile: Profile {
+                    name: "maker".into(),
+                    driver: Driver::Sqlite,
+                    database: path.display().to_string(),
+                    create_if_missing: true,
+                    ..Profile::default()
+                },
+                previous_name: None,
+                overwrite: true,
+            })
+            .await
+            .unwrap();
+        client
+            .execute(Command::Query {
+                profile: "maker".into(),
+                sql: "CREATE TABLE orders (id integer PRIMARY KEY)".into(),
+                session: None,
+                max_rows: None,
+                autocommit: None,
+            })
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn dropping_a_database_file_makes_a_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let shop = dir.path().join("shop.sqlite");
+    sqlite_file_with_a_table(&shop);
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    drop_file(&mut h, &shop);
+    until(&mut h, "the connection", |a| {
+        a.profiles.iter().any(|p| p.name == "shop")
+    });
+    let i = h.state().active;
+    assert_eq!(h.state().docs[i].profile.as_deref(), Some("shop"));
+}
+
+#[test]
+fn dropping_a_sql_file_opens_it_in_a_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report.sql");
+    std::fs::write(&file, "select 1").unwrap();
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    drop_file(&mut h, &file);
+    h.run_steps(2);
+    let doc = &h.state().docs[h.state().active];
+    assert_eq!(doc.path.as_deref(), Some(file.as_path()));
+    assert_eq!(doc.text, "select 1");
+}
+
+#[test]
+fn a_file_dropped_on_the_form_says_what_it_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let shop = dir.path().join("shop.sqlite");
+    sqlite_file_with_a_table(&shop);
+    let mut h = app(dir.path());
+    until(&mut h, "the welcome screen", |a| a.show_welcome());
+    h.get_by_label("Add a connection").click();
+    h.run_steps(3);
+    // Postgres is picked; the file switches the form to SQLite.
+    drop_file(&mut h, &shop);
+    {
+        let form = h.state().form.as_ref().unwrap();
+        assert_eq!(form.driver, Driver::Sqlite);
+        assert_eq!(form.name, "shop");
+        assert_eq!(form.database, shop.display().to_string());
+    }
+    for _ in 0..400 {
+        h.run_steps(1);
+        if h.query_by_label_contains("· 1 table").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    h.get_by_label_contains("Opened SQLite");
+    // Nothing is saved until the form is.
+    assert!(h.state().profiles.is_empty());
+}

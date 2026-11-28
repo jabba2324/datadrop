@@ -13,6 +13,7 @@ mod grid_edit;
 mod history_view;
 mod import_dialog;
 mod kit;
+mod native_menu;
 mod params_dialog;
 mod plan_view;
 mod profile_form;
@@ -54,6 +55,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = app::App::new(&cc.egui_ctx, config);
+            #[cfg(target_os = "macos")]
+            app.install_native_menu(&cc.egui_ctx);
             // Files given on the command line (or by the desktop's "Open with").
             for path in std::env::args_os().skip(1).map(std::path::PathBuf::from) {
                 if path.is_file() {
