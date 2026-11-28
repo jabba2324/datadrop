@@ -1192,11 +1192,21 @@ impl App {
             egui::Order::Foreground,
             egui::Id::new("drop-overlay"),
         ));
-        painter.rect_filled(rect, 0, p.bg.gamma_multiply(0.85));
+        // Nearly opaque, and the words on a card: the window behind shouldn't show
+        // through them.
+        painter.rect_filled(rect, 0, p.bg.gamma_multiply(0.94));
         painter.rect_stroke(
             rect.shrink(12.0),
             12,
             Stroke::new(2.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
+        let card = egui::Rect::from_center_size(rect.center(), egui::vec2(520.0, 104.0));
+        painter.rect(
+            card,
+            12,
+            p.panel,
+            Stroke::new(1.0, p.border),
             egui::StrokeKind::Inside,
         );
         painter.text(
