@@ -23,7 +23,7 @@ egui = "0.36"
 egui_extras = { version = "0.36", default-features = false }
 egui-phosphor = "0.14"
 egui-notify = "0.23"
-rfd = "0.17"
+rfd = "0.18"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
