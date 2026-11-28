@@ -42,7 +42,10 @@ pub struct ProfileForm {
     keychain: Result<(), String>,
     show_password: bool,
     test: Option<Task>,
-    test_result: Option<Result<String, String>>,
+    /// The server version and, for a database file, its number of tables.
+    test_result: Option<Result<(String, Option<u64>), String>>,
+    /// A database file was picked or dropped: test it on the next frame.
+    probe: bool,
     /// The SSH server's key isn't known: offer to trust it.
     pub untrusted: Option<TrustPrompt>,
     trusting: Option<Task>,
@@ -175,6 +178,7 @@ impl ProfileForm {
             show_password: false,
             test: None,
             test_result: None,
+            probe: false,
             untrusted: None,
             trusting: None,
             saving: None,
@@ -255,8 +259,11 @@ impl ProfileForm {
         if let Some(r) = poll(&mut self.test) {
             self.untrusted = r.as_ref().err().and_then(TrustPrompt::from_error);
             self.test_result = Some(match r {
-                Ok(Output::Connected { server_version }) => Ok(server_version),
-                Ok(_) => Ok("Connected".into()),
+                Ok(Output::Connected {
+                    server_version,
+                    tables,
+                }) => Ok((server_version, tables)),
+                Ok(_) => Ok(("Connected".into(), None)),
                 Err(e) if self.untrusted.is_some() => Err(e.to_string()),
                 Err(e) => Err(e.to_string()),
             });
@@ -273,6 +280,15 @@ impl ProfileForm {
                 }
                 Err(e) => self.test_result = Some(Err(e.to_string())),
             }
+        }
+        if std::mem::take(&mut self.probe)
+            && let Ok(profile) = self.build()
+        {
+            if let Some(t) = &self.test {
+                t.cancel();
+            }
+            self.untrusted = None;
+            self.test = Some(backend.run(Command::ConnectionTest { profile }));
         }
         if let Some(r) = poll(&mut self.saving) {
             match r {
@@ -303,11 +319,11 @@ impl ProfileForm {
                         if let Some(r) = &self.test_result {
                             ui.add_space(6.0);
                             match r {
-                                Ok(v) => ui.label(
+                                Ok((v, tables)) => ui.label(
                                     RichText::new(format!(
-                                        "{} Connected: {}",
+                                        "{} {}",
                                         icon::CHECK_CIRCLE,
-                                        short(v)
+                                        connected_text(v, *tables)
                                     ))
                                     .color(theme::colors(ui).ok),
                                 ),
@@ -710,7 +726,7 @@ impl ProfileForm {
                     dialog.pick_file()
                 };
                 if let Some(f) = picked {
-                    self.database = f.display().to_string();
+                    self.take_file(&f);
                 }
             }
         });
@@ -721,6 +737,92 @@ impl ProfileForm {
             "Create the file if it doesn't exist",
         );
         ui.end_row();
+        ui.label("");
+        drop_zone(ui);
+        ui.end_row();
+    }
+
+    /// Files dropped on the window while the form is open: the first database file
+    /// (or, for SQLite and DuckDB, the first file) becomes the connection's file.
+    pub fn drop_files(&mut self, paths: &[std::path::PathBuf]) {
+        let file = paths
+            .iter()
+            .find(|p| crate::welcome::is_database_file(p))
+            .or_else(|| paths.first().filter(|_| self.driver.is_file()));
+        if let Some(path) = file {
+            self.take_file(path);
+        }
+    }
+
+    /// A database file, picked or dropped: its driver comes from the file, its name
+    /// from the file name (unless one was typed), and it's opened to show what it has.
+    fn take_file(&mut self, path: &std::path::Path) {
+        self.database = path.display().to_string();
+        self.use_url = false;
+        self.test_result = None;
+        if !path.is_file() {
+            // A file to create: nothing to look at yet.
+            if !self.driver.is_file() {
+                self.driver = crate::welcome::driver_for_path(path);
+            }
+            return;
+        }
+        self.driver = crate::welcome::driver_for_file(path)
+            .unwrap_or_else(|_| crate::welcome::driver_for_path(path));
+        if self.name.trim().is_empty() {
+            self.name = crate::welcome::profile_name_from_path(path);
+        }
+        self.probe = true;
+    }
+}
+
+/// Where a database file can be dropped (anywhere on the window works; this says so).
+fn drop_zone(ui: &mut egui::Ui) {
+    let p = theme::colors(ui);
+    let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(FIELD_WIDTH, 96.0), egui::Sense::hover());
+    let painter = ui.painter();
+    if hovering {
+        painter.rect_filled(rect, 8, p.accent_soft);
+    }
+    let stroke = egui::Stroke::new(1.0, if hovering { p.accent } else { p.border2 });
+    let r = rect.shrink(0.5);
+    let corners = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+        r.left_top(),
+    ];
+    painter.extend(egui::Shape::dashed_line(&corners, stroke, 6.0, 4.0));
+    painter.text(
+        rect.center() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_CENTER,
+        "Drop a .duckdb, .db or .sqlite file here",
+        egui::FontId::proportional(13.0),
+        if hovering { p.accent } else { p.muted },
+    );
+    painter.text(
+        rect.center() + egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        "or pass it on the command line: datadrop-gui shop.duckdb",
+        egui::FontId::proportional(11.5),
+        p.faint,
+    );
+}
+
+/// "Opened DuckDB v1.4.1 · 14 tables" for a database file; "Connected: …" otherwise.
+fn connected_text(version: &str, tables: Option<u64>) -> String {
+    match tables {
+        Some(n) => {
+            let tables = if n == 1 {
+                "1 table".into()
+            } else {
+                format!("{n} tables")
+            };
+            format!("Opened {} · {tables}", short(version))
+        }
+        None => format!("Connected: {}", short(version)),
     }
 }
 

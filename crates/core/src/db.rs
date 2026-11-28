@@ -632,6 +632,27 @@ impl Session {
         })
     }
 
+    /// How many tables a SQLite or DuckDB file has (its main database, without views
+    /// or SQLite's own tables). `None` for the server databases.
+    pub async fn table_count(&mut self) -> Result<Option<u64>> {
+        let sql = match self.profile.driver {
+            Driver::Sqlite => {
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+            }
+            Driver::DuckDb => {
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_catalog = current_database() AND table_type = 'BASE TABLE'"
+            }
+            _ => return Ok(None),
+        };
+        let r = self.run(sql, 1).await?;
+        Ok(r.rows
+            .first()
+            .and_then(|row| row.first().cloned().flatten())
+            .and_then(|n| n.parse().ok()))
+    }
+
     pub async fn server_version(&mut self) -> Result<String> {
         match &mut self.conn {
             Conn::Pg(c) => scalar!(c, "SELECT version()").await,

@@ -96,7 +96,7 @@ async fn values_batches_and_sessions() {
         })
         .await
         .unwrap();
-    let Output::Connected { server_version } = out else {
+    let Output::Connected { server_version, .. } = out else {
         panic!("{out:?}")
     };
     assert!(

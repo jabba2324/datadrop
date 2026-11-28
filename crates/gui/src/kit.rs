@@ -167,7 +167,9 @@ pub fn sheet_footer<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
         Stroke::new(1.0, p.border),
     );
     ui.add_space(14.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add)
+    // One row high: given the rest of the dialog, the buttons would sit in its middle.
+    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(size, egui::Layout::right_to_left(egui::Align::Center), add)
         .inner
 }
 

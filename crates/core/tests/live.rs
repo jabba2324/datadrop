@@ -170,11 +170,45 @@ macro_rules! both {
     };
 }
 
+/// A SQLite file's test counts its tables, but not its views or SQLite's own tables.
+#[tokio::test]
+async fn sqlite_test_counts_tables() {
+    let db = setup(Driver::Sqlite, "dd_count").await.unwrap();
+    for sql in [
+        "CREATE TABLE a (id integer PRIMARY KEY AUTOINCREMENT)",
+        "CREATE TABLE b (id integer)",
+        "CREATE VIEW v AS SELECT id FROM a",
+    ] {
+        ok(run(&db.client, &db.profile, sql, None).await);
+    }
+    let out = db
+        .client
+        .execute(Command::ProfileTest {
+            name: db.profile.clone(),
+        })
+        .await
+        .unwrap();
+    // AUTOINCREMENT adds sqlite_sequence, which isn't counted.
+    assert!(
+        matches!(
+            out,
+            Output::Connected {
+                tables: Some(2),
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+}
+
 both!(connects, |driver, schema| async move {
     let Some(db) = setup(driver, schema).await else {
         return;
     };
-    let Output::Connected { server_version } = db
+    let Output::Connected {
+        server_version,
+        tables,
+    } = db
         .client
         .execute(Command::ProfileTest {
             name: db.profile.clone(),
@@ -184,6 +218,9 @@ both!(connects, |driver, schema| async move {
     else {
         panic!()
     };
+    // A count of tables only for a database file (a new, empty one here).
+    let expect_tables = (driver == Driver::Sqlite).then_some(0);
+    assert_eq!(tables, expect_tables);
     let expect = match driver {
         Driver::Postgres => "PostgreSQL",
         Driver::Mysql => "MySQL",
