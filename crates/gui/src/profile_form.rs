@@ -116,6 +116,12 @@ impl ProfileForm {
         f
     }
 
+    pub fn new_url(keychain: Result<(), String>) -> Self {
+        let mut f = Self::new(keychain);
+        f.use_url = true;
+        f
+    }
+
     fn from_profile(previous: Option<String>, p: &Profile) -> Self {
         Self {
             previous,
