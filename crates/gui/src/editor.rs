@@ -317,18 +317,21 @@ pub fn editor_ui(
     // What happened in the text area this frame: the cursor (char index), whether
     // the text changed, and where the cursor is on screen.
     let mut typed: Option<(Option<usize>, bool, egui::Rect)> = None;
-    let outer = ui.available_size();
+    let margin = egui::Margin {
+        left: 12,
+        right: 0,
+        top: 10,
+        bottom: 0,
+    };
+    // Fill the space, margin included: any bigger and the editor draws over the
+    // results pane below it.
+    let inside = ui.available_size() - margin.sum();
     let colors = crate::theme::palette(dark);
     egui::Frame::new()
         .fill(colors.bg)
-        .inner_margin(egui::Margin {
-            left: 12,
-            right: 0,
-            top: 10,
-            bottom: 0,
-        })
+        .inner_margin(margin)
         .show(ui, |ui| {
-            ui.set_min_size(outer);
+            ui.set_min_size(inside);
             // Line numbers scroll up and down with the text, but stay put when a long
             // line scrolls sideways.
             egui::ScrollArea::vertical()
@@ -381,7 +384,7 @@ pub fn editor_ui(
                             galley
                         };
                         let width = ui.available_width().max(100.0);
-                        let height = (outer.y - 8.0).max(40.0);
+                        let height = (inside.y - 8.0).max(40.0);
                         let request_focus = std::mem::take(&mut doc.request_focus);
                         let scroll_to = doc.scroll_to.take();
                         // The inner (sideways) scroll area swallows vertical scroll requests
